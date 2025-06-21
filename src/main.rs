@@ -1,6 +1,8 @@
 use gio::prelude::*;
 use gtk::prelude::*;
+use gtk::glib;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
+use chrono::Local;
 
 fn create_workspace_widget() -> gtk::Label {
     let label = gtk::Label::new(Some("Workspace 1"));
@@ -17,10 +19,27 @@ fn create_title_widget() -> gtk::Label {
 }
 
 fn create_time_widget() -> gtk::Label {
-    let label = gtk::Label::new(Some("12:00"));
+    let label = gtk::Label::new(Some(&get_current_time()));
     label.add_css_class("time-widget");
     label.set_halign(gtk::Align::End);
     label
+}
+
+fn get_current_time() -> String {
+    Local::now().format("%H:%M").to_string()
+}
+
+fn update_time_widget(label: gtk::Label) {
+    let label_weak = label.downgrade();
+    glib::timeout_add_seconds_local(1, move || {
+        if let Some(label) = label_weak.upgrade() {
+            let time_str = get_current_time();
+            label.set_text(&time_str);
+            glib::ControlFlow::Continue
+        } else {
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 fn create_bt_widget() -> gtk::Label {
@@ -30,7 +49,7 @@ fn create_bt_widget() -> gtk::Label {
     label
 }
 
-fn create_experimental_bar() -> gtk::Box {
+fn create_experimental_bar() -> (gtk::Box, gtk::Label) {
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
     main_box.set_valign(gtk::Align::Center);
@@ -61,7 +80,9 @@ fn create_experimental_bar() -> gtk::Box {
     right_group.set_hexpand(false);
     right_group.set_valign(gtk::Align::End);
     right_group.append(&create_bt_widget());
-    right_group.append(&create_time_widget());
+    
+    let time_widget = create_time_widget();
+    right_group.append(&time_widget);
 
     // Assemble main box
     main_box.append(&left_group);
@@ -70,7 +91,7 @@ fn create_experimental_bar() -> gtk::Box {
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    main_box
+    (main_box, time_widget)
 }
 
 fn activate(application: &gtk::Application) {
@@ -105,9 +126,12 @@ fn activate(application: &gtk::Application) {
     // Set height to 2% of screen (similar to eww config)
     window.set_default_height(30);
 
-    let bar = create_experimental_bar();
+    let (bar, time_widget) = create_experimental_bar();
     window.set_child(Some(&bar));
-    window.show()
+    window.show();
+
+    // Start time update timer
+    update_time_widget(time_widget);
 }
 
 fn main() {

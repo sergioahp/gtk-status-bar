@@ -19,12 +19,39 @@ fn create_workspace_widget() -> gtk::Label {
     label
 }
 
+fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
+    if name.is_empty() {
+        format!("Workspace {}", id)
+    } else {
+        format!("Workspace {}", name)
+    }
+}
+
+fn format_workspace_name_from_type(name: &hyprland::shared::WorkspaceType, id: hyprland::shared::WorkspaceId) -> String {
+    match name {
+        hyprland::shared::WorkspaceType::Regular(name) => {
+            if name.is_empty() {
+                format!("Workspace {}", id)
+            } else {
+                format!("Workspace {}", name)
+            }
+        }
+        hyprland::shared::WorkspaceType::Special(name_opt) => {
+            match name_opt {
+                Some(name) if !name.is_empty() => format!("Special: {}", name),
+                _ => format!("Special {}", id),
+            }
+        }
+    }
+}
+
 async fn hyprland_event_listener() -> hyprland::Result<()> {
     // Get initial workspace state
     if let Some(sender) = WORKSPACE_SENDER.get() {
         match hyprland::data::Workspace::get_active_async().await {
             Ok(workspace) => {
-                let _ = sender.send(format!("Workspace {}", workspace.name));
+                let display_name = format_workspace_name_from_string(&workspace.name, workspace.id);
+                let _ = sender.send(display_name);
             }
             Err(_) => {
                 let _ = sender.send("Workspace ?".to_string());
@@ -38,8 +65,8 @@ async fn hyprland_event_listener() -> hyprland::Result<()> {
     event_listener.add_workspace_changed_handler(async_closure! {
         |workspace_data| {
             if let Some(sender) = WORKSPACE_SENDER.get() {
-                let workspace_name = format!("Workspace {}", workspace_data.id);
-                let _ = sender.send(workspace_name);
+                let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
+                let _ = sender.send(display_name);
             }
         }
     });

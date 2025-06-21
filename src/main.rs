@@ -5,6 +5,12 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use chrono::Local;
 use tokio::sync::mpsc;
 use hyprland::shared::HyprDataActive;
+use hyprland::event_listener::AsyncEventListener;
+use hyprland::async_closure;
+use std::sync::OnceLock;
+
+// Global workspace update sender
+static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn create_workspace_widget() -> gtk::Label {
     let label = gtk::Label::new(Some("Workspace ?"));
@@ -13,27 +19,54 @@ fn create_workspace_widget() -> gtk::Label {
     label
 }
 
-async fn hyprland_event_listener(tx: mpsc::UnboundedSender<String>) {
+async fn hyprland_event_listener() -> hyprland::Result<()> {
     // Get initial workspace state
-    match hyprland::data::Workspace::get_active_async().await {
-        Ok(workspace) => {
-            let _ = tx.send(format!("Workspace {}", workspace.name));
-        }
-        Err(_) => {
-            let _ = tx.send("Workspace ?".to_string());
+    if let Some(sender) = WORKSPACE_SENDER.get() {
+        match hyprland::data::Workspace::get_active_async().await {
+            Ok(workspace) => {
+                let _ = sender.send(format!("Workspace {}", workspace.name));
+            }
+            Err(_) => {
+                let _ = sender.send("Workspace ?".to_string());
+            }
         }
     }
     
-    // For now, just send the initial state and don't set up the event listener
-    // due to closure complexity. We'll improve this later.
-    eprintln!("Hyprland workspace monitoring started with initial state only");
+    // Set up event listener
+    let mut event_listener = AsyncEventListener::new();
+    
+    event_listener.add_workspace_changed_handler(async_closure! {
+        |workspace_data| {
+            if let Some(sender) = WORKSPACE_SENDER.get() {
+                let workspace_name = format!("Workspace {}", workspace_data.id);
+                let _ = sender.send(workspace_name);
+            }
+        }
+    });
+    
+    // Start listening for events
+    event_listener.start_listener_async().await?;
+    
+    Ok(())
 }
 
 fn setup_workspace_updates(label: gtk::Label) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     
-    tokio::spawn(hyprland_event_listener(tx));
+    // Set the global sender
+    if WORKSPACE_SENDER.set(tx).is_err() {
+        eprintln!("Failed to set global workspace sender");
+        return;
+    }
     
+    // Start the hyprland event listener
+    tokio::spawn(async move {
+        if let Err(e) = hyprland_event_listener().await {
+            eprintln!("Hyprland event listener error: {}", e);
+        }
+    });
+    
+    // Bridge to GTK main thread
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             label.set_text(&update);

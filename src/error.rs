@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("Workspace channel setup failed: {0}")]
     WorkspaceChannel(String),
 
+    #[error("Title channel setup failed: {0}")]
+    TitleChannel(String),
+
     #[error("Time formatting failed: {0}")]
     TimeFormat(String),
 

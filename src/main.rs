@@ -6,7 +6,7 @@ use gtk::glib;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use chrono::Local;
 use tokio::sync::mpsc;
-use hyprland::shared::HyprDataActive;
+use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
 use hyprland::event_listener::AsyncEventListener;
 use hyprland::async_closure;
 use std::sync::OnceLock;
@@ -14,6 +14,7 @@ use tracing::{info, warn, error, debug};
 use error::{AppError, Result};
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static TITLE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -60,12 +61,62 @@ async fn get_initial_workspace_state() -> Result<String> {
     Ok(display_name)
 }
 
+
+fn format_title_string(client: Option<hyprland::data::Client>, total_length: usize) -> String {
+    client.map_or("".to_string(), |client| {
+        if client.title.chars().count() <= total_length {
+            client.title
+        } else {
+            // reserve 1 for the …
+            let chars_left = (total_length / 2) - 1;
+            let chars_right = total_length - chars_left;
+            let crop_from_idx = client.title.char_indices()
+                .nth(chars_left)
+                .map(|(idx, _)| idx)
+                .unwrap_or(chars_left);
+            let crop_to_idx = client.title.char_indices()
+                .nth(client.title.chars().count() - chars_right)
+                .map(|(idx, _)| idx)
+                .unwrap_or(client.title.len());
+            format!(
+                "{}…{}",
+                &client.title[..crop_from_idx],
+                &client.title[crop_to_idx..]
+            )
+        }
+    })
+}
+
+async fn get_initial_title_state() -> Result<String> {
+    // We do want to know when the operation is successfull but the title string is not there,
+    // which would be because there is no active client
+    debug!("Fetching initial title state");
+    
+    let client = hyprland::data::Client::get_active_async().await?;
+    let display_name = format_title_string(client, 64);
+    
+    info!("Initial title: {:?}", display_name);
+    Ok(display_name)
+}
+
 async fn send_workspace_update(update: String) -> Result<()> {
     let sender = WORKSPACE_SENDER.get()
         .ok_or_else(|| AppError::WorkspaceChannel("Global sender not initialized".to_string()))?;
     
     sender.send(update)
         .map_err(|e| AppError::WorkspaceChannel(format!("Failed to send update: {}", e)))?;
+    
+    Ok(())
+}
+
+async fn send_title_update(update: Option<String>) -> Result<()> {
+    let sender = TITLE_SENDER.get()
+        .ok_or_else(|| AppError::TitleChannel("Global sender not initialized".to_string()))?;
+    
+    // TODO: maybe handle None variant as: remove the widget? maybe pass as optional and handle
+    // that None case elsewere
+    sender.send(update.unwrap_or_default())
+        .map_err(|e| AppError::TitleChannel(format!("Failed to send update: {}", e)))?;
     
     Ok(())
 }
@@ -77,6 +128,56 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
     info!("Workspace changed to: {}", display_name);
     
     send_workspace_update(display_name).await
+}
+
+async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEventData) -> Result<()> {
+    debug!("Handling title change event");
+    
+    // If not active client skip event except if there is no active client, use title_data.address
+    let active_client = hyprland::data::Client::get_active_async().await?
+    // log + early return, not as debug it is normal sometimes for it to not be an active client,
+    // use combinators
+    .filter(|client| client.address == title_data.address);
+
+    if let Some(client) = active_client {
+        // TODO: Should formatted tittle return Option<String> ?
+        let formatted_title = format_title_string(Some(client), 64);
+        info!("Title changed to: {}", formatted_title);
+        send_title_update(Some(formatted_title)).await
+    } else {
+        info!("No active client matches the title change event");
+        Ok(())
+    }
+}
+
+
+async fn setup_title_event_listener() -> Result<()> {
+    debug!("Setting up title event listener");
+    
+    let initial_state = get_initial_title_state().await
+        .unwrap_or_else(|e| {
+            warn!("Failed to get initial title state: {}", e);
+            "".to_string()
+        });
+    
+    if let Err(e) = send_title_update(Some(initial_state)).await {
+        error!("Failed to send initial title update: {}", e);
+    }
+    
+    let mut event_listener = AsyncEventListener::new();
+    
+    event_listener.add_window_title_changed_handler(async_closure! {
+        |title_data| {
+            if let Err(e) = handle_title_change(title_data).await {
+                error!("Failed to handle title change: {}", e);
+            }
+        }
+    });
+    
+    info!("Starting title event listener");
+    event_listener.start_listener_async().await?;
+    
+    Ok(())
 }
 
 async fn setup_workspace_event_listener() -> Result<()> {
@@ -126,6 +227,31 @@ fn setup_workspace_updates(label: gtk::Label) -> Result<()> {
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating workspace label: {}", update);
+            label.set_text(&update);
+        }
+    });
+    
+    Ok(())
+}
+
+fn setup_title_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up title updates");
+    
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    
+    if TITLE_SENDER.set(tx).is_err() {
+        return Err(AppError::TitleChannel("Failed to set global title sender".to_string()));
+    }
+    
+    tokio::spawn(async move {
+        if let Err(e) = setup_title_event_listener().await {
+            error!("Title event listener failed: {}", e);
+        }
+    });
+    
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            debug!("Updating title label: {}", update);
             label.set_text(&update);
         }
     });
@@ -201,7 +327,7 @@ fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
     Ok((left_group, workspace_widget))
 }
 
-fn create_center_group() -> Result<(gtk::Box, gtk::Box, gtk::Box)> {
+fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     debug!("Creating center group");
     
     let center_spacer_start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -211,12 +337,14 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Box, gtk::Box)> {
     center_group.add_css_class("center-group");
     center_group.set_valign(gtk::Align::Center);
     center_group.set_hexpand(false);
-    center_group.append(&create_title_widget()?);
+    
+    let title_widget = create_title_widget()?;
+    center_group.append(&title_widget);
 
     let center_spacer_end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     center_spacer_end.set_hexpand(true);
     
-    Ok((center_spacer_start, center_group, center_spacer_end))
+    Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
 fn create_right_group() -> Result<(gtk::Box, gtk::Label)> {
@@ -234,7 +362,7 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label)> {
     Ok((right_group, time_widget))
 }
 
-fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
     
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -242,16 +370,16 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
     main_box.set_valign(gtk::Align::Center);
 
     let (left_group, workspace_widget) = create_left_group()?;
-    let (center_spacer_start, center_group, center_spacer_end) = create_center_group()?;
+    let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
     let (right_group, time_widget) = create_right_group()?;
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
-    main_box.append(&center_group);
+    main_box.append(&title_widget);
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, time_widget, workspace_widget))
+    Ok((main_box, time_widget, workspace_widget, title_widget))
 }
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
@@ -303,12 +431,13 @@ fn activate(application: &gtk::Application) -> Result<()> {
     load_css_styles(&window)?;
     configure_layer_shell(&window)?;
 
-    let (bar, time_widget, workspace_widget) = create_experimental_bar()?;
+    let (bar, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
     update_time_widget(time_widget)?;
     setup_workspace_updates(workspace_widget)?;
+    setup_title_updates(title_widget)?;
 
     info!("Application activated successfully");
     Ok(())

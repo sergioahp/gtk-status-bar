@@ -80,10 +80,11 @@ fn activate(application: &gtk::Application) {
     // Load CSS
     let css_provider = gtk::CssProvider::new();
     css_provider.load_from_path("style.css");
+    // Provide our CSS at USER priority so it overrides theme and application providers
     gtk::style_context_add_provider_for_display(
         &gtk::prelude::WidgetExt::display(&window),
         &css_provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_USER,
     );
     window.init_layer_shell();
     window.set_layer(Layer::Bottom);

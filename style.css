@@ -1,0 +1,54 @@
+* {
+  all: unset;
+}
+
+.time-widget {
+  background-color: rgba(102, 126, 234, 0.5);
+  color: white;
+  padding: 0em 1em;
+  border-radius: 1.25em;
+  margin: 0.3em 0.5em 0em;
+  font-weight: bold;
+  min-width: 10em;
+}
+
+.workspace-widget {
+  background-color: rgba(240, 147, 251, 0.5);
+  color: white;
+  padding: 0em 1em;
+  border-radius: 1.25em;
+  margin: 0.3em 0.5em 0em;
+  font-weight: bold;
+  min-width: 7em;
+}
+
+.title-widget {
+  background-color: rgba(67, 233, 123, 0.5);
+  color: white;
+  padding: 0em 1em;
+  border-radius: 1.25em;
+  margin: 0.3em 0.5em 0em;
+  font-weight: bold;
+  min-width: 10em;
+}
+
+.bt-widget {
+  background-color: rgba(250, 112, 154, 0.5);
+  color: white;
+  padding: 0em 1em;
+  border-radius: 1.25em;
+  margin: 0.3em 0.5em 0em;
+  font-weight: bold;
+}
+
+window {
+  background-color: transparent;
+}
+
+window.layer-bar {
+  background-color: transparent;
+}
+
+* {
+  background-color: transparent;
+}

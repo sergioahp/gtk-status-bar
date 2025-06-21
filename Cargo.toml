@@ -10,3 +10,6 @@ gio = "0.20"
 # GTK4 aliased as `gtk` so we can use `use gtk::prelude::*;`
 gtk = { package = "gtk4", version = "0.9" }
 chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+hyprland = "0.4.0-beta.1"
+futures-util = "0.3"

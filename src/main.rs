@@ -3,12 +3,42 @@ use gtk::prelude::*;
 use gtk::glib;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use chrono::Local;
+use tokio::sync::mpsc;
+use hyprland::shared::HyprDataActive;
 
 fn create_workspace_widget() -> gtk::Label {
-    let label = gtk::Label::new(Some("Workspace 1"));
+    let label = gtk::Label::new(Some("Workspace ?"));
     label.add_css_class("workspace-widget");
     label.set_halign(gtk::Align::Center);
     label
+}
+
+async fn hyprland_event_listener(tx: mpsc::UnboundedSender<String>) {
+    // Get initial workspace state
+    match hyprland::data::Workspace::get_active_async().await {
+        Ok(workspace) => {
+            let _ = tx.send(format!("Workspace {}", workspace.name));
+        }
+        Err(_) => {
+            let _ = tx.send("Workspace ?".to_string());
+        }
+    }
+    
+    // For now, just send the initial state and don't set up the event listener
+    // due to closure complexity. We'll improve this later.
+    eprintln!("Hyprland workspace monitoring started with initial state only");
+}
+
+fn setup_workspace_updates(label: gtk::Label) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    
+    tokio::spawn(hyprland_event_listener(tx));
+    
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            label.set_text(&update);
+        }
+    });
 }
 
 fn create_title_widget() -> gtk::Label {
@@ -49,7 +79,7 @@ fn create_bt_widget() -> gtk::Label {
     label
 }
 
-fn create_experimental_bar() -> (gtk::Box, gtk::Label) {
+fn create_experimental_bar() -> (gtk::Box, gtk::Label, gtk::Label) {
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
     main_box.set_valign(gtk::Align::Center);
@@ -59,7 +89,9 @@ fn create_experimental_bar() -> (gtk::Box, gtk::Label) {
     left_group.add_css_class("left-group");
     left_group.set_valign(gtk::Align::Start);
     left_group.set_hexpand(false);
-    left_group.append(&create_workspace_widget());
+    
+    let workspace_widget = create_workspace_widget();
+    left_group.append(&workspace_widget);
 
     // Center group - title with spacers
     let center_spacer_start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -91,7 +123,7 @@ fn create_experimental_bar() -> (gtk::Box, gtk::Label) {
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    (main_box, time_widget)
+    (main_box, time_widget, workspace_widget)
 }
 
 fn activate(application: &gtk::Application) {
@@ -126,15 +158,22 @@ fn activate(application: &gtk::Application) {
     // Set height to 2% of screen (similar to eww config)
     window.set_default_height(30);
 
-    let (bar, time_widget) = create_experimental_bar();
+    let (bar, time_widget, workspace_widget) = create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
 
     // Start time update timer
     update_time_widget(time_widget);
+    
+    // Start workspace updates
+    setup_workspace_updates(workspace_widget);
 }
 
 fn main() {
+    // Initialize tokio runtime for async tasks
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    
     let application = gtk::Application::new(Some("sh.wmww.gtk-layer-example"), Default::default());
 
     application.connect_activate(|app| {

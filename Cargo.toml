@@ -1,0 +1,11 @@
+[package]
+name = "gtklayershelltest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4-layer-shell = "0.5.0"
+# GIO (GLib I/O) for Application and signal traits
+gio = "0.20"
+# GTK4 aliased as `gtk` so we can use `use gtk::prelude::*;`
+gtk = { package = "gtk4", version = "0.9" }

@@ -39,6 +39,15 @@ This is a personal status bar tailored to my specific workflow and aesthetic pre
 
 ## 🔨 Building
 
+### With Nix Flakes (Recommended)
+
+```bash
+nix develop
+cargo build --release
+```
+
+### Traditional Cargo
+
 ```bash
 cargo build --release
 ```

@@ -18,7 +18,7 @@ Error types should be domain-specific using the thiserror crate to provide meani
 
 ## Code Organization Principles
 
-Function extraction is preferred over deep nesting to maintain code readability and testability. When control flow becomes complex, breaking functionality into smaller, focused functions improves both understanding and maintenance. The goal is keeping the happy path as the main flow through functions with minimal indentation.
+Locality of behavior is preferred over aggressive function extraction. Code should be organized to maintain clear, readable control flow while keeping related logic together. When control flow becomes complex, consider restructuring to improve understanding without necessarily breaking into multiple functions.
 
 Guard clauses and early returns are effective techniques for flattening control flow. These patterns move error conditions and edge cases to the beginning of functions, leaving the primary logic unencumbered by defensive checks.
 

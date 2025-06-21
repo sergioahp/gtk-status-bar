@@ -53,3 +53,7 @@ cargo build --release
 ```
 
 Requires GTK4, layer-shell protocol support, and a Wayland compositor (tested with Hyprland).
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) for details.

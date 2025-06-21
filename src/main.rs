@@ -1,3 +1,5 @@
+mod error;
+
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk::glib;
@@ -8,33 +10,36 @@ use hyprland::shared::HyprDataActive;
 use hyprland::event_listener::AsyncEventListener;
 use hyprland::async_closure;
 use std::sync::OnceLock;
+use tracing::{info, warn, error, debug};
+use error::{AppError, Result};
 
-// Global workspace update sender
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
-fn create_workspace_widget() -> gtk::Label {
+fn setup_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+}
+
+fn create_workspace_widget() -> Result<gtk::Label> {
+    debug!("Creating workspace widget");
     let label = gtk::Label::new(Some("Workspace ?"));
     label.add_css_class("workspace-widget");
     label.set_halign(gtk::Align::Center);
-    label
+    Ok(label)
 }
 
 fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
     if name.is_empty() {
-        format!("Workspace {}", id)
-    } else {
-        format!("Workspace {}", name)
+        return format!("Workspace {}", id);
     }
+    format!("Workspace {}", name)
 }
 
 fn format_workspace_name_from_type(name: &hyprland::shared::WorkspaceType, id: hyprland::shared::WorkspaceId) -> String {
     match name {
         hyprland::shared::WorkspaceType::Regular(name) => {
-            if name.is_empty() {
-                format!("Workspace {}", id)
-            } else {
-                format!("Workspace {}", name)
-            }
+            format_workspace_name_from_string(name, id)
         }
         hyprland::shared::WorkspaceType::Special(name_opt) => {
             match name_opt {
@@ -45,115 +50,160 @@ fn format_workspace_name_from_type(name: &hyprland::shared::WorkspaceType, id: h
     }
 }
 
-async fn hyprland_event_listener() -> hyprland::Result<()> {
-    // Get initial workspace state
-    if let Some(sender) = WORKSPACE_SENDER.get() {
-        match hyprland::data::Workspace::get_active_async().await {
-            Ok(workspace) => {
-                let display_name = format_workspace_name_from_string(&workspace.name, workspace.id);
-                let _ = sender.send(display_name);
-            }
-            Err(_) => {
-                let _ = sender.send("Workspace ?".to_string());
-            }
-        }
+async fn get_initial_workspace_state() -> Result<String> {
+    debug!("Fetching initial workspace state");
+    
+    let workspace = hyprland::data::Workspace::get_active_async().await?;
+    let display_name = format_workspace_name_from_string(&workspace.name, workspace.id);
+    
+    info!("Initial workspace: {}", display_name);
+    Ok(display_name)
+}
+
+async fn send_workspace_update(update: String) -> Result<()> {
+    let sender = WORKSPACE_SENDER.get()
+        .ok_or_else(|| AppError::WorkspaceChannel("Global sender not initialized".to_string()))?;
+    
+    sender.send(update)
+        .map_err(|e| AppError::WorkspaceChannel(format!("Failed to send update: {}", e)))?;
+    
+    Ok(())
+}
+
+async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData) -> Result<()> {
+    debug!("Handling workspace change event");
+    
+    let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
+    info!("Workspace changed to: {}", display_name);
+    
+    send_workspace_update(display_name).await
+}
+
+async fn setup_workspace_event_listener() -> Result<()> {
+    debug!("Setting up workspace event listener");
+    
+    let initial_state = get_initial_workspace_state().await
+        .unwrap_or_else(|e| {
+            warn!("Failed to get initial workspace state: {}", e);
+            "Workspace ?".to_string()
+        });
+    
+    if let Err(e) = send_workspace_update(initial_state).await {
+        error!("Failed to send initial workspace update: {}", e);
     }
     
-    // Set up event listener
     let mut event_listener = AsyncEventListener::new();
     
     event_listener.add_workspace_changed_handler(async_closure! {
         |workspace_data| {
-            if let Some(sender) = WORKSPACE_SENDER.get() {
-                let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
-                let _ = sender.send(display_name);
+            if let Err(e) = handle_workspace_change(workspace_data).await {
+                error!("Failed to handle workspace change: {}", e);
             }
         }
     });
     
-    // Start listening for events
+    info!("Starting workspace event listener");
     event_listener.start_listener_async().await?;
     
     Ok(())
 }
 
-fn setup_workspace_updates(label: gtk::Label) {
+fn setup_workspace_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up workspace updates");
+    
     let (tx, mut rx) = mpsc::unbounded_channel();
     
-    // Set the global sender
     if WORKSPACE_SENDER.set(tx).is_err() {
-        eprintln!("Failed to set global workspace sender");
-        return;
+        return Err(AppError::WorkspaceChannel("Failed to set global workspace sender".to_string()));
     }
     
-    // Start the hyprland event listener
     tokio::spawn(async move {
-        if let Err(e) = hyprland_event_listener().await {
-            eprintln!("Hyprland event listener error: {}", e);
+        if let Err(e) = setup_workspace_event_listener().await {
+            error!("Workspace event listener failed: {}", e);
         }
     });
     
-    // Bridge to GTK main thread
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
+            debug!("Updating workspace label: {}", update);
             label.set_text(&update);
         }
     });
+    
+    Ok(())
 }
 
-fn create_title_widget() -> gtk::Label {
+fn create_title_widget() -> Result<gtk::Label> {
+    debug!("Creating title widget");
     let label = gtk::Label::new(Some("Application Title"));
     label.add_css_class("title-widget");
     label.set_halign(gtk::Align::End);
-    label
+    Ok(label)
 }
 
-fn create_time_widget() -> gtk::Label {
-    let label = gtk::Label::new(Some(&get_current_time()));
+fn create_time_widget() -> Result<gtk::Label> {
+    debug!("Creating time widget");
+    let time_str = get_current_time()?;
+    let label = gtk::Label::new(Some(&time_str));
     label.add_css_class("time-widget");
     label.set_halign(gtk::Align::End);
-    label
+    Ok(label)
 }
 
-fn get_current_time() -> String {
-    Local::now().format("%H:%M").to_string()
+fn get_current_time() -> Result<String> {
+    Ok(Local::now().format("%H:%M").to_string())
 }
 
-fn update_time_widget(label: gtk::Label) {
+fn update_time_widget(label: gtk::Label) -> Result<()> {
+    debug!("Setting up time widget updates");
+    
     let label_weak = label.downgrade();
     glib::timeout_add_seconds_local(1, move || {
-        if let Some(label) = label_weak.upgrade() {
-            let time_str = get_current_time();
-            label.set_text(&time_str);
-            glib::ControlFlow::Continue
-        } else {
-            glib::ControlFlow::Break
-        }
+        let Some(label) = label_weak.upgrade() else {
+            debug!("Time widget label dropped, stopping updates");
+            return glib::ControlFlow::Break;
+        };
+        
+        let time_str = match get_current_time() {
+            Ok(time) => time,
+            Err(e) => {
+                warn!("Failed to get current time: {}", e);
+                "??:??".to_string()
+            }
+        };
+        
+        label.set_text(&time_str);
+        glib::ControlFlow::Continue
     });
+    
+    Ok(())
 }
 
-fn create_bt_widget() -> gtk::Label {
+fn create_bt_widget() -> Result<gtk::Label> {
+    debug!("Creating bluetooth widget");
     let label = gtk::Label::new(Some("No BT"));
     label.add_css_class("bt-widget");
     label.set_halign(gtk::Align::End);
-    label
+    Ok(label)
 }
 
-fn create_experimental_bar() -> (gtk::Box, gtk::Label, gtk::Label) {
-    let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    main_box.set_hexpand(true);
-    main_box.set_valign(gtk::Align::Center);
-
-    // Left group - workspace
+fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
+    debug!("Creating left group");
+    
     let left_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
     left_group.set_valign(gtk::Align::Start);
     left_group.set_hexpand(false);
     
-    let workspace_widget = create_workspace_widget();
+    let workspace_widget = create_workspace_widget()?;
     left_group.append(&workspace_widget);
+    
+    Ok((left_group, workspace_widget))
+}
 
-    // Center group - title with spacers
+fn create_center_group() -> Result<(gtk::Box, gtk::Box, gtk::Box)> {
+    debug!("Creating center group");
+    
     let center_spacer_start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     center_spacer_start.set_hexpand(true);
 
@@ -161,49 +211,72 @@ fn create_experimental_bar() -> (gtk::Box, gtk::Label, gtk::Label) {
     center_group.add_css_class("center-group");
     center_group.set_valign(gtk::Align::Center);
     center_group.set_hexpand(false);
-    center_group.append(&create_title_widget());
+    center_group.append(&create_title_widget()?);
 
     let center_spacer_end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     center_spacer_end.set_hexpand(true);
+    
+    Ok((center_spacer_start, center_group, center_spacer_end))
+}
 
-    // Right group - systray, bt, time
+fn create_right_group() -> Result<(gtk::Box, gtk::Label)> {
+    debug!("Creating right group");
+    
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
     right_group.set_valign(gtk::Align::End);
-    right_group.append(&create_bt_widget());
+    right_group.append(&create_bt_widget()?);
     
-    let time_widget = create_time_widget();
+    let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
+    
+    Ok((right_group, time_widget))
+}
 
-    // Assemble main box
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
+    debug!("Creating experimental bar");
+    
+    let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    main_box.set_hexpand(true);
+    main_box.set_valign(gtk::Align::Center);
+
+    let (left_group, workspace_widget) = create_left_group()?;
+    let (center_spacer_start, center_group, center_spacer_end) = create_center_group()?;
+    let (right_group, time_widget) = create_right_group()?;
+
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
     main_box.append(&center_group);
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    (main_box, time_widget, workspace_widget)
+    Ok((main_box, time_widget, workspace_widget))
 }
 
-fn activate(application: &gtk::Application) {
-    let window = gtk::ApplicationWindow::new(application);
-    window.add_css_class("layer-bar");
-
-    // Load CSS
+fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
+    debug!("Loading CSS styles");
+    
     let css_provider = gtk::CssProvider::new();
     css_provider.load_from_path("style.css");
-    // Provide our CSS at USER priority so it overrides theme and application providers
+    
     gtk::style_context_add_provider_for_display(
-        &gtk::prelude::WidgetExt::display(&window),
+        &gtk::prelude::WidgetExt::display(window),
         &css_provider,
         gtk::STYLE_PROVIDER_PRIORITY_USER,
     );
+    
+    info!("CSS styles loaded successfully");
+    Ok(())
+}
+
+fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
+    debug!("Configuring layer shell");
+    
     window.init_layer_shell();
     window.set_layer(Layer::Bottom);
     window.auto_exclusive_zone_enable();
 
-    // Set anchors for top bar
     let anchors = [
         (Edge::Left, true),
         (Edge::Right, true),
@@ -215,30 +288,57 @@ fn activate(application: &gtk::Application) {
         window.set_anchor(anchor, state);
     }
 
-    // Set height to 2% of screen (similar to eww config)
     window.set_default_height(30);
+    
+    info!("Layer shell configured successfully");
+    Ok(())
+}
 
-    let (bar, time_widget, workspace_widget) = create_experimental_bar();
+fn activate(application: &gtk::Application) -> Result<()> {
+    info!("Activating GTK application");
+    
+    let window = gtk::ApplicationWindow::new(application);
+    window.add_css_class("layer-bar");
+
+    load_css_styles(&window)?;
+    configure_layer_shell(&window)?;
+
+    let (bar, time_widget, workspace_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
-    // Start time update timer
-    update_time_widget(time_widget);
-    
-    // Start workspace updates
-    setup_workspace_updates(workspace_widget);
+    update_time_widget(time_widget)?;
+    setup_workspace_updates(workspace_widget)?;
+
+    info!("Application activated successfully");
+    Ok(())
 }
 
-fn main() {
-    // Initialize tokio runtime for async tasks
-    let rt = tokio::runtime::Runtime::new().unwrap();
+fn create_tokio_runtime() -> Result<tokio::runtime::Runtime> {
+    debug!("Creating tokio runtime");
+    
+    tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::TokioRuntime(format!("Failed to create runtime: {}", e)))
+}
+
+fn main() -> Result<()> {
+    setup_logging();
+    info!("Starting GTK status bar application");
+
+    let rt = create_tokio_runtime()?;
     let _guard = rt.enter();
     
     let application = gtk::Application::new(Some("sh.wmww.gtk-layer-example"), Default::default());
 
     application.connect_activate(|app| {
-        activate(app);
+        if let Err(e) = activate(app) {
+            error!("Application activation failed: {}", e);
+            std::process::exit(1);
+        }
     });
 
+    info!("Running GTK application");
     application.run();
+    
+    Ok(())
 }

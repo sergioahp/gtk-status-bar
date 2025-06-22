@@ -62,29 +62,27 @@ async fn get_initial_workspace_state() -> Result<String> {
 }
 
 
-fn format_title_string(client: Option<hyprland::data::Client>, total_length: usize) -> String {
-    client.map_or("".to_string(), |client| {
-        if client.title.chars().count() <= total_length {
-            client.title
-        } else {
-            // reserve 1 for the …
-            let chars_left = (total_length / 2) - 1;
-            let chars_right = total_length - chars_left;
-            let crop_from_idx = client.title.char_indices()
-                .nth(chars_left)
-                .map(|(idx, _)| idx)
-                .unwrap_or(chars_left);
-            let crop_to_idx = client.title.char_indices()
-                .nth(client.title.chars().count() - chars_right)
-                .map(|(idx, _)| idx)
-                .unwrap_or(client.title.len());
-            format!(
-                "{}…{}",
-                &client.title[..crop_from_idx],
-                &client.title[crop_to_idx..]
-            )
-        }
-    })
+fn format_title_string(title: String, max_length: usize) -> String {
+    if title.chars().count() <= max_length {
+        title
+    } else {
+        // reserve 1 for the …
+        let chars_left = (max_length / 2) - 1;
+        let chars_right = max_length - chars_left;
+        let crop_from_idx = title.char_indices()
+            .nth(chars_left)
+            .map(|(idx, _)| idx)
+            .unwrap_or(chars_left);
+        let crop_to_idx = title.char_indices()
+            .nth(title.chars().count() - chars_right)
+            .map(|(idx, _)| idx)
+            .unwrap_or(title.len());
+        format!(
+            "{}…{}",
+            &title[..crop_from_idx],
+            &title[crop_to_idx..]
+        )
+    }
 }
 
 async fn get_initial_title_state() -> Result<String> {
@@ -93,7 +91,10 @@ async fn get_initial_title_state() -> Result<String> {
     debug!("Fetching initial title state");
     
     let client = hyprland::data::Client::get_active_async().await?;
-    let display_name = format_title_string(client, 64);
+    let display_name = match client {
+        Some(client) => format_title_string(client.title, 64),
+        None => String::new()
+    };
     
     info!("Initial title: {:?}", display_name);
     Ok(display_name)
@@ -140,14 +141,32 @@ async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEv
     .filter(|client| client.address == title_data.address);
 
     if let Some(client) = active_client {
-        // TODO: Should formatted tittle return Option<String> ?
-        let formatted_title = format_title_string(Some(client), 64);
+        let formatted_title = format_title_string(client.title, 64);
         info!("Title changed to: {}", formatted_title);
         send_title_update(Some(formatted_title)).await
     } else {
         info!("No active client matches the title change event");
         Ok(())
     }
+}
+
+async fn handle_active_window_change(window_data: Option<hyprland::event_listener::WindowEventData>) -> Result<()> {
+    debug!("Handling active window change event");
+    
+    let formatted_title = match &window_data {
+        Some(data) => {
+            debug!("Window data - class: '{}', title: '{}', address: '{}'", data.class, data.title, data.address);
+            format_title_string(data.title.clone(), 64)
+        }
+        None => {
+            debug!("No active window (window_data is None)");
+            String::new()
+        }
+    };
+    
+    info!("Active window changed, title: '{}'", formatted_title);
+    debug!("Sending title update: '{}'", formatted_title);
+    send_title_update(Some(formatted_title)).await
 }
 
 
@@ -170,6 +189,14 @@ async fn setup_title_event_listener() -> Result<()> {
         |title_data| {
             if let Err(e) = handle_title_change(title_data).await {
                 error!("Failed to handle title change: {}", e);
+            }
+        }
+    });
+    
+    event_listener.add_active_window_changed_handler(async_closure! {
+        |window_data| {
+            if let Err(e) = handle_active_window_change(window_data).await {
+                error!("Failed to handle active window change: {}", e);
             }
         }
     });

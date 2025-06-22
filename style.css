@@ -32,6 +32,18 @@
   min-width: 10em;
 }
 
+/* Workspace-specific title widget colors */
+.title-widget.workspace-1 { background-color: rgba(122, 162, 247, 0.5); }
+.title-widget.workspace-2 { background-color: rgba(125, 207, 255, 0.5); }
+.title-widget.workspace-3 { background-color: rgba(158, 206, 106, 0.5); }
+.title-widget.workspace-4 { background-color: rgba(187, 154, 247, 0.5); }
+.title-widget.workspace-5 { background-color: rgba(247, 118, 142, 0.5); }
+.title-widget.workspace-6 { background-color: rgba(255, 158, 102, 0.5); }
+.title-widget.workspace-7 { background-color: rgba(157, 124, 216, 0.5); }
+.title-widget.workspace-8 { background-color: rgba(224, 175, 104, 0.5); }
+.title-widget.workspace-9 { background-color: rgba(42, 195, 222, 0.5); }
+.title-widget.workspace-10 { background-color: rgba(13, 185, 215, 0.5); }
+
 .bt-widget {
   background-color: rgba(250, 112, 154, 0.5);
   color: white;

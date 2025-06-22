@@ -132,22 +132,38 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
 }
 
 fn update_title_widget_workspace_color(title_widget: &gtk::Label, workspace_id: hyprland::shared::WorkspaceId) {
-    // Remove any existing workspace CSS classes
-    let css_classes: Vec<String> = title_widget.css_classes().iter()
-        .map(|class| class.to_string())
-        .collect();
+    // Get workspace color based on ID
+    let color = get_workspace_color(workspace_id);
     
-    for class in css_classes {
-        if class.starts_with("workspace-") {
-            title_widget.remove_css_class(&class);
-        }
+    // Apply color directly via CSS provider for immediate update
+    let css_provider = gtk::CssProvider::new();
+    let css = format!(
+        ".title-widget {{ background-color: {}; }}",
+        color
+    );
+    
+    css_provider.load_from_data(&css);
+    
+    let style_context = title_widget.style_context();
+    style_context.add_provider(&css_provider, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
+    
+    debug!("Updated title widget color to: {} for workspace: {}", color, workspace_id);
+}
+
+fn get_workspace_color(workspace_id: hyprland::shared::WorkspaceId) -> &'static str {
+    match workspace_id {
+        1 => "rgba(122, 162, 247, 0.5)",
+        2 => "rgba(125, 207, 255, 0.5)",
+        3 => "rgba(158, 206, 106, 0.5)",
+        4 => "rgba(187, 154, 247, 0.5)",
+        5 => "rgba(247, 118, 142, 0.5)",
+        6 => "rgba(255, 158, 102, 0.5)",
+        7 => "rgba(157, 124, 216, 0.5)",
+        8 => "rgba(224, 175, 104, 0.5)",
+        9 => "rgba(42, 195, 222, 0.5)",
+        10 => "rgba(13, 185, 215, 0.5)",
+        _ => "rgba(67, 233, 123, 0.5)", // Default color
     }
-    
-    // Add new workspace CSS class
-    let workspace_class = format!("workspace-{}", workspace_id);
-    title_widget.add_css_class(&workspace_class);
-    
-    debug!("Updated title widget CSS class to: {}", workspace_class);
 }
 
 async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEventData) -> Result<()> {

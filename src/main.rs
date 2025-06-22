@@ -13,9 +13,14 @@ use std::sync::OnceLock;
 use tracing::{info, warn, error, debug};
 use error::{AppError, Result};
 
-static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct WorkspaceUpdate {
+    name: String,
+    id: hyprland::shared::WorkspaceId,
+}
+
+static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
 static TITLE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
-static WORKSPACE_ID_SENDER: OnceLock<mpsc::UnboundedSender<hyprland::shared::WorkspaceId>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -51,17 +56,6 @@ fn format_workspace_name_from_type(name: &hyprland::shared::WorkspaceType, id: h
         }
     }
 }
-
-async fn get_initial_workspace_state() -> Result<String> {
-    debug!("Fetching initial workspace state");
-    
-    let workspace = hyprland::data::Workspace::get_active_async().await?;
-    let display_name = format_workspace_name_from_string(&workspace.name, workspace.id);
-    
-    info!("Initial workspace: {}", display_name);
-    Ok(display_name)
-}
-
 
 fn format_title_string(title: String, max_length: usize) -> String {
     if title.chars().count() <= max_length {
@@ -101,7 +95,7 @@ async fn get_initial_title_state() -> Result<String> {
     Ok(display_name)
 }
 
-async fn send_workspace_update(update: String) -> Result<()> {
+async fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
     let sender = WORKSPACE_SENDER.get()
         .ok_or_else(|| AppError::WorkspaceChannel("Global sender not initialized".to_string()))?;
     
@@ -123,27 +117,18 @@ async fn send_title_update(update: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn send_workspace_id_update(workspace_id: hyprland::shared::WorkspaceId) -> Result<()> {
-    let sender = WORKSPACE_ID_SENDER.get()
-        .ok_or_else(|| AppError::WorkspaceChannel("Global workspace ID sender not initialized".to_string()))?;
-    
-    sender.send(workspace_id)
-        .map_err(|e| AppError::WorkspaceChannel(format!("Failed to send workspace ID update: {}", e)))?;
-    
-    Ok(())
-}
-
 async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData) -> Result<()> {
     debug!("Handling workspace change event");
     
     let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
     info!("Workspace changed to: {}", display_name);
     
-    // Send both workspace name and ID updates
-    send_workspace_update(display_name).await?;
-    send_workspace_id_update(workspace_data.id).await?;
-    
-    Ok(())
+    // Send combined workspace update with both name and ID
+    let update = WorkspaceUpdate {
+        name: display_name,
+        id: workspace_data.id,
+    };
+    send_workspace_update(update).await
 }
 
 fn update_title_widget_workspace_color(title_widget: &gtk::Label, workspace_id: hyprland::shared::WorkspaceId) {
@@ -249,16 +234,21 @@ async fn setup_workspace_event_listener() -> Result<()> {
     match workspace_result {
         Ok(workspace) => {
             let initial_state = format_workspace_name_from_string(&workspace.name, workspace.id);
-            if let Err(e) = send_workspace_update(initial_state).await {
+            let update = WorkspaceUpdate {
+                name: initial_state,
+                id: workspace.id,
+            };
+            if let Err(e) = send_workspace_update(update).await {
                 error!("Failed to send initial workspace update: {}", e);
-            }
-            if let Err(e) = send_workspace_id_update(workspace.id).await {
-                error!("Failed to send initial workspace ID update: {}", e);
             }
         }
         Err(e) => {
             warn!("Failed to get initial workspace state: {}", e);
-            if let Err(e) = send_workspace_update("Workspace ?".to_string()).await {
+            let fallback_update = WorkspaceUpdate {
+                name: "Workspace ?".to_string(),
+                id: 1, // WorkspaceId is just an i32
+            };
+            if let Err(e) = send_workspace_update(fallback_update).await {
                 error!("Failed to send fallback workspace update: {}", e);
             }
         }
@@ -283,16 +273,10 @@ async fn setup_workspace_event_listener() -> Result<()> {
 fn setup_workspace_updates(label: gtk::Label, title_widget: gtk::Label) -> Result<()> {
     debug!("Setting up workspace updates");
     
-    // Set up workspace name updates
+    // Set up combined workspace updates
     let (tx, mut rx) = mpsc::unbounded_channel();
     if WORKSPACE_SENDER.set(tx).is_err() {
         return Err(AppError::WorkspaceChannel("Failed to set global workspace sender".to_string()));
-    }
-    
-    // Set up workspace ID updates for title widget colors
-    let (id_tx, mut id_rx) = mpsc::unbounded_channel();
-    if WORKSPACE_ID_SENDER.set(id_tx).is_err() {
-        return Err(AppError::WorkspaceChannel("Failed to set global workspace ID sender".to_string()));
     }
     
     tokio::spawn(async move {
@@ -301,19 +285,13 @@ fn setup_workspace_updates(label: gtk::Label, title_widget: gtk::Label) -> Resul
         }
     });
     
-    // Handle workspace name updates
+    // Handle combined workspace updates (name + ID) in single frame
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
-            debug!("Updating workspace label: {}", update);
-            label.set_text(&update);
-        }
-    });
-    
-    // Handle workspace ID updates for title widget colors
-    glib::spawn_future_local(async move {
-        while let Some(workspace_id) = id_rx.recv().await {
-            debug!("Updating title widget color for workspace: {}", workspace_id);
-            update_title_widget_workspace_color(&title_widget, workspace_id);
+            debug!("Updating workspace - label: '{}', color for workspace: {}", update.name, update.id);
+            // Update both workspace text and title color atomically
+            label.set_text(&update.name);
+            update_title_widget_workspace_color(&title_widget, update.id);
         }
     });
     

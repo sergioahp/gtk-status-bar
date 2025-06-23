@@ -12,7 +12,7 @@ gio = "0.20"
 gtk = { package = "gtk4", version = "0.9" }
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
-hyprland = { path = "hyprland-rs" }
+hyprland = { git = "https://github.com/sergioahp/hyprland-rs" }
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -12,6 +12,8 @@ use hyprland::async_closure;
 use std::sync::OnceLock;
 use tracing::{info, warn, error, debug};
 use error::{AppError, Result};
+use zbus::Connection;
+use zbus::fdo;
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
@@ -502,6 +504,29 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     Ok(())
 }
 
+async fn monitor_battery() -> Result<()> {
+    info!("Starting battery monitoring task");
+    let connection = Connection::system().await;
+    // Get initial status
+    // TODO: what if there is no battery (for example, in a desktop?)
+    // Probably should monitor if a battery comes into existance so
+    // you should not return
+    let obj_proxy = fdo::PropertiesProxy::builder(connection)
+        .destination("org.freedesktop.UPower")?
+        .path("/org/freedesktop/UPower/devices/battery_BAT0")?
+        .build().await?;
+
+    let percentage: f64 = obj_proxy
+        .get("org.freedesktop.UPower.Device", "Percentage")
+        .await?;
+    println!("Battery is at {:.1}%", percentage);
+
+
+    // stream: zbus::MessageStream = connection.into();
+        Ok()
+
+}
+
 fn activate(application: &gtk::Application) -> Result<()> {
     info!("Activating GTK application");
     
@@ -548,6 +573,13 @@ fn main() -> Result<()> {
 
     info!("Running GTK application");
     application.run();
+
+    // Maybe set up error recovery: exponentially backup retries, currently a failed task will not
+    // execute again during the duration of the program
+    // Monitor battery status
+    tokio::spawn(async move {
+        monitor_battery().await;
+    });
     
     Ok(())
 }

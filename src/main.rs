@@ -24,6 +24,7 @@ struct WorkspaceUpdate {
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
 static TITLE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static BATTERY_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -116,6 +117,16 @@ async fn send_title_update(update: Option<String>) -> Result<()> {
     // that None case elsewere
     sender.send(update.unwrap_or_default())
         .map_err(|e| AppError::TitleChannel(format!("Failed to send update: {}", e)))?;
+    
+    Ok(())
+}
+
+async fn send_battery_update(update: String) -> Result<()> {
+    let sender = BATTERY_SENDER.get()
+        .ok_or_else(|| AppError::BatteryChannel("Global sender not initialized".to_string()))?;
+    
+    sender.send(update)
+        .map_err(|e| AppError::BatteryChannel(format!("Failed to send update: {}", e)))?;
     
     Ok(())
 }
@@ -342,6 +353,31 @@ fn setup_title_updates(label: gtk::Label) -> Result<()> {
     Ok(())
 }
 
+fn setup_battery_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up battery updates");
+    
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    
+    if BATTERY_SENDER.set(tx).is_err() {
+        return Err(AppError::BatteryChannel("Failed to set global battery sender".to_string()));
+    }
+    
+    tokio::spawn(async move {
+        if let Err(e) = monitor_battery().await {
+            error!("Battery monitoring failed: {}", e);
+        }
+    });
+    
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            debug!("Updating battery label: {}", update);
+            label.set_text(&update);
+        }
+    });
+    
+    Ok(())
+}
+
 fn create_title_widget() -> Result<gtk::Label> {
     debug!("Creating title widget");
     let label = gtk::Label::new(Some("Application Title"));
@@ -396,6 +432,14 @@ fn create_bt_widget() -> Result<gtk::Label> {
     Ok(label)
 }
 
+fn create_battery_widget() -> Result<gtk::Label> {
+    debug!("Creating battery widget");
+    let label = gtk::Label::new(Some("🔋 ??%"));
+    label.add_css_class("battery-widget");
+    label.set_halign(gtk::Align::End);
+    Ok(label)
+}
+
 fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
     debug!("Creating left group");
     
@@ -430,7 +474,7 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
-fn create_right_group() -> Result<(gtk::Box, gtk::Label)> {
+fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
     
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -439,13 +483,16 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label)> {
     right_group.set_valign(gtk::Align::End);
     right_group.append(&create_bt_widget()?);
     
+    let battery_widget = create_battery_widget()?;
+    right_group.append(&battery_widget);
+    
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
     
-    Ok((right_group, time_widget))
+    Ok((right_group, battery_widget, time_widget))
 }
 
-fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
     
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -454,7 +501,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
 
     let (left_group, workspace_widget) = create_left_group()?;
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
-    let (right_group, time_widget) = create_right_group()?;
+    let (right_group, battery_widget, time_widget) = create_right_group()?;
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -462,7 +509,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, time_widget, workspace_widget, title_widget))
+    Ok((main_box, battery_widget, time_widget, workspace_widget, title_widget))
 }
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
@@ -524,7 +571,10 @@ async fn monitor_battery() -> Result<()> {
         .get(interface_name, "Percentage")
         .await?;
     let percentage = f64::try_from(percentage)?;
-    println!("Battery is at {:.1}%", percentage);
+    info!("Battery is at {:.1}%", percentage);
+
+    let battery_text = format!("🔋 {:.0}%", percentage);
+    send_battery_update(battery_text).await?; 
 
 
     // stream: zbus::MessageStream = connection.into();
@@ -541,13 +591,14 @@ fn activate(application: &gtk::Application) -> Result<()> {
     load_css_styles(&window)?;
     configure_layer_shell(&window)?;
 
-    let (bar, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
+    let (bar, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
     update_time_widget(time_widget)?;
     setup_workspace_updates(workspace_widget, title_widget.clone())?;
     setup_title_updates(title_widget)?;
+    setup_battery_updates(battery_widget)?;
 
     info!("Application activated successfully");
     Ok(())

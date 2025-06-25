@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Title channel setup failed: {0}")]
     TitleChannel(String),
 
+    #[error("Battery channel setup failed: {0}")]
+    BatteryChannel(String),
+
     #[error("Time formatting failed: {0}")]
     TimeFormat(String),
 

@@ -14,6 +14,7 @@ use tracing::{info, warn, error, debug};
 use error::{AppError, Result};
 use zbus::Connection;
 use zbus::fdo;
+use zbus_names::InterfaceName;
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
@@ -506,24 +507,28 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
 
 async fn monitor_battery() -> Result<()> {
     info!("Starting battery monitoring task");
-    let connection = Connection::system().await;
+    let connection = Connection::system().await?;
     // Get initial status
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
-    let obj_proxy = fdo::PropertiesProxy::builder(connection)
+    let obj_proxy = fdo::PropertiesProxy::builder(&connection)
         .destination("org.freedesktop.UPower")?
         .path("/org/freedesktop/UPower/devices/battery_BAT0")?
-        .build().await?;
-
-    let percentage: f64 = obj_proxy
-        .get("org.freedesktop.UPower.Device", "Percentage")
+        .build()
         .await?;
+
+    let interface_name = InterfaceName::try_from("org.freedesktop.UPower.Device")?;
+    let percentage = obj_proxy
+        // InterfaceName
+        .get(interface_name, "Percentage")
+        .await?;
+    let percentage = f64::try_from(percentage)?;
     println!("Battery is at {:.1}%", percentage);
 
 
     // stream: zbus::MessageStream = connection.into();
-        Ok()
+    Ok(())
 
 }
 

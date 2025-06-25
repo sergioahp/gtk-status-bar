@@ -18,3 +18,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 thiserror = "1.0"
+zbus = "5.7.1"
+zbus_names = "4.2.0"
+zvariant = "5.5.3"

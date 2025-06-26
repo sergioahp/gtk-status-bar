@@ -15,6 +15,7 @@ use error::{AppError, Result};
 use zbus::Connection;
 use zbus::fdo;
 use zbus_names::InterfaceName;
+use futures::StreamExt;
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
@@ -576,10 +577,69 @@ async fn monitor_battery() -> Result<()> {
     let battery_text = format!("🔋 {:.0}%", percentage);
     send_battery_update(battery_text).await?; 
 
+    let mut stream: zbus::MessageStream = connection.into();
+    info!("Battery monitor: Starting to listen for D-Bus messages");
 
-    // stream: zbus::MessageStream = connection.into();
+    while let Some(msg) = stream.next().await {
+        let Ok(msg) = msg else {
+            error!("Error receiving DBus message in battery monitor loop");
+            continue;
+        };
+
+        debug!("Got an event in event stream: {:?}", msg);
+
+        let header = msg.header();
+        debug!("Battery monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}", 
+               header.path(), header.interface(), header.member());
+
+        let Some(member) = header.member() else {
+            debug!("Battery monitor: Message has no member field");
+            continue;
+        };
+
+        if member.as_str() != "PropertiesChanged" {
+            debug!("Battery monitor: Ignoring message with member: {}", member.as_str());
+            continue;
+        }
+
+        info!("Battery monitor: Received PropertiesChanged signal");
+        
+        let body = msg.body();
+        let Ok(args) = body.deserialize::<(String, std::collections::HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
+            warn!("Battery monitor: Failed to deserialize PropertiesChanged message");
+            continue;
+        };
+
+        debug!("Battery monitor: PropertiesChanged interface: {}", args.0);
+        debug!("Battery monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
+        
+        if args.0 != "org.freedesktop.UPower.Device" {
+            debug!("Battery monitor: PropertiesChanged for different interface: {}", args.0);
+            continue;
+        }
+
+        info!("Battery monitor: UPower.Device properties changed");
+        
+        let Some(percent_value) = args.1.get("Percentage") else {
+            debug!("Battery monitor: No Percentage property in UPower.Device change");
+            continue;
+        };
+
+        let Ok(percentage) = f64::try_from(percent_value) else {
+            warn!("Battery monitor: Failed to convert percentage value");
+            continue;
+        };
+
+        info!("Battery monitor: Battery percentage updated to {:.1}%", percentage);
+        let battery_text = format!("🔋 {:.0}%", percentage);
+        if let Err(e) = send_battery_update(battery_text).await {
+            error!("Battery monitor: Failed to send battery update: {}", e);
+        }
+    }
+
+    warn!("Battery monitor: Message stream ended unexpectedly");
+
     Ok(())
-
 }
 
 fn activate(application: &gtk::Application) -> Result<()> {

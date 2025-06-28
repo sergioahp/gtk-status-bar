@@ -560,22 +560,34 @@ async fn monitor_battery() -> Result<()> {
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
+
     let obj_proxy = fdo::PropertiesProxy::builder(&connection)
         .destination("org.freedesktop.UPower")?
         .path("/org/freedesktop/UPower/devices/battery_BAT0")?
         .build()
         .await?;
+    info!("Object proxy created");
 
     let interface_name = InterfaceName::try_from("org.freedesktop.UPower.Device")?;
-    let percentage = obj_proxy
-        // InterfaceName
+    match obj_proxy
         .get(interface_name, "Percentage")
-        .await?;
-    let percentage = f64::try_from(percentage)?;
-    info!("Battery is at {:.1}%", percentage);
-
-    let battery_text = format!("🔋 {:.0}%", percentage);
-    send_battery_update(battery_text).await?; 
+        .await {
+        Ok(value) => {
+            let percentage = f64::try_from(value)?;
+            info!("Battery is at {:.1}%", percentage);
+            let battery_text = format!("🔋 {:.0}%", percentage);
+            send_battery_update(battery_text).await?;
+        }
+        Err(e) => {
+            info!("No battery detected initially (likely desktop system): {}", e);
+            // Invisible label, maybe thing removing the widget altogether or make it invisible or
+            // something: we don't want to polute the bar: if there is no battery then this info
+            // is not so relevant
+            send_battery_update("".to_string()).await?;
+        }
+    };
+    info!("Initial battery state processed"); 
+    // should path be "/" for the following monitoring to work?
 
     let mut stream: zbus::MessageStream = connection.into();
     info!("Battery monitor: Starting to listen for D-Bus messages");

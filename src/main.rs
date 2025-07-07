@@ -15,6 +15,8 @@ use error::{AppError, Result};
 use zbus::Connection;
 use zbus::fdo;
 use zbus_names::InterfaceName;
+use zbus::message::Type as MessageType;
+use zbus::MatchRule;
 use futures::StreamExt;
 
 #[derive(Debug, Clone)]
@@ -587,7 +589,25 @@ async fn monitor_battery() -> Result<()> {
         }
     };
     info!("Initial battery state processed"); 
-    // should path be "/" for the following monitoring to work?
+    
+    // Subscribe to UPower property changes before creating MessageStream.
+    // Without this subscription, the MessageStream receives no messages because
+    // D-Bus requires explicit signal subscriptions via match rules.
+    // Note: ObjectManagerProxy only reports interface additions/removals, not property changes.
+    // As per https://openrr.github.io/openrr/zbus/fdo/struct.ObjectManagerProxy.html:
+    // "Changes to properties on existing interfaces are not reported using this interface"
+    // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
+    let rule = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.UPower")?
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .path("/org/freedesktop/UPower/devices/battery_BAT0")?
+        .build();
+    
+    let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
+    dbus_proxy.add_match_rule(rule).await?;
+    info!("Battery monitor: Subscribed to UPower property changes");
 
     let mut stream: zbus::MessageStream = connection.into();
     info!("Battery monitor: Starting to listen for D-Bus messages");

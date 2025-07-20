@@ -91,13 +91,13 @@ async fn get_initial_title_state() -> Result<String> {
     // We do want to know when the operation is successfull but the title string is not there,
     // which would be because there is no active client
     debug!("Fetching initial title state");
-    
+
     let client = hyprland::data::Client::get_active_async().await?;
     let display_name = match client {
         Some(client) => format_title_string(client.title, 64),
         None => String::new()
     };
-    
+
     info!("Initial title: {:?}", display_name);
     Ok(display_name)
 }
@@ -105,41 +105,41 @@ async fn get_initial_title_state() -> Result<String> {
 async fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
     let sender = WORKSPACE_SENDER.get()
         .ok_or_else(|| AppError::WorkspaceChannel("Global sender not initialized".to_string()))?;
-    
+
     sender.send(update)
         .map_err(|e| AppError::WorkspaceChannel(format!("Failed to send update: {}", e)))?;
-    
+
     Ok(())
 }
 
 async fn send_title_update(update: Option<String>) -> Result<()> {
     let sender = TITLE_SENDER.get()
         .ok_or_else(|| AppError::TitleChannel("Global sender not initialized".to_string()))?;
-    
+
     // TODO: maybe handle None variant as: remove the widget? maybe pass as optional and handle
     // that None case elsewere
     sender.send(update.unwrap_or_default())
         .map_err(|e| AppError::TitleChannel(format!("Failed to send update: {}", e)))?;
-    
+
     Ok(())
 }
 
 async fn send_battery_update(update: String) -> Result<()> {
     let sender = BATTERY_SENDER.get()
         .ok_or_else(|| AppError::BatteryChannel("Global sender not initialized".to_string()))?;
-    
+
     sender.send(update)
         .map_err(|e| AppError::BatteryChannel(format!("Failed to send update: {}", e)))?;
-    
+
     Ok(())
 }
 
 async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData) -> Result<()> {
     debug!("Handling workspace change event");
-    
+
     let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
     info!("Workspace changed to: {}", display_name);
-    
+
     // Send combined workspace update with both name and ID
     let update = WorkspaceUpdate {
         name: display_name,
@@ -151,19 +151,19 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
 fn update_title_widget_workspace_color(title_widget: &gtk::Label, workspace_id: hyprland::shared::WorkspaceId) {
     // Get workspace color based on ID
     let color = get_workspace_color(workspace_id);
-    
+
     // Apply color directly via CSS provider for immediate update
     let css_provider = gtk::CssProvider::new();
     let css = format!(
         ".title-widget {{ background-color: {}; }}",
         color
     );
-    
+
     css_provider.load_from_data(&css);
-    
+
     let style_context = title_widget.style_context();
     style_context.add_provider(&css_provider, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
-    
+
     debug!("Updated title widget color to: {} for workspace: {}", color, workspace_id);
 }
 
@@ -185,7 +185,7 @@ fn get_workspace_color(workspace_id: hyprland::shared::WorkspaceId) -> &'static 
 
 async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEventData) -> Result<()> {
     debug!("Handling title change event");
-    
+
     // If not active client skip event except if there is no active client, use title_data.address
     let active_client = hyprland::data::Client::get_active_async().await?
     // log + early return, not as debug it is normal sometimes for it to not be an active client,
@@ -204,7 +204,7 @@ async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEv
 
 async fn handle_active_window_change(window_data: Option<hyprland::event_listener::WindowEventData>) -> Result<()> {
     debug!("Handling active window change event");
-    
+
     let formatted_title = match &window_data {
         Some(data) => {
             debug!("Window data - class: '{}', title: '{}', address: '{}'", data.class, data.title, data.address);
@@ -215,7 +215,7 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
             String::new()
         }
     };
-    
+
     info!("Active window changed, title: '{}'", formatted_title);
     debug!("Sending title update: '{}'", formatted_title);
     send_title_update(Some(formatted_title)).await
@@ -224,19 +224,19 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
 
 async fn setup_title_event_listener() -> Result<()> {
     debug!("Setting up title event listener");
-    
+
     let initial_state = get_initial_title_state().await
         .unwrap_or_else(|e| {
             warn!("Failed to get initial title state: {}", e);
             "".to_string()
         });
-    
+
     if let Err(e) = send_title_update(Some(initial_state)).await {
         error!("Failed to send initial title update: {}", e);
     }
-    
+
     let mut event_listener = AsyncEventListener::new();
-    
+
     event_listener.add_window_title_changed_handler(async_closure! {
         |title_data| {
             if let Err(e) = handle_title_change(title_data).await {
@@ -244,7 +244,7 @@ async fn setup_title_event_listener() -> Result<()> {
             }
         }
     });
-    
+
     event_listener.add_active_window_changed_handler(async_closure! {
         |window_data| {
             if let Err(e) = handle_active_window_change(window_data).await {
@@ -252,18 +252,18 @@ async fn setup_title_event_listener() -> Result<()> {
             }
         }
     });
-    
+
     info!("Starting title event listener");
     event_listener.start_listener_async().await?;
-    
+
     Ok(())
 }
 
 async fn setup_workspace_event_listener() -> Result<()> {
     debug!("Setting up workspace event listener");
-    
+
     let workspace_result = hyprland::data::Workspace::get_active_async().await;
-    
+
     match workspace_result {
         Ok(workspace) => {
             let initial_state = format_workspace_name_from_string(&workspace.name, workspace.id);
@@ -286,9 +286,9 @@ async fn setup_workspace_event_listener() -> Result<()> {
             }
         }
     }
-    
+
     let mut event_listener = AsyncEventListener::new();
-    
+
     event_listener.add_workspace_changed_handler(async_closure! {
         |workspace_data| {
             if let Err(e) = handle_workspace_change(workspace_data).await {
@@ -296,28 +296,28 @@ async fn setup_workspace_event_listener() -> Result<()> {
             }
         }
     });
-    
+
     info!("Starting workspace event listener");
     event_listener.start_listener_async().await?;
-    
+
     Ok(())
 }
 
 fn setup_workspace_updates(label: gtk::Label, title_widget: gtk::Label) -> Result<()> {
     debug!("Setting up workspace updates");
-    
+
     // Set up combined workspace updates
     let (tx, mut rx) = mpsc::unbounded_channel();
     if WORKSPACE_SENDER.set(tx).is_err() {
         return Err(AppError::WorkspaceChannel("Failed to set global workspace sender".to_string()));
     }
-    
+
     tokio::spawn(async move {
         if let Err(e) = setup_workspace_event_listener().await {
             error!("Workspace event listener failed: {}", e);
         }
     });
-    
+
     // Handle combined workspace updates (name + ID) in single frame
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
@@ -327,57 +327,57 @@ fn setup_workspace_updates(label: gtk::Label, title_widget: gtk::Label) -> Resul
             update_title_widget_workspace_color(&title_widget, update.id);
         }
     });
-    
+
     Ok(())
 }
 
 fn setup_title_updates(label: gtk::Label) -> Result<()> {
     debug!("Setting up title updates");
-    
+
     let (tx, mut rx) = mpsc::unbounded_channel();
-    
+
     if TITLE_SENDER.set(tx).is_err() {
         return Err(AppError::TitleChannel("Failed to set global title sender".to_string()));
     }
-    
+
     tokio::spawn(async move {
         if let Err(e) = setup_title_event_listener().await {
             error!("Title event listener failed: {}", e);
         }
     });
-    
+
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating title label: {}", update);
             label.set_text(&update);
         }
     });
-    
+
     Ok(())
 }
 
 fn setup_battery_updates(label: gtk::Label) -> Result<()> {
     debug!("Setting up battery updates");
-    
+
     let (tx, mut rx) = mpsc::unbounded_channel();
-    
+
     if BATTERY_SENDER.set(tx).is_err() {
         return Err(AppError::BatteryChannel("Failed to set global battery sender".to_string()));
     }
-    
+
     tokio::spawn(async move {
         if let Err(e) = monitor_battery().await {
             error!("Battery monitoring failed: {}", e);
         }
     });
-    
+
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating battery label: {}", update);
             label.set_text(&update);
         }
     });
-    
+
     Ok(())
 }
 
@@ -404,14 +404,14 @@ fn get_current_time() -> Result<String> {
 
 fn update_time_widget(label: gtk::Label) -> Result<()> {
     debug!("Setting up time widget updates");
-    
+
     let label_weak = label.downgrade();
     glib::timeout_add_seconds_local(1, move || {
         let Some(label) = label_weak.upgrade() else {
             debug!("Time widget label dropped, stopping updates");
             return glib::ControlFlow::Break;
         };
-        
+
         let time_str = match get_current_time() {
             Ok(time) => time,
             Err(e) => {
@@ -419,11 +419,11 @@ fn update_time_widget(label: gtk::Label) -> Result<()> {
                 "??:??".to_string()
             }
         };
-        
+
         label.set_text(&time_str);
         glib::ControlFlow::Continue
     });
-    
+
     Ok(())
 }
 
@@ -445,21 +445,21 @@ fn create_battery_widget() -> Result<gtk::Label> {
 
 fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
     debug!("Creating left group");
-    
+
     let left_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
     left_group.set_valign(gtk::Align::Start);
     left_group.set_hexpand(false);
-    
+
     let workspace_widget = create_workspace_widget()?;
     left_group.append(&workspace_widget);
-    
+
     Ok((left_group, workspace_widget))
 }
 
 fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     debug!("Creating center group");
-    
+
     let center_spacer_start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     center_spacer_start.set_hexpand(true);
 
@@ -467,37 +467,37 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     center_group.add_css_class("center-group");
     center_group.set_valign(gtk::Align::Center);
     center_group.set_hexpand(false);
-    
+
     let title_widget = create_title_widget()?;
     center_group.append(&title_widget);
 
     let center_spacer_end = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     center_spacer_end.set_hexpand(true);
-    
+
     Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
 fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
-    
+
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
     right_group.set_valign(gtk::Align::End);
     right_group.append(&create_bt_widget()?);
-    
+
     let battery_widget = create_battery_widget()?;
     right_group.append(&battery_widget);
-    
+
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
-    
+
     Ok((right_group, battery_widget, time_widget))
 }
 
 fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
-    
+
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
     main_box.set_valign(gtk::Align::Center);
@@ -517,23 +517,23 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
     debug!("Loading CSS styles");
-    
+
     let css_provider = gtk::CssProvider::new();
     css_provider.load_from_path("style.css");
-    
+
     gtk::style_context_add_provider_for_display(
         &gtk::prelude::WidgetExt::display(window),
         &css_provider,
         gtk::STYLE_PROVIDER_PRIORITY_USER,
     );
-    
+
     info!("CSS styles loaded successfully");
     Ok(())
 }
 
 fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     debug!("Configuring layer shell");
-    
+
     window.init_layer_shell();
     window.set_layer(Layer::Bottom);
     window.auto_exclusive_zone_enable();
@@ -550,7 +550,7 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     }
 
     window.set_default_height(30);
-    
+
     info!("Layer shell configured successfully");
     Ok(())
 }
@@ -589,7 +589,7 @@ async fn monitor_battery() -> Result<()> {
         }
     };
     info!("Initial battery state processed"); 
-    
+
     // Subscribe to UPower property changes before creating MessageStream.
     // Without this subscription, the MessageStream receives no messages because
     // D-Bus requires explicit signal subscriptions via match rules.
@@ -604,7 +604,7 @@ async fn monitor_battery() -> Result<()> {
         .member("PropertiesChanged")?
         .path("/org/freedesktop/UPower/devices/battery_BAT0")?
         .build();
-    
+
     let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
     dbus_proxy.add_match_rule(rule).await?;
     info!("Battery monitor: Subscribed to UPower property changes");
@@ -621,7 +621,7 @@ async fn monitor_battery() -> Result<()> {
         debug!("Got an event in event stream: {:?}", msg);
 
         let header = msg.header();
-        debug!("Battery monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}", 
+        debug!("Battery monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}",
                header.path(), header.interface(), header.member());
 
         let Some(member) = header.member() else {
@@ -635,7 +635,7 @@ async fn monitor_battery() -> Result<()> {
         }
 
         info!("Battery monitor: Received PropertiesChanged signal");
-        
+
         let body = msg.body();
         let Ok(args) = body.deserialize::<(String, std::collections::HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
             warn!("Battery monitor: Failed to deserialize PropertiesChanged message");
@@ -644,14 +644,14 @@ async fn monitor_battery() -> Result<()> {
 
         debug!("Battery monitor: PropertiesChanged interface: {}", args.0);
         debug!("Battery monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
-        
+
         if args.0 != "org.freedesktop.UPower.Device" {
             debug!("Battery monitor: PropertiesChanged for different interface: {}", args.0);
             continue;
         }
 
         info!("Battery monitor: UPower.Device properties changed");
-        
+
         let Some(percent_value) = args.1.get("Percentage") else {
             debug!("Battery monitor: No Percentage property in UPower.Device change");
             continue;
@@ -676,7 +676,7 @@ async fn monitor_battery() -> Result<()> {
 
 fn activate(application: &gtk::Application) -> Result<()> {
     info!("Activating GTK application");
-    
+
     let window = gtk::ApplicationWindow::new(application);
     window.add_css_class("layer-bar");
 
@@ -698,7 +698,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
 
 fn create_tokio_runtime() -> Result<tokio::runtime::Runtime> {
     debug!("Creating tokio runtime");
-    
+
     tokio::runtime::Runtime::new()
         .map_err(|e| AppError::TokioRuntime(format!("Failed to create runtime: {}", e)))
 }
@@ -709,7 +709,7 @@ fn main() -> Result<()> {
 
     let rt = create_tokio_runtime()?;
     let _guard = rt.enter();
-    
+
     let application = gtk::Application::new(Some("sh.wmww.gtk-layer-example"), Default::default());
 
     application.connect_activate(|app| {
@@ -728,6 +728,6 @@ fn main() -> Result<()> {
     tokio::spawn(async move {
         monitor_battery().await;
     });
-    
+
     Ok(())
 }

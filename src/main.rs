@@ -725,9 +725,6 @@ fn main() -> Result<()> {
     // Maybe set up error recovery: exponentially backup retries, currently a failed task will not
     // execute again during the duration of the program
     // Monitor battery status
-    tokio::spawn(async move {
-        monitor_battery().await;
-    });
 
     Ok(())
 }

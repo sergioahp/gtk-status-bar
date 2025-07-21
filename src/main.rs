@@ -366,7 +366,7 @@ fn setup_battery_updates(label: gtk::Label) -> Result<()> {
     }
 
     tokio::spawn(async move {
-        if let Err(e) = monitor_battery().await {
+        if let Err(e) = monitor_dbus().await {
             error!("Battery monitoring failed: {}", e);
         }
     });
@@ -555,39 +555,84 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     Ok(())
 }
 
-async fn monitor_battery() -> Result<()> {
-    info!("Starting battery monitoring task");
-    let connection = Connection::system().await?;
+async fn monitor_dbus() -> Result<()> {
+    info!("Starting D-Bus monitoring task");
+    let connection = Connection::system().await
+        .map_err(|e| {
+            error!("Failed to connect to system D-Bus: {}", e);
+            e
+        })?;
     // Get initial status
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
 
-    let obj_proxy = fdo::PropertiesProxy::builder(&connection)
-        .destination("org.freedesktop.UPower")?
-        .path("/org/freedesktop/UPower/devices/battery_BAT0")?
-        .build()
-        .await?;
-    info!("Object proxy created");
+    // Battery monitoring setup - continue even if this fails since we'll monitor other things
+    let battery_builder_result = fdo::PropertiesProxy::builder(&connection)
+        .destination("org.freedesktop.UPower")
+        .map_err(|e| {
+            error!("Failed to set UPower destination: {}", e);
+            e
+        })
+        .and_then(|builder| builder.path("/org/freedesktop/UPower/devices/battery_BAT0")
+            .map_err(|e| {
+                error!("Failed to set battery device path: {}", e);
+                e
+        }));
 
-    let interface_name = InterfaceName::try_from("org.freedesktop.UPower.Device")?;
-    match obj_proxy
-        .get(interface_name, "Percentage")
-        .await {
-        Ok(value) => {
-            let percentage = f64::try_from(value)?;
-            info!("Battery is at {:.1}%", percentage);
-            let battery_text = format!("🔋 {:.0}%", percentage);
-            send_battery_update(battery_text).await?;
-        }
-        Err(e) => {
-            info!("No battery detected initially (likely desktop system): {}", e);
-            // Invisible label, maybe thing removing the widget altogether or make it invisible or
-            // something: we don't want to polute the bar: if there is no battery then this info
-            // is not so relevant
-            send_battery_update("".to_string()).await?;
+    let obj_proxy = match battery_builder_result {
+        Err(_) => None,
+        Ok(builder) => builder.build().await
+            .map_err(|e| {
+                error!("Failed to build UPower properties proxy: {}", e);
+                e
+            }).ok()
+
+    };
+
+    let battery_proxy_and_interface = obj_proxy
+        .ok_or("No proxy available")
+        .and_then(|proxy| {
+            info!("Battery proxy created successfully");
+            InterfaceName::try_from("org.freedesktop.UPower.Device")
+                .map_err(|e| {
+                    error!("Failed to create interface name: {}", e);
+                    "Interface creation failed"
+                })
+                .map(|interface_name| (proxy, interface_name))
+        })
+        .ok();
+
+    let battery_value = match battery_proxy_and_interface {
+        None => None,
+        Some((proxy, interface_name)) => {
+            proxy.get(interface_name, "Percentage").await
+                .map_err(|e| {
+                    info!("No battery detected initially (likely desktop system): {}", e);
+                }).ok()
         }
     };
+
+    let battery_text = battery_value
+        .and_then(|value| {
+            f64::try_from(value)
+                .map_err(|e| {
+                    error!("Failed to convert battery percentage to f64: {}", e);
+                })
+                .ok()
+        })
+        .map(|percentage| {
+            info!("Battery is at {:.1}%", percentage);
+            format!("🔋 {:.0}%", percentage)
+        })
+        .unwrap_or_else(|| {
+            debug!("Using empty battery text");
+            String::new()
+        });
+
+    send_battery_update(battery_text).await
+        .map_err(|e| error!("Failed to send battery update: {}", e))
+        .ok();
     info!("Initial battery state processed"); 
 
     // Subscribe to UPower property changes before creating MessageStream.
@@ -597,79 +642,94 @@ async fn monitor_battery() -> Result<()> {
     // As per https://openrr.github.io/openrr/zbus/fdo/struct.ObjectManagerProxy.html:
     // "Changes to properties on existing interfaces are not reported using this interface"
     // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
-    let rule = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .sender("org.freedesktop.UPower")?
-        .interface("org.freedesktop.DBus.Properties")?
-        .member("PropertiesChanged")?
-        .path("/org/freedesktop/UPower/devices/battery_BAT0")?
-        .build();
-
     let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
-    dbus_proxy.add_match_rule(rule).await?;
-    info!("Battery monitor: Subscribed to UPower property changes");
+
+    // None to signal a fail: (which ok, there is more monitoring to do)
+    let battery_rule: Option<MatchRule> = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.UPower")
+        .map_err(|e| error!("Failed to set sender in match rule: {}", e))
+        .ok()
+        .and_then(
+            |builder| builder.interface("org.freedesktop.DBus.Properties")
+                .map_err(|e|
+                    error!("Failed to set interfase in match rule: {}", e)
+                ).ok())
+        .and_then(
+            |builder| builder.member("PropertiesChanged")
+                .map_err(|e|
+                    error!("Failed to set member in match rule: {}", e)
+                ).ok())
+        .and_then(|builder|
+            builder.path("/org/freedesktop/UPower/devices/battery_BAT0")
+            .map_err(|e| error!("Failed to set path in match rule: {}", e)
+            ).ok())
+        .and_then(|builder| Some(builder.build()));
+
+
+    if let Some(x) = battery_rule {
+        dbus_proxy.add_match_rule(x)
+            .await
+            .map_err(|e| {
+                error!("Failed to add D-Bus match rule for battery property changes: {}", e);
+            })
+            .ok();
+    }
 
     let mut stream: zbus::MessageStream = connection.into();
     info!("Battery monitor: Starting to listen for D-Bus messages");
 
     while let Some(msg) = stream.next().await {
         let Ok(msg) = msg else {
-            error!("Error receiving DBus message in battery monitor loop");
+            error!(
+                "Error receiving DBus message in the dbus monitor loop: {:?}",
+                msg.err()
+            );
             continue;
         };
 
         debug!("Got an event in event stream: {:?}", msg);
 
         let header = msg.header();
-        debug!("Battery monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}",
+        debug!("Dbus monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}",
                header.path(), header.interface(), header.member());
 
         let Some(member) = header.member() else {
-            debug!("Battery monitor: Message has no member field");
+            debug!("Dbus monitor: Message has no member field: {:?}", header.member());
             continue;
         };
 
-        if member.as_str() != "PropertiesChanged" {
-            debug!("Battery monitor: Ignoring message with member: {}", member.as_str());
-            continue;
-        }
-
-        info!("Battery monitor: Received PropertiesChanged signal");
+        info!("Dbus monitor: Received PropertiesChanged signal");
 
         let body = msg.body();
         let Ok(args) = body.deserialize::<(String, std::collections::HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
-            warn!("Battery monitor: Failed to deserialize PropertiesChanged message");
+            warn!("Dbus monitor: Failed to deserialize PropertiesChanged message");
             continue;
         };
 
         debug!("Battery monitor: PropertiesChanged interface: {}", args.0);
         debug!("Battery monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
 
-        if args.0 != "org.freedesktop.UPower.Device" {
-            debug!("Battery monitor: PropertiesChanged for different interface: {}", args.0);
-            continue;
-        }
-
-        info!("Battery monitor: UPower.Device properties changed");
+        info!("Dbus monitor: UPower.Device properties changed");
 
         let Some(percent_value) = args.1.get("Percentage") else {
-            debug!("Battery monitor: No Percentage property in UPower.Device change");
+            debug!("Dbus monitor: No Percentage property in UPower.Device change");
             continue;
         };
 
         let Ok(percentage) = f64::try_from(percent_value) else {
-            warn!("Battery monitor: Failed to convert percentage value");
+            warn!("Dbus monitor: Failed to convert percentage value");
             continue;
         };
 
-        info!("Battery monitor: Battery percentage updated to {:.1}%", percentage);
+        info!("Dbus monitor: Battery percentage updated to {:.1}%", percentage);
         let battery_text = format!("🔋 {:.0}%", percentage);
         if let Err(e) = send_battery_update(battery_text).await {
-            error!("Battery monitor: Failed to send battery update: {}", e);
+            error!("Dbus monitor: Failed to send battery update: {}", e);
         }
     }
 
-    warn!("Battery monitor: Message stream ended unexpectedly");
+    warn!("Dbus monitor: Message stream ended unexpectedly");
 
     Ok(())
 }

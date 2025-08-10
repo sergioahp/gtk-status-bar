@@ -18,6 +18,9 @@ use zbus_names::InterfaceName;
 use zbus::message::Type as MessageType;
 use zbus::MatchRule;
 use futures::StreamExt;
+use std::collections::HashMap;
+use zbus::zvariant;
+use zbus::zvariant::Value;
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
@@ -26,8 +29,8 @@ struct WorkspaceUpdate {
 }
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
-static TITLE_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
-static BATTERY_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static TITLE_SENDER:     OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static BATTERY_SENDER:   OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -98,7 +101,7 @@ async fn get_initial_title_state() -> Result<String> {
         None => String::new()
     };
 
-    info!("Initial title: {:?}", display_name);
+    debug!("Initial title: {:?}", display_name);
     Ok(display_name)
 }
 
@@ -138,7 +141,7 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
     debug!("Handling workspace change event");
 
     let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
-    info!("Workspace changed to: {}", display_name);
+    debug!("Workspace changed to: {}", display_name);
 
     // Send combined workspace update with both name and ID
     let update = WorkspaceUpdate {
@@ -194,10 +197,10 @@ async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEv
 
     if let Some(client) = active_client {
         let formatted_title = format_title_string(client.title, 64);
-        info!("Title changed to: {}", formatted_title);
+        debug!("Title changed to: {}", formatted_title);
         send_title_update(Some(formatted_title)).await
     } else {
-        info!("No active client matches the title change event");
+        debug!("No active client matches the title change event");
         Ok(())
     }
 }
@@ -216,7 +219,7 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
         }
     };
 
-    info!("Active window changed, title: '{}'", formatted_title);
+    debug!("Active window changed, title: '{}'", formatted_title);
     debug!("Sending title update: '{}'", formatted_title);
     send_title_update(Some(formatted_title)).await
 }
@@ -227,7 +230,7 @@ async fn setup_title_event_listener() -> Result<()> {
 
     let initial_state = get_initial_title_state().await
         .unwrap_or_else(|e| {
-            warn!("Failed to get initial title state: {}", e);
+            error!("Failed to get initial title state: {}", e);
             "".to_string()
         });
 
@@ -276,7 +279,7 @@ async fn setup_workspace_event_listener() -> Result<()> {
             }
         }
         Err(e) => {
-            warn!("Failed to get initial workspace state: {}", e);
+            error!("Failed to get initial workspace state: {}", e);
             let fallback_update = WorkspaceUpdate {
                 name: "Workspace ?".to_string(),
                 id: 1, // WorkspaceId is just an i32
@@ -415,7 +418,7 @@ fn update_time_widget(label: gtk::Label) -> Result<()> {
         let time_str = match get_current_time() {
             Ok(time) => time,
             Err(e) => {
-                warn!("Failed to get current time: {}", e);
+                error!("Failed to get current time: {}", e);
                 "??:??".to_string()
             }
         };
@@ -555,6 +558,30 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     Ok(())
 }
 
+fn process_bluetooth_battery_interface(battery_interface_value: &Value) {
+    match battery_interface_value {
+        Value::Dict(battery_info) => {
+            match battery_info.get::<_, zvariant::Value>(&zvariant::Str::from("Percentage")) {
+                Err(e) => {
+                    error!("Dbus monitor: Failed to get percentage from a bluetooth device's battery: {}", e);
+                },
+                Ok(None) => {
+                    debug!("Bluetooth battery interface found but no Percentage property");
+                },
+                Ok(Some(Value::U8(percentage))) => {
+                    info!("Dbus monitor: added bluetooth battery interface's value: {:?}%", percentage);
+                }
+                Ok(Some(other)) => {
+                    debug!("Bluetooth battery Percentage property has unexpected type: {:?}", other);
+                },
+            }
+        },
+        other => {
+            error!("Dbus monitor: Failed to parse battery_info as Dict: {:?}", other);
+        }
+    }
+}
+
 async fn monitor_dbus() -> Result<()> {
     info!("Starting D-Bus monitoring task");
     let connection = Connection::system().await
@@ -644,22 +671,32 @@ async fn monitor_dbus() -> Result<()> {
     // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
     let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
 
+    // from the connection, we get the dbus_proxy, we add the rules to the proxy
+    // which makes it so that when we do connection.into() to get a stream
+    // we can think of the rules being *inside* that connection
+
+    // Probably we have tried to go from dbus_proxy to stream, should have
+    // documented the attempt but we didn't
+
+    // Some code online seems to use select!, which merges multiple async sources into one
+    // We should think if select! + multiple streams is better. The current approach is
+    // One stream, multiple match rules, branch out depending on the type of event
+
     // None to signal a fail: (which ok, there is more monitoring to do)
     let battery_rule: Option<MatchRule> = MatchRule::builder()
         .msg_type(MessageType::Signal)
         .sender("org.freedesktop.UPower")
         .map_err(|e| error!("Failed to set sender in match rule: {}", e))
         .ok()
-        .and_then(
-            |builder| builder.interface("org.freedesktop.DBus.Properties")
-                .map_err(|e|
-                    error!("Failed to set interfase in match rule: {}", e)
-                ).ok())
-        .and_then(
-            |builder| builder.member("PropertiesChanged")
-                .map_err(|e|
-                    error!("Failed to set member in match rule: {}", e)
-                ).ok())
+        .and_then(|builder|
+            builder.interface("org.freedesktop.DBus.Properties")
+            .map_err(|e| error!("Failed to set interface in match rule: {}", e))
+            .ok())
+        .and_then(|builder|
+            builder.member("PropertiesChanged")
+            .map_err(|e|
+            error!("Failed to set member in match rule: {}", e))
+            .ok())
         .and_then(|builder|
             builder.path("/org/freedesktop/UPower/devices/battery_BAT0")
             .map_err(|e| error!("Failed to set path in match rule: {}", e)
@@ -676,8 +713,36 @@ async fn monitor_dbus() -> Result<()> {
             .ok();
     }
 
+    let bt_interface_added_rule: Option<MatchRule> = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.bluez")
+        .map_err(|e|
+            error!("Failed to set sender in Bluetooth match rule: {}", e))
+        .ok()
+        .and_then(|builder|
+            builder.interface("org.freedesktop.DBus.ObjectManager")
+            .map_err(|e|
+            error!("Failed to set interface in Bluetooth match rule: {}", e))
+            .ok())
+        .and_then(|builder|
+            builder.member("InterfacesAdded")
+            .map_err(|e|
+            error!("Failed to set member in Bluetooth match rule: {}", e))
+            .ok())
+        .and_then(|builder| Some(builder.build()));
+
+    if let Some(x) = bt_interface_added_rule {
+        dbus_proxy.add_match_rule(x)
+            .await
+            .map_err(|e| {
+                error!("Failed to add Bluetooth InterfacesAdded match rule: {}", e);
+            })
+            .ok();
+    }
+
+
     let mut stream: zbus::MessageStream = connection.into();
-    info!("Battery monitor: Starting to listen for D-Bus messages");
+    info!("Dbus monitor: Starting to listen for D-Bus messages");
 
     while let Some(msg) = stream.next().await {
         let Ok(msg) = msg else {
@@ -691,45 +756,350 @@ async fn monitor_dbus() -> Result<()> {
         debug!("Got an event in event stream: {:?}", msg);
 
         let header = msg.header();
+
+        // We are listening to only signals, which by the spec they should have path, interface and
+        // member present, so we skip the loop if not
         debug!("Dbus monitor: Received D-Bus message from path: {:?}, interface: {:?}, member: {:?}",
                header.path(), header.interface(), header.member());
 
-        let Some(member) = header.member() else {
-            debug!("Dbus monitor: Message has no member field: {:?}", header.member());
-            continue;
+        let path = match header.path() {
+            Some(path) => path.as_str(),
+            None => {
+                error!("Dbus monitor: Received message with no path, ignoring");
+                continue;
+            }
         };
 
-        info!("Dbus monitor: Received PropertiesChanged signal");
-
-        let body = msg.body();
-        let Ok(args) = body.deserialize::<(String, std::collections::HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
-            warn!("Dbus monitor: Failed to deserialize PropertiesChanged message");
-            continue;
+        let member = match header.member() {
+            Some(m) => m.as_str(),
+            None => {
+                debug!("Dbus monitor: Message has no member field: {:?}", header.member());
+                continue;
+            }
         };
 
-        debug!("Battery monitor: PropertiesChanged interface: {}", args.0);
-        debug!("Battery monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
-
-        info!("Dbus monitor: UPower.Device properties changed");
-
-        let Some(percent_value) = args.1.get("Percentage") else {
-            debug!("Dbus monitor: No Percentage property in UPower.Device change");
-            continue;
+        let interface = match header.interface() {
+            Some(interface) => interface.as_str(),
+            None => {
+          debug!("Dbus monitor: Message has no interface field: {:?}", header.interface());
+                continue;
+            }
         };
 
-        let Ok(percentage) = f64::try_from(percent_value) else {
-            warn!("Dbus monitor: Failed to convert percentage value");
-            continue;
-        };
+        info!("Dbus monitor: Received signal");
 
-        info!("Dbus monitor: Battery percentage updated to {:.1}%", percentage);
-        let battery_text = format!("🔋 {:.0}%", percentage);
-        if let Err(e) = send_battery_update(battery_text).await {
-            error!("Dbus monitor: Failed to send battery update: {}", e);
+        match (path, interface, member) {
+            (_, "org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => {
+                info!("Dbus monitor: Received InterfacesAdded signal from ObjectManager");
+                // let interfaces_and_properties = msg
+                // .body()
+                // // Do we get to observe at which point did the deserialization failed?
+                // .deserialize::<(String, HashMap<String, HashMap<String, zvariant::Value>>)>()
+                // .map_err(|e| {
+                //     error!("Failed to deserialize InterfacesAdded message body: {}", e);
+                //         e
+                //     }).ok();
+                let body = msg.body();
+                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+                    error!("Dbus monitor: Failed to deserialize InterfacesAdded message body as Structure");
+                    continue;
+                };
+
+                let fields = body_deserialized.fields();
+
+                // Destructure into two separate Values first
+                let (object_path_value, interfaces_dict_value) = match fields {
+                    [a, b] => (a, b),
+                    other => {
+                        error!("Dbus monitor: Expected exactly 2 fields, got: {}", other.len());
+                        continue;
+                    }
+                };
+
+                // TODO: Add nested function here to extract and validate object path
+                // fn extract_object_path(value: &Value) -> Result<&str, String> {
+                //     match value {
+                //         Value::ObjectPath(path) => Ok(path.as_str()),
+                //         other => Err(format!("Expected ObjectPath, got: {:?}", other))
+                //     }
+                // }
+                // This will allow other InterfacesAdded handling code to reuse path extraction
+
+                let interfaces_and_properties = match interfaces_dict_value {
+                    Value::Dict(dict) => dict,
+                    other => {
+                        error!("Dbus monitor: Expected Dict as second field, got: {:?}", other);
+                        continue;
+                    }
+                };
+
+                // Create longer-lived Str bindings
+                let bluetooth_interface_key = zvariant::Str::from("org.bluez.Device1");
+                let upower_interface_key = zvariant::Str::from("org.freedesktop.UPower.Device");
+
+                // Debug: print all available interfaces in the dict
+                debug!("Available interfaces in InterfacesAdded: {:?}", 
+                       interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
+
+                // Check for Bluetooth MediaTransport1 interface (indicates media device connection)
+                let media_transport_key = zvariant::Str::from("org.bluez.MediaTransport1");
+                // TODO: split Ok and Some for better logging
+                // TODO: incorporate if let Stuff() instead of two branched match statements
+                if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_transport_key) {
+                    info!("Dbus monitor: Bluetooth media device connected");
+                    // TODO: Extract device info and update Bluetooth media widget in future versions
+                };
+
+                // let bluetooth_battery_key = zvariant::Str::from("org.bluez.Battery1");
+                // let percentage = match interfaces_and_properties.get::<_, Value>(&bluetooth_battery_key) {
+                //     Ok(v) => v,
+                //     Err(e) => {
+                //         error!("Failed to get bluetooth battery percentage property: {}", e);
+                //         continue;
+                //     }
+                // }
+                // if let Ok(v) = interfaces_and_properties.get::<_, Value>(&bluetooth_battery_key) {
+                //     info!("Dbus monitor: bluetooth device with battery interface connected");
+                //     let Some(battery_info) = v else {
+                //         // This is not an error because if it is paired but not connected then
+                //         // we get None
+                //         warn!("Dbus monitor: got value of org.bluez.Battery1 but it's None");
+                //         // So, probably should not skip to next iteration, what if there are other
+                //         // interfaces you want to inspect
+                //         // maybe use a function and returns?
+                //         // If you do a function that'd be nice because you will parse this battery
+                //         // info on interfaces changed too
+                //         // or accept one more level of indentation an do an if-else
+                //         continue;
+                //     };
+                //     // let Value::Dict(battery_info) = v else {
+                //     //     error!("Dbus monitor: couldn't parse battery as a Value::Dict");
+                //     //     continue
+                //     // };
+                //     // match zvariant::Dict::try_from(battery_info) {
+                //     //     Ok(v) => v,
+                //     //     _ => {continue;}
+                //     // };
+                //     let Ok(battery_info) = zvariant::Dict::try_from(battery_info) else {
+                //         error!("Dbus monitor: Failed to parse battery_info as Dict");
+                //         continue;
+                //     };
+                //     let percentage = battery_info.get::<_,u8>(&zvariant::Str::from("Percentage"));
+                //     let Ok(percentage) = percentage else {
+                //         error!("Dbus monitor: Failed to get percentage from a bluetooth device's battery");
+                //         continue;
+                //     };
+                //     let Some(percentage) = percentage else {
+                //         error!("Dbus monitor: got percentage from a bluetooth device's batterry but it's None");
+                //         continue;
+                //     };
+                //     info!("Dbus monitor: added bluetooth battery interface's value: {:?}%", percentage);
+                //     // TODO: show percentage on the bluetooth thing
+                // };
+                match interfaces_and_properties.get::<_, Value>(&zvariant::Str::from("org.bluez.Battery1")) {
+                    Err(e) => {
+                        error!("Failed to get bluetooth battery interface: {}", e);
+                    },
+                    Ok(None) => {
+                        debug!("Not a device with org.bluez.Battery1 interface");
+                    },
+                    Ok(Some(battery_interface_value)) => {
+                        process_bluetooth_battery_interface(&battery_interface_value);
+                    }
+                };
+
+
+
+                // Check for UPower Device interface
+                if let Some(Value::Dict(_battery_props)) = interfaces_and_properties
+                    .get::<_, Value>(&upower_interface_key)
+                    .ok()
+                    .flatten() {
+                    info!("Dbus monitor: Battery device added");
+                    // Possibly refresh battery information or re-subscribe if needed
+                }
+
+            }
+            (_, "org.freedesktop.DBus.Properties", "PropertiesChanged") => {
+                info!("Dbus monitor: Received PropertiesChanged signal");
+                let body = msg.body();
+                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+                    error!("Dbus monitor: Failed to deserialize PropertiesChanged message body as Structure");
+                    continue;
+                };
+                let fields = body_deserialized.fields();
+                let (interface_name_val, changed_properties_val, invalidated_properties) = match fields {
+                    [a, b, c] => (a, b, c),
+                    other => {
+                        error!("Dbus monitor: Expected exactly 3 fields, got: {}", other.len());
+                        continue;
+                    }
+                };
+                // Convert name, match if it is battery
+                let interface_names = match interface_name_val {
+                    Value::Str(val) => val,
+                    other => {
+                        error!("Dbus monitor: Expected interface name to be a string, got: {:?}", other);
+                        continue;
+                    }
+                };
+
+                match interface_names.as_str() {
+                    "org.freedesktop.UPower.Device" => {
+                        let changed_properties = match changed_properties_val {
+                            Value::Dict(dict) => dict,
+                            other => {
+                                error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", other);
+                                continue;
+                            }
+                        };
+
+                        let percentage_key = Value::Str("Percentage".into());
+                        let percentage_value = match changed_properties.get::<_, Value>(&percentage_key) {
+                            Ok(Some(value)) => {
+                                debug!("Successfully retrieved Percentage property: {:?}", value);
+                                value
+                            }
+                            Ok(None) => {
+                                debug!("Percentage property not present in changed properties");
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("Failed to get Percentage property: {}", e);
+                                continue;
+                            }
+                        };
+
+                        let percentage = match u8::try_from(percentage_value) {
+                            Ok(value) => {
+                                debug!("Battery percentage parsed as: {}%", value);
+                                value
+                            }
+                            Err(e) => {
+                                error!("Failed to parse Percentage value as u8: {}", e);
+                                continue;
+                            }
+                        };
+
+                        info!("Dbus monitor: Battery percentage changed to {}%", percentage);
+                        let battery_text = format!("🔋 {:.0}%", percentage);
+                        if let Err(e) = send_battery_update(battery_text).await {
+                            error!("Dbus monitor: Failed to send battery update: {}", e);
+                        }
+
+                    }
+                    "org.bluez.Battery1" => {
+                        let Value::Dict(_) = changed_properties_val else {
+                            error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", changed_properties_val);
+                            continue;
+                        };
+
+                        // Use the existing function by passing changed properties as Value::Dict
+                        process_bluetooth_battery_interface(changed_properties_val);
+                    }
+                    other => {
+                        debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);
+                        continue;
+                    }
+                };
+
+            }
+            (_, "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
+                info!("Dbus monitor: Received InterfacesRemoved signal from ObjectManager");
+                let body = msg.body();
+                let Ok(Value::Array(removed_interfaces)) = body.deserialize() else {
+                    error!("Dbus monitor: Failed to deserialize InterfacesRemoved message body as Array");
+                    continue;
+                };
+                // Check len is 2
+                if removed_interfaces.len() != 2 {
+                    error!("Dbus monitor: Expected 2 elements in InterfacesRemoved body array, got {}", removed_interfaces.len());
+                    continue;
+                }
+
+                // TODO: consider skipping this until the last moment
+                let object_path = match &removed_interfaces[0] {
+                    Value::ObjectPath(object_path) => object_path,
+                    other => {
+                        error!("Dbus monitor: Expected ObjectPath as first element, got {:?}", other);
+                        continue;
+                    }
+                };
+
+                let interfaces = match &removed_interfaces[1] {
+                    Value::Array(arr) => arr,
+                    other => {
+                        error!("Dbus monitor: Expected Array as second element, got {:?}", other);
+                        continue;
+                    }
+                };
+
+                debug!("Dbus monitor: Interfaces removed from {}: {:?}", object_path, interfaces);
+
+                // Check for bt battery or media interfaces and handle them
+                for iface in interfaces.iter() {
+                    if let Value::Str(interface_name) = iface {
+                        match interface_name.as_str() {
+                            "org.bluez.Battery1" => {
+                                info!("Dbus monitor: Bluetooth battery interface removed from {}", object_path);
+                                // TODO: Handle cleanup or UI update for removed bluetooth battery interface
+                            }
+                            "org.bluez.MediaTransport1" => {
+                                info!("Dbus monitor: Bluetooth media interface removed from {}", object_path);
+                                // TODO: Handle cleanup or UI update for removed bluetooth media interface
+                            }
+                            "org.freedesktop.UPower.Device" => {
+                                info!("Dbus monitor: UPower battery interface removed from {}", object_path);
+                                // TODO: Handle cleanup or UI update for removed battery device
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+
+
+
+
+
+
+            }
+            _ => {
+                warn!("Dbus monitor: Unhandled signal: path: {}, interface: {}, member: {}", path, interface, member);
+            }
         }
+
+
+        // let body = msg.body();
+        // // This does not work for the bluetooht stuff
+        // let Ok(args) = body.deserialize::<(String, HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
+        //     error!("Dbus monitor: Failed to deserialize PropertiesChanged message");
+        //     continue;
+        // };
+        //
+        // debug!("Dbus monitor: PropertiesChanged interface: {}", args.0);
+        // debug!("Dbus monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
+        //
+        // info!("Dbus monitor: UPower.Device properties changed");
+        //
+        // let Some(percent_value) = args.1.get("Percentage") else {
+        //     debug!("Dbus monitor: No Percentage property in UPower.Device change");
+        //     continue;
+        // };
+        //
+        // let Ok(percentage) = f64::try_from(percent_value) else {
+        //     error!("Dbus monitor: Failed to convert percentage value");
+        //     continue;
+        // };
+        //
+        // info!("Dbus monitor: Battery percentage updated to {:.1}%", percentage);
+        // let battery_text = format!("🔋 {:.0}%", percentage);
+        // if let Err(e) = send_battery_update(battery_text).await {
+        //     error!("Dbus monitor: Failed to send battery update: {}", e);
+        // }
     }
 
-    warn!("Dbus monitor: Message stream ended unexpectedly");
+    error!("Dbus monitor: Message stream ended unexpectedly");
 
     Ok(())
 }

@@ -582,6 +582,49 @@ fn process_bluetooth_battery_interface(battery_interface_value: &Value) {
     }
 }
 
+fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
+    // Check State property (charging/discharging/fully charged)
+    match properties_dict.get::<_, zvariant::Value>(&zvariant::Str::from("State")) {
+        Err(e) => {
+            debug!("Dbus monitor: Failed to get State property from battery device: {}", e);
+        },
+        Ok(None) => {
+            debug!("Battery device properties found but no State property");
+        },
+        Ok(Some(Value::U32(state))) => {
+            match state {
+                0 => info!("Dbus monitor: Battery state: Unknown"),
+                1 => info!("Dbus monitor: Battery state: Charging (plugged in)"),
+                2 => info!("Dbus monitor: Battery state: Discharging (unplugged)"),
+                3 => info!("Dbus monitor: Battery state: Empty"),
+                4 => info!("Dbus monitor: Battery state: Fully charged (plugged in)"),
+                5 => info!("Dbus monitor: Battery state: Pending charge"),
+                6 => info!("Dbus monitor: Battery state: Pending discharge"),
+                other => info!("Dbus monitor: Battery state: Unknown value {}", other),
+            }
+        },
+        Ok(Some(other)) => {
+            debug!("Battery State property has unexpected type: {:?}", other);
+        },
+    }
+
+    // Check Percentage property (existing functionality)
+    match properties_dict.get::<_, zvariant::Value>(&zvariant::Str::from("Percentage")) {
+        Err(e) => {
+            debug!("Dbus monitor: Failed to get Percentage property from battery device: {}", e);
+        },
+        Ok(None) => {
+            debug!("Battery device properties found but no Percentage property");
+        },
+        Ok(Some(Value::F64(percentage))) => {
+            info!("Dbus monitor: Battery percentage: {:.1}%", percentage);
+        },
+        Ok(Some(other)) => {
+            debug!("Battery Percentage property has unexpected type: {:?}", other);
+        },
+    }
+}
+
 async fn monitor_dbus() -> Result<()> {
     info!("Starting D-Bus monitoring task");
     let connection = Connection::system().await
@@ -954,37 +997,17 @@ async fn monitor_dbus() -> Result<()> {
                             }
                         };
 
+                        // Use the new battery properties processing function
+                        process_battery_device_properties(changed_properties);
+
+                        // Keep existing UI update logic for percentage changes only
                         let percentage_key = Value::Str("Percentage".into());
-                        let percentage_value = match changed_properties.get::<_, Value>(&percentage_key) {
-                            Ok(Some(value)) => {
-                                debug!("Successfully retrieved Percentage property: {:?}", value);
-                                value
+                        if let Ok(Some(Value::F64(percentage))) = changed_properties.get::<_, Value>(&percentage_key) {
+                            info!("Dbus monitor: Battery percentage changed to {:.1}%", percentage);
+                            let battery_text = format!("🔋 {:.0}%", percentage);
+                            if let Err(e) = send_battery_update(battery_text).await {
+                                error!("Dbus monitor: Failed to send battery update: {}", e);
                             }
-                            Ok(None) => {
-                                debug!("Percentage property not present in changed properties");
-                                continue;
-                            }
-                            Err(e) => {
-                                error!("Failed to get Percentage property: {}", e);
-                                continue;
-                            }
-                        };
-
-                        let percentage = match u8::try_from(percentage_value) {
-                            Ok(value) => {
-                                debug!("Battery percentage parsed as: {}%", value);
-                                value
-                            }
-                            Err(e) => {
-                                error!("Failed to parse Percentage value as u8: {}", e);
-                                continue;
-                            }
-                        };
-
-                        info!("Dbus monitor: Battery percentage changed to {}%", percentage);
-                        let battery_text = format!("🔋 {:.0}%", percentage);
-                        if let Err(e) = send_battery_update(battery_text).await {
-                            error!("Dbus monitor: Failed to send battery update: {}", e);
                         }
 
                     }

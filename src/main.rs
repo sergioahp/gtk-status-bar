@@ -805,6 +805,13 @@ async fn monitor_dbus() -> Result<()> {
                         }
 
                         // Check for MediaTransport1 interface
+                        // TODO: Problem: on the top level bt device of my earbuds
+                        // we see MediaControl1 but not MediaTransport1
+                        // this breaks the assumption that we wouldn't need to corelate
+                        // multiple paths to a single physical device
+                        // OR we could use MediaControl1
+                        // we also assume the toplevel one is the one with
+                        // Device1
                         if interfaces.contains_key("org.bluez.MediaTransport1") {
                             has_media = true;
                             debug!("Found Bluetooth device with media transport at: {}", object_path);
@@ -1041,7 +1048,25 @@ async fn monitor_dbus() -> Result<()> {
                 // TODO: incorporate if let Stuff() instead of two branched match statements
                 if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_transport_key) {
                     info!("Dbus monitor: Bluetooth media device connected");
-                    // TODO: Extract device info and update Bluetooth media widget in future versions
+                    // Update HashMap with media capability
+                    if let Value::ObjectPath(object_path) = object_path_value {
+                        if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                            device.has_media = true;
+                            info!("Updated device {} with media capability", object_path);
+                        } else {
+                            debug!("Creating new device in hashmap for media: {}", object_path);
+                            bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                                device_path: object_path.to_string(),
+                                has_battery: false,
+                                has_media: true,
+                                battery_percentage: None,
+                                device_name: None, // TODO: Extract device name from interfaces if available
+                            });
+                            info!("Created new device {} with media capability via InterfacesAdded", object_path);
+                        }
+                    } else {
+                        error!("Expected ObjectPath for media device path field, got: {:?}. Skipping update to bluetooth_devices", object_path_value);
+                    }
                 };
 
                 // let bluetooth_battery_key = zvariant::Str::from("org.bluez.Battery1");
@@ -1098,8 +1123,28 @@ async fn monitor_dbus() -> Result<()> {
                         debug!("Not a device with org.bluez.Battery1 interface");
                     },
                     Ok(Some(battery_interface_value)) => {
-                        let _percentage = process_bluetooth_battery_interface(&battery_interface_value);
-                        // TODO: Use _percentage to update Bluetooth battery widget in GUI
+                        let percentage = process_bluetooth_battery_interface(&battery_interface_value);
+                        // Update HashMap with new battery percentage
+                        if let Value::ObjectPath(object_path) = object_path_value {
+                            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                                device.has_battery = true;
+                                device.battery_percentage = percentage;
+                                info!("Updated device {} battery: {:?}%", object_path, percentage);
+                            } else {
+                                debug!("Creating new device in hashmap: {}", object_path);
+                                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                                    device_path: object_path.to_string(),
+                                    has_battery: true,
+                                    has_media: false,
+                                    battery_percentage: percentage,
+                                    device_name: None, // TODO: Extract device name from interfaces if available
+                                });
+                                info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
+                            }
+                        } else {
+                            error!("Expected ObjectPath for object path field, got: {:?}. Skiping update to bluetooth_devices", object_path_value);
+                        }
+                        // TODO: Use percentage to update Bluetooth battery widget in GUI
                     }
                 };
 
@@ -1166,8 +1211,34 @@ async fn monitor_dbus() -> Result<()> {
                         };
 
                         // Use the existing function by passing changed properties as Value::Dict
-                        let _percentage = process_bluetooth_battery_interface(changed_properties_val);
-                        // TODO: Use _percentage to update Bluetooth battery widget in GUI
+                        let percentage = process_bluetooth_battery_interface(changed_properties_val);
+                        // Update HashMap with new battery percentage
+                        if let Some(device) = bluetooth_devices.get_mut(path) {
+                            device.battery_percentage = percentage;
+                            info!("Updated device {} battery via PropertiesChanged: {:?}%", path, percentage);
+                        } else {
+                            debug!("Bluetooth battery device not found in hashmap: {}. Device may not be tracked yet.", path);
+                        }
+                        // TODO: Use percentage to update Bluetooth battery widget in GUI
+                    }
+                    "org.bluez.MediaTransport1" => {
+                        info!("Dbus monitor: MediaTransport1 properties changed for {}", path);
+                        // Update HashMap with media capability if device exists
+                        if let Some(device) = bluetooth_devices.get_mut(path) {
+                            device.has_media = true;
+                            info!("Updated device {} with media capability via PropertiesChanged", path);
+                        } else {
+                            debug!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
+                            bluetooth_devices.insert(path.to_string(), BluetoothDevice {
+                                device_path: path.to_string(),
+                                has_battery: false,
+                                has_media: true,
+                                battery_percentage: None,
+                                device_name: None, // TODO: Extract device name if available
+                            });
+                            info!("Created new device {} with media capability via PropertiesChanged", path);
+                        }
+                        // TODO: Process specific MediaTransport1 properties if needed
                     }
                     other => {
                         debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);

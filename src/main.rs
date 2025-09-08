@@ -992,14 +992,6 @@ async fn monitor_dbus() -> Result<()> {
         match (path, interface, member) {
             (_, "org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => {
                 info!("Dbus monitor: Received InterfacesAdded signal from ObjectManager");
-                // let interfaces_and_properties = msg
-                // .body()
-                // // Do we get to observe at which point did the deserialization failed?
-                // .deserialize::<(String, HashMap<String, HashMap<String, zvariant::Value>>)>()
-                // .map_err(|e| {
-                //     error!("Failed to deserialize InterfacesAdded message body: {}", e);
-                //         e
-                //     }).ok();
                 let body = msg.body();
                 let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
                     error!("Dbus monitor: Failed to deserialize InterfacesAdded message body as Structure");
@@ -1069,52 +1061,6 @@ async fn monitor_dbus() -> Result<()> {
                     }
                 };
 
-                // let bluetooth_battery_key = zvariant::Str::from("org.bluez.Battery1");
-                // let percentage = match interfaces_and_properties.get::<_, Value>(&bluetooth_battery_key) {
-                //     Ok(v) => v,
-                //     Err(e) => {
-                //         error!("Failed to get bluetooth battery percentage property: {}", e);
-                //         continue;
-                //     }
-                // }
-                // if let Ok(v) = interfaces_and_properties.get::<_, Value>(&bluetooth_battery_key) {
-                //     info!("Dbus monitor: bluetooth device with battery interface connected");
-                //     let Some(battery_info) = v else {
-                //         // This is not an error because if it is paired but not connected then
-                //         // we get None
-                //         warn!("Dbus monitor: got value of org.bluez.Battery1 but it's None");
-                //         // So, probably should not skip to next iteration, what if there are other
-                //         // interfaces you want to inspect
-                //         // maybe use a function and returns?
-                //         // If you do a function that'd be nice because you will parse this battery
-                //         // info on interfaces changed too
-                //         // or accept one more level of indentation an do an if-else
-                //         continue;
-                //     };
-                //     // let Value::Dict(battery_info) = v else {
-                //     //     error!("Dbus monitor: couldn't parse battery as a Value::Dict");
-                //     //     continue
-                //     // };
-                //     // match zvariant::Dict::try_from(battery_info) {
-                //     //     Ok(v) => v,
-                //     //     _ => {continue;}
-                //     // };
-                //     let Ok(battery_info) = zvariant::Dict::try_from(battery_info) else {
-                //         error!("Dbus monitor: Failed to parse battery_info as Dict");
-                //         continue;
-                //     };
-                //     let percentage = battery_info.get::<_,u8>(&zvariant::Str::from("Percentage"));
-                //     let Ok(percentage) = percentage else {
-                //         error!("Dbus monitor: Failed to get percentage from a bluetooth device's battery");
-                //         continue;
-                //     };
-                //     let Some(percentage) = percentage else {
-                //         error!("Dbus monitor: got percentage from a bluetooth device's batterry but it's None");
-                //         continue;
-                //     };
-                //     info!("Dbus monitor: added bluetooth battery interface's value: {:?}%", percentage);
-                //     // TODO: show percentage on the bluetooth thing
-                // };
                 match interfaces_and_properties.get::<_, Value>(&zvariant::Str::from("org.bluez.Battery1")) {
                     Err(e) => {
                         error!("Failed to get bluetooth battery interface: {}", e);
@@ -1314,34 +1260,6 @@ async fn monitor_dbus() -> Result<()> {
             }
         }
 
-
-        // let body = msg.body();
-        // // This does not work for the bluetooht stuff
-        // let Ok(args) = body.deserialize::<(String, HashMap<String, zbus::zvariant::Value>, Vec<String>)>() else {
-        //     error!("Dbus monitor: Failed to deserialize PropertiesChanged message");
-        //     continue;
-        // };
-        //
-        // debug!("Dbus monitor: PropertiesChanged interface: {}", args.0);
-        // debug!("Dbus monitor: PropertiesChanged properties: {:?}", args.1.keys().collect::<Vec<_>>());
-        //
-        // info!("Dbus monitor: UPower.Device properties changed");
-        //
-        // let Some(percent_value) = args.1.get("Percentage") else {
-        //     debug!("Dbus monitor: No Percentage property in UPower.Device change");
-        //     continue;
-        // };
-        //
-        // let Ok(percentage) = f64::try_from(percent_value) else {
-        //     error!("Dbus monitor: Failed to convert percentage value");
-        //     continue;
-        // };
-        //
-        // info!("Dbus monitor: Battery percentage updated to {:.1}%", percentage);
-        // let battery_text = format!("🔋 {:.0}%", percentage);
-        // if let Err(e) = send_battery_update(battery_text).await {
-        //     error!("Dbus monitor: Failed to send battery update: {}", e);
-        // }
     }
 
     error!("Dbus monitor: Message stream ended unexpectedly");

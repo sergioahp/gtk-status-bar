@@ -1,5 +1,7 @@
 mod error;
 
+use anyhow::{Context, Result};
+
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk::glib;
@@ -11,16 +13,17 @@ use hyprland::event_listener::AsyncEventListener;
 use hyprland::async_closure;
 use std::sync::OnceLock;
 use tracing::{info, warn, error, debug};
-use error::{AppError, Result};
+// use error::{AppError, Result};
 use zbus::Connection;
 use zbus::fdo;
 use zbus_names::InterfaceName;
 use zbus::message::Type as MessageType;
 use zbus::MatchRule;
-use futures::StreamExt;
 use std::collections::HashMap;
 use zbus::zvariant;
 use zbus::zvariant::Value;
+use futures::{TryStreamExt, StreamExt};
+use futures::future::ready;
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
@@ -107,32 +110,32 @@ async fn get_initial_title_state() -> Result<String> {
 
 async fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
     let sender = WORKSPACE_SENDER.get()
-        .ok_or_else(|| AppError::WorkspaceChannel("Global sender not initialized".to_string()))?;
+        .context("Global workspace sender not initialized")?;
 
     sender.send(update)
-        .map_err(|e| AppError::WorkspaceChannel(format!("Failed to send update: {}", e)))?;
+        .context("Failed to send workspace update")?;
 
     Ok(())
 }
 
 async fn send_title_update(update: Option<String>) -> Result<()> {
     let sender = TITLE_SENDER.get()
-        .ok_or_else(|| AppError::TitleChannel("Global sender not initialized".to_string()))?;
+        .context("Global title sender not initialized")?;
 
     // TODO: maybe handle None variant as: remove the widget? maybe pass as optional and handle
     // that None case elsewere
     sender.send(update.unwrap_or_default())
-        .map_err(|e| AppError::TitleChannel(format!("Failed to send update: {}", e)))?;
+        .context("Failed to send title update")?;
 
     Ok(())
 }
 
 async fn send_battery_update(update: String) -> Result<()> {
     let sender = BATTERY_SENDER.get()
-        .ok_or_else(|| AppError::BatteryChannel("Global sender not initialized".to_string()))?;
+        .context("Global battery sender not initialized")?;
 
     sender.send(update)
-        .map_err(|e| AppError::BatteryChannel(format!("Failed to send update: {}", e)))?;
+        .context("Failed to send battery update")?;
 
     Ok(())
 }
@@ -312,7 +315,7 @@ fn setup_workspace_updates(label: gtk::Label, title_widget: gtk::Label) -> Resul
     // Set up combined workspace updates
     let (tx, mut rx) = mpsc::unbounded_channel();
     if WORKSPACE_SENDER.set(tx).is_err() {
-        return Err(AppError::WorkspaceChannel("Failed to set global workspace sender".to_string()));
+        return Err(anyhow::anyhow!("Failed to set global workspace sender"));
     }
 
     tokio::spawn(async move {
@@ -340,7 +343,7 @@ fn setup_title_updates(label: gtk::Label) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     if TITLE_SENDER.set(tx).is_err() {
-        return Err(AppError::TitleChannel("Failed to set global title sender".to_string()));
+        return Err(anyhow::anyhow!("Failed to set global title sender"));
     }
 
     tokio::spawn(async move {
@@ -365,7 +368,7 @@ fn setup_battery_updates(label: gtk::Label) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     if BATTERY_SENDER.set(tx).is_err() {
-        return Err(AppError::BatteryChannel("Failed to set global battery sender".to_string()));
+        return Err(anyhow::anyhow!("Failed to set global battery sender"));
     }
 
     tokio::spawn(async move {
@@ -558,26 +561,72 @@ fn configure_layer_shell(window: &gtk::ApplicationWindow) -> Result<()> {
     Ok(())
 }
 
-fn process_bluetooth_battery_interface(battery_interface_value: &Value) {
+fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
+    u8::try_from(value)
+        .inspect_err(|e| {
+            error!("Failed to convert Bluetooth battery percentage to u8: {}", e);
+        })
+        .ok()
+        .inspect(|percentage| {
+            info!("Bluetooth device battery at {}%", percentage);
+        })
+}
+
+async fn process_battery_percentage(value: Value<'_>) {
+    if let Some(percentage) = f64::try_from(value)
+        .inspect_err(|e| {
+            error!("Failed to convert battery percentage to f64: {}", e);
+        })
+        .ok() 
+    {
+        info!("Battery percentage changed to {:.1}%", percentage);
+        let battery_text = format!("🔋 {:.0}%", percentage);
+        if let Err(e) = send_battery_update(battery_text).await {
+            error!("Failed to send battery update: {}", e);
+        }
+    }
+}
+
+async fn process_battery_state(value: Value<'_>) {
+    if let Some(state) = u32::try_from(value)
+        .inspect_err(|e| {
+            error!("Failed to convert battery state to u32: {}", e);
+        })
+        .ok() 
+    {
+        match state {
+            1 => info!("Battery is charging (state: {})", state),
+            2 => info!("Battery is discharging (state: {})", state),
+            3 => info!("Battery is empty (state: {})", state),
+            4 => info!("Battery is fully charged (state: {})", state),
+            5 => info!("Battery charge is pending (state: {})", state),
+            6 => info!("Battery discharge is pending (state: {})", state),
+            _ => info!("Battery state unknown: {}", state),
+        }
+        // TODO: Future UI update for battery state
+    }
+}
+
+fn process_bluetooth_battery_interface(battery_interface_value: &Value<'_>) -> Option<u8> {
     match battery_interface_value {
         Value::Dict(battery_info) => {
             match battery_info.get::<_, zvariant::Value>(&zvariant::Str::from("Percentage")) {
                 Err(e) => {
                     error!("Dbus monitor: Failed to get percentage from a bluetooth device's battery: {}", e);
+                    None
                 },
                 Ok(None) => {
                     debug!("Bluetooth battery interface found but no Percentage property");
+                    None
                 },
-                Ok(Some(Value::U8(percentage))) => {
-                    info!("Dbus monitor: added bluetooth battery interface's value: {:?}%", percentage);
+                Ok(Some(percentage_value)) => {
+                    process_bluetooth_battery_percentage(percentage_value.clone())
                 }
-                Ok(Some(other)) => {
-                    debug!("Bluetooth battery Percentage property has unexpected type: {:?}", other);
-                },
             }
         },
         other => {
             error!("Dbus monitor: Failed to parse battery_info as Dict: {:?}", other);
+            None
         }
     }
 }
@@ -625,6 +674,17 @@ fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
     }
 }
 
+// UNSAFE assumtion for now: assume Battery1 and MediaTransport1 are on the same object when they
+// exist, but a device could have just one of them or non
+#[derive(Debug, Clone)]
+struct BluetoothDevice {
+    device_path: String,
+    has_battery: bool,
+    has_media: bool,
+    battery_percentage: Option<u8>,
+    device_name: Option<String>,
+}
+
 async fn monitor_dbus() -> Result<()> {
     info!("Starting D-Bus monitoring task");
     let connection = Connection::system().await
@@ -637,73 +697,138 @@ async fn monitor_dbus() -> Result<()> {
     // Probably should monitor if a battery comes into existance so
     // you should not return
 
-    // Battery monitoring setup - continue even if this fails since we'll monitor other things
-    let battery_builder_result = fdo::PropertiesProxy::builder(&connection)
-        .destination("org.freedesktop.UPower")
-        .map_err(|e| {
-            error!("Failed to set UPower destination: {}", e);
-            e
-        })
-        .and_then(|builder| builder.path("/org/freedesktop/UPower/devices/battery_BAT0")
-            .map_err(|e| {
-                error!("Failed to set battery device path: {}", e);
-                e
-        }));
 
-    let obj_proxy = match battery_builder_result {
-        Err(_) => None,
-        Ok(builder) => builder.build().await
-            .map_err(|e| {
-                error!("Failed to build UPower properties proxy: {}", e);
-                e
-            }).ok()
+    // will .ok() later
+    let properties_proxy = zbus::fdo::PropertiesProxy::new(
+        &connection,
+        "org.freedesktop.UPower",
+        "/org/freedesktop/UPower/devices/battery_BAT0",
+    ).await
+    .inspect_err(|e| error!("different style to construction battery_BAT0 proxy failed"))
+    .ok();
 
-    };
-
-    let battery_proxy_and_interface = obj_proxy
-        .ok_or("No proxy available")
-        .and_then(|proxy| {
-            info!("Battery proxy created successfully");
-            InterfaceName::try_from("org.freedesktop.UPower.Device")
-                .map_err(|e| {
-                    error!("Failed to create interface name: {}", e);
-                    "Interface creation failed"
-                })
-                .map(|interface_name| (proxy, interface_name))
-        })
+    if let Some(proxy) = properties_proxy {
+        let battery_interface_name = InterfaceName::try_from("org.freedesktop.UPower.Device")
+        .inspect_err(|e| error!("Failed to create interface name: {}", e))
         .ok();
+        if let Some(battery_interface_name) = battery_interface_name {
+            let battery_percentage = proxy.get(battery_interface_name.clone(), "Percentage").await
+            .inspect_err(|e| 
+                info!("No battery detected initially (likely desktop system): {}", e)
+            )
+            .ok()
+            .and_then(|battery| 
+                f64::try_from(battery)
+                .inspect_err(|e| {
+                    error!("Failed to convert battery percentage to f64: {}", e);
+                })
+                .ok());
+        
+            let battery_text = battery_percentage
+                .map(|percentage| {
+                    info!("Battery is at {:.1}%", percentage);
+                    format!("🔋 {:.0}%", percentage)
+                })
+                .unwrap_or_else(|| {
+                    debug!("Using empty battery text");
+                    String::new()
+                });
 
-    let battery_value = match battery_proxy_and_interface {
-        None => None,
-        Some((proxy, interface_name)) => {
-            proxy.get(interface_name, "Percentage").await
-                .map_err(|e| {
-                    info!("No battery detected initially (likely desktop system): {}", e);
-                }).ok()
+            send_battery_update(battery_text).await
+                .inspect_err(|e| error!("Failed to send battery update: {}", e))
+                .ok();
+
+            if let Some(state_value) = proxy.get(battery_interface_name.clone(), "State").await
+                .inspect_err(|e|
+                    info!("No battery state detected initially (likely desktop system): {}", e)
+                )
+                .ok()
+            {
+                process_battery_state(state_value.into()).await;
+            }
         }
     };
 
-    let battery_text = battery_value
-        .and_then(|value| {
-            f64::try_from(value)
-                .map_err(|e| {
-                    error!("Failed to convert battery percentage to f64: {}", e);
-                })
-                .ok()
-        })
-        .map(|percentage| {
-            info!("Battery is at {:.1}%", percentage);
-            format!("🔋 {:.0}%", percentage)
-        })
-        .unwrap_or_else(|| {
-            debug!("Using empty battery text");
-            String::new()
-        });
+    // Initial Bluetooth battery query - check for connected devices with battery info
+    let bluez_proxy = zbus::fdo::PropertiesProxy::new(
+        &connection,
+        "org.bluez",
+        "/", // ObjectManager path
+    ).await
+    .inspect_err(|e| error!("Failed to create Bluez ObjectManager proxy: {}", e))
+    .ok();
 
-    send_battery_update(battery_text).await
-        .map_err(|e| error!("Failed to send battery update: {}", e))
-        .ok();
-    info!("Initial battery state processed"); 
+    // create hashmap of bt devices:
+    let mut bluetooth_devices: HashMap<String, BluetoothDevice> = HashMap::new();
+
+    if let Some(bluez_proxy) = bluez_proxy {
+        // Use ObjectManager to get all managed objects
+        let object_manager = zbus::fdo::ObjectManagerProxy::new(&connection, "org.bluez", "/").await
+            .inspect_err(|e| error!("Failed to create Bluez ObjectManager: {}", e))
+            .ok();
+
+        if let Some(object_manager) = object_manager {
+            match object_manager.get_managed_objects().await {
+                Ok(objects) => {
+                    info!("Found {} Bluetooth objects", objects.len());
+
+                    // Look for Bluetooth devices and populate HashMap
+                    for (object_path, interfaces) in objects {
+                        // Track all BT devices, some might gain battery/media interfaces later
+                        let mut has_battery        = false;
+                        let mut battery_percentage: Option<u8> = None;
+                        let mut device_name: Option<String> = None;
+                        let mut has_media         = false;
+
+                        // Check for Device1 interface (basic device info)
+                        if let Some(device_interface) = interfaces.get("org.bluez.Device1") {
+                            // Extract device name/alias
+                            if let Some(name_value) = device_interface.get("Alias")
+                                .or_else(|| device_interface.get("Name")) {
+                                if let Ok(name) = String::try_from(name_value.clone()) {
+                                    device_name = Some(name);
+                                }
+                            }
+                        }
+
+                        // Check for Battery1 interface
+                        if let Some(battery_interface) = interfaces.get("org.bluez.Battery1") {
+                            info!("Found Bluetooth device with battery at: {}", object_path);
+                            has_battery = true;
+
+                            // Get the battery percentage if available
+                            if let Some(percentage_value) = battery_interface.get("Percentage") {
+                                battery_percentage = process_bluetooth_battery_percentage(percentage_value.clone().into());
+                            } else {
+                                debug!("Bluetooth battery device at {} has no Percentage property", object_path);
+                            }
+                        }
+
+                        // Check for MediaTransport1 interface
+                        if interfaces.contains_key("org.bluez.MediaTransport1") {
+                            has_media = true;
+                            debug!("Found Bluetooth device with media transport at: {}", object_path);
+                        }
+
+                        // Add all Bluetooth devices - they might gain battery/media interfaces later
+                        bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                            device_path: object_path.to_string(),
+                            has_battery,
+                            has_media,
+                            battery_percentage,
+                            device_name,
+                        });
+                    }
+                    debug!("Initial bluetooth devices: {:?}", bluetooth_devices);
+                }
+                Err(e) => {
+                    info!("No Bluetooth devices found or failed to query: {}", e);
+                }
+            }
+        }
+    }
+
+ 
 
     // Subscribe to UPower property changes before creating MessageStream.
     // Without this subscription, the MessageStream receives no messages because
@@ -783,6 +908,32 @@ async fn monitor_dbus() -> Result<()> {
             .ok();
     }
 
+    // Match rule for Bluetooth device disconnections
+    let bt_interface_removed_rule: Option<MatchRule> = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.bluez")
+        .map_err(|e| error!("Failed to set sender in Bluetooth InterfacesRemoved match rule: {}", e))
+        .ok()
+        .and_then(|builder|
+            builder.interface("org.freedesktop.DBus.ObjectManager")
+            .map_err(|e| 
+            error!("Failed to set interface in Bluetooth InterfacesRemoved match rule: {}", e))
+            .ok())
+        .and_then(|builder|
+            builder.member("InterfacesRemoved")
+            .map_err(|e|
+            error!("Failed to set member in Bluetooth InterfacesRemoved match rule: {}", e))
+            .ok())
+        .and_then(|builder| Some(builder.build()));
+
+    if let Some(x) = bt_interface_removed_rule {
+        dbus_proxy.add_match_rule(x)
+            .await
+            .map_err(|e| {
+                error!("Failed to add Bluetooth InterfacesRemoved match rule: {}", e);
+            })
+            .ok();
+    }
 
     let mut stream: zbus::MessageStream = connection.into();
     info!("Dbus monitor: Starting to listen for D-Bus messages");
@@ -947,7 +1098,8 @@ async fn monitor_dbus() -> Result<()> {
                         debug!("Not a device with org.bluez.Battery1 interface");
                     },
                     Ok(Some(battery_interface_value)) => {
-                        process_bluetooth_battery_interface(&battery_interface_value);
+                        let _percentage = process_bluetooth_battery_interface(&battery_interface_value);
+                        // TODO: Use _percentage to update Bluetooth battery widget in GUI
                     }
                 };
 
@@ -1000,14 +1152,10 @@ async fn monitor_dbus() -> Result<()> {
                         // Use the new battery properties processing function
                         process_battery_device_properties(changed_properties);
 
-                        // Keep existing UI update logic for percentage changes only
+                        // Use dedicated function for percentage changes
                         let percentage_key = Value::Str("Percentage".into());
-                        if let Ok(Some(Value::F64(percentage))) = changed_properties.get::<_, Value>(&percentage_key) {
-                            info!("Dbus monitor: Battery percentage changed to {:.1}%", percentage);
-                            let battery_text = format!("🔋 {:.0}%", percentage);
-                            if let Err(e) = send_battery_update(battery_text).await {
-                                error!("Dbus monitor: Failed to send battery update: {}", e);
-                            }
+                        if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key) {
+                            process_battery_percentage(percentage_value).await;
                         }
 
                     }
@@ -1018,7 +1166,8 @@ async fn monitor_dbus() -> Result<()> {
                         };
 
                         // Use the existing function by passing changed properties as Value::Dict
-                        process_bluetooth_battery_interface(changed_properties_val);
+                        let _percentage = process_bluetooth_battery_interface(changed_properties_val);
+                        // TODO: Use _percentage to update Bluetooth battery widget in GUI
                     }
                     other => {
                         debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);
@@ -1030,18 +1179,20 @@ async fn monitor_dbus() -> Result<()> {
             (_, "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
                 info!("Dbus monitor: Received InterfacesRemoved signal from ObjectManager");
                 let body = msg.body();
-                let Ok(Value::Array(removed_interfaces)) = body.deserialize() else {
-                    error!("Dbus monitor: Failed to deserialize InterfacesRemoved message body as Array");
+                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+                    error!("Dbus monitor: Failed to deserialize InterfacesRemoved message body as Structure");
                     continue;
                 };
-                // Check len is 2
-                if removed_interfaces.len() != 2 {
-                    error!("Dbus monitor: Expected 2 elements in InterfacesRemoved body array, got {}", removed_interfaces.len());
-                    continue;
-                }
+                let fields = body_deserialized.fields();
+                let (object_path_value, interfaces_array_value) = match fields {
+                    [a, b] => (a, b),
+                    other => {
+                        error!("Dbus monitor: Expected exactly 2 fields in InterfacesRemoved, got: {}", other.len());
+                        continue;
+                    }
+                };
 
-                // TODO: consider skipping this until the last moment
-                let object_path = match &removed_interfaces[0] {
+                let object_path = match object_path_value {
                     Value::ObjectPath(object_path) => object_path,
                     other => {
                         error!("Dbus monitor: Expected ObjectPath as first element, got {:?}", other);
@@ -1049,7 +1200,7 @@ async fn monitor_dbus() -> Result<()> {
                     }
                 };
 
-                let interfaces = match &removed_interfaces[1] {
+                let interfaces = match interfaces_array_value {
                     Value::Array(arr) => arr,
                     other => {
                         error!("Dbus monitor: Expected Array as second element, got {:?}", other);
@@ -1153,7 +1304,7 @@ fn create_tokio_runtime() -> Result<tokio::runtime::Runtime> {
     debug!("Creating tokio runtime");
 
     tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::TokioRuntime(format!("Failed to create runtime: {}", e)))
+        .context("Failed to create Tokio runtime")
 }
 
 fn main() -> Result<()> {

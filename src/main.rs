@@ -34,6 +34,7 @@ struct WorkspaceUpdate {
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
 static TITLE_SENDER:     OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 static BATTERY_SENDER:   OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static BLUETOOTH_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -138,6 +139,30 @@ async fn send_battery_update(update: String) -> Result<()> {
         .context("Failed to send battery update")?;
 
     Ok(())
+}
+
+fn compute_bluetooth_display_string(bluetooth_devices: &HashMap<String, BluetoothDevice>) -> String {
+    let device_strings: Vec<String> = bluetooth_devices
+        .values()
+        .filter_map(|device| {
+            // Only include devices with battery percentage
+            let percentage = device.battery_percentage?;
+            
+            // Get first character of device name, fallback to 'D' for device
+            let first_char = device.device_name
+                .as_ref()
+                .and_then(|name| name.chars().next())
+                .unwrap_or('D');
+            
+            Some(format!("{}{}", first_char, percentage))
+        })
+        .collect();
+    
+    if device_strings.is_empty() {
+        "No BT".to_string()
+    } else {
+        device_strings.join(" ")
+    }
 }
 
 async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData) -> Result<()> {
@@ -387,6 +412,25 @@ fn setup_battery_updates(label: gtk::Label) -> Result<()> {
     Ok(())
 }
 
+fn setup_bluetooth_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up Bluetooth battery updates");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    if BLUETOOTH_SENDER.set(tx).is_err() {
+        return Err(anyhow::anyhow!("Failed to set global Bluetooth sender"));
+    }
+
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            debug!("Updating Bluetooth battery label: {}", update);
+            label.set_text(&update);
+        }
+    });
+
+    Ok(())
+}
+
 fn create_title_widget() -> Result<gtk::Label> {
     debug!("Creating title widget");
     let label = gtk::Label::new(Some("Application Title"));
@@ -483,14 +527,15 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
-fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
+fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
 
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
     right_group.set_valign(gtk::Align::End);
-    right_group.append(&create_bt_widget()?);
+    let bt_widget = create_bt_widget()?;
+    right_group.append(&bt_widget);
 
     let battery_widget = create_battery_widget()?;
     right_group.append(&battery_widget);
@@ -498,10 +543,10 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label)> {
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
 
-    Ok((right_group, battery_widget, time_widget))
+    Ok((right_group, bt_widget, battery_widget, time_widget))
 }
 
-fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
 
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -510,7 +555,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
 
     let (left_group, workspace_widget) = create_left_group()?;
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
-    let (right_group, battery_widget, time_widget) = create_right_group()?;
+    let (right_group, bt_widget, battery_widget, time_widget) = create_right_group()?;
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -518,7 +563,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, battery_widget, time_widget, workspace_widget, title_widget))
+    Ok((main_box, bt_widget, battery_widget, time_widget, workspace_widget, title_widget))
 }
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
@@ -804,7 +849,7 @@ async fn monitor_dbus() -> Result<()> {
                             }
                         }
 
-                        // Check for MediaTransport1 interface
+                        // Check for MediaControl1 interface (changed from MediaTransport1)
                         // TODO: Problem: on the top level bt device of my earbuds
                         // we see MediaControl1 but not MediaTransport1
                         // this breaks the assumption that we wouldn't need to corelate
@@ -812,24 +857,51 @@ async fn monitor_dbus() -> Result<()> {
                         // OR we could use MediaControl1
                         // we also assume the toplevel one is the one with
                         // Device1
-                        if interfaces.contains_key("org.bluez.MediaTransport1") {
+                        // 
+                        // In case you need to corelate devices, check the
+                        // .Device property on the multiple devices, it seems
+                        // to point to the appropiate top level device
+                        if interfaces.contains_key("org.bluez.MediaControl1") {
                             has_media = true;
-                            debug!("Found Bluetooth device with media transport at: {}", object_path);
+                            debug!("Found Bluetooth device with media control at: {}", object_path);
                         }
 
-                        // Add all Bluetooth devices - they might gain battery/media interfaces later
-                        bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                            device_path: object_path.to_string(),
-                            has_battery,
-                            has_media,
-                            battery_percentage,
-                            device_name,
-                        });
+                        // Only add Bluetooth devices that have battery or media interfaces
+                        if has_battery || has_media {
+                            bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                                device_path: object_path.to_string(),
+                                has_battery,
+                                has_media,
+                                battery_percentage,
+                                device_name,
+                            });
+                            debug!("Added device {} to HashMap (has_battery: {}, has_media: {})", object_path, has_battery, has_media);
+                        }
                     }
                     debug!("Initial bluetooth devices: {:?}", bluetooth_devices);
+                    
+                    // Send initial GUI update for discovered devices
+                    let display_string = compute_bluetooth_display_string(&bluetooth_devices);
+                    if let Some(sender) = BLUETOOTH_SENDER.get() {
+                        if let Err(e) = sender.send(display_string.clone()) {
+                            error!("Failed to send initial Bluetooth display update to GUI: {}", e);
+                        } else {
+                            info!("Sent initial Bluetooth display: {}", display_string);
+                        }
+                    } else {
+                        warn!("Bluetooth sender not initialized, cannot send initial GUI update");
+                    }
                 }
                 Err(e) => {
                     info!("No Bluetooth devices found or failed to query: {}", e);
+                    
+                    // Send "No BT" update even when no devices found
+                    let display_string = compute_bluetooth_display_string(&bluetooth_devices);
+                    if let Some(sender) = BLUETOOTH_SENDER.get() {
+                        if let Err(e) = sender.send(display_string) {
+                            error!("Failed to send 'No BT' display update to GUI: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -1034,11 +1106,11 @@ async fn monitor_dbus() -> Result<()> {
                 debug!("Available interfaces in InterfacesAdded: {:?}", 
                        interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
 
-                // Check for Bluetooth MediaTransport1 interface (indicates media device connection)
-                let media_transport_key = zvariant::Str::from("org.bluez.MediaTransport1");
+                // Check for Bluetooth MediaControl1 interface (indicates media device connection)
+                let media_control_key = zvariant::Str::from("org.bluez.MediaControl1");
                 // TODO: split Ok and Some for better logging
                 // TODO: incorporate if let Stuff() instead of two branched match statements
-                if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_transport_key) {
+                if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_control_key) {
                     info!("Dbus monitor: Bluetooth media device connected");
                     // Update HashMap with media capability
                     if let Value::ObjectPath(object_path) = object_path_value {
@@ -1087,10 +1159,19 @@ async fn monitor_dbus() -> Result<()> {
                                 });
                                 info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
                             }
+                            
+                            // Send GUI update for all Bluetooth devices
+                            let display_string = compute_bluetooth_display_string(&bluetooth_devices);
+                            if let Some(sender) = BLUETOOTH_SENDER.get() {
+                                if let Err(e) = sender.send(display_string) {
+                                    error!("Failed to send Bluetooth battery update to GUI: {}", e);
+                                }
+                            } else {
+                                error!("Bluetooth sender not initialized, cannot send GUI update");
+                            }
                         } else {
                             error!("Expected ObjectPath for object path field, got: {:?}. Skiping update to bluetooth_devices", object_path_value);
                         }
-                        // TODO: Use percentage to update Bluetooth battery widget in GUI
                     }
                 };
 
@@ -1163,18 +1244,37 @@ async fn monitor_dbus() -> Result<()> {
                             device.battery_percentage = percentage;
                             info!("Updated device {} battery via PropertiesChanged: {:?}%", path, percentage);
                         } else {
-                            debug!("Bluetooth battery device not found in hashmap: {}. Device may not be tracked yet.", path);
+                            error!("Device Battery1 property change that wasn't previously on the hashmap");
+                            info!("Creating new device in hashmap for battery via PropertiesChanged: {}", path);
+                            bluetooth_devices.insert(path.to_string(), BluetoothDevice {
+                                device_path: path.to_string(),
+                                has_battery: true,
+                                has_media: false,
+                                battery_percentage: percentage,
+                                device_name: None, // TODO: Extract device name if available
+                            });
+                            info!("Created new device {} with battery capability via PropertiesChanged", path);
                         }
-                        // TODO: Use percentage to update Bluetooth battery widget in GUI
+                        
+                        // Send GUI update for all Bluetooth devices
+                        let display_string = compute_bluetooth_display_string(&bluetooth_devices);
+                        if let Some(sender) = BLUETOOTH_SENDER.get() {
+                            if let Err(e) = sender.send(display_string) {
+                                error!("Failed to send Bluetooth battery update to GUI: {}", e);
+                            }
+                        } else {
+                            error!("Bluetooth sender not initialized, cannot send GUI update");
+                        }
                     }
-                    "org.bluez.MediaTransport1" => {
-                        info!("Dbus monitor: MediaTransport1 properties changed for {}", path);
+                    "org.bluez.MediaControl1" => {
+                        info!("Dbus monitor: MediaControl1 properties changed for {}", path);
                         // Update HashMap with media capability if device exists
                         if let Some(device) = bluetooth_devices.get_mut(path) {
                             device.has_media = true;
                             info!("Updated device {} with media capability via PropertiesChanged", path);
                         } else {
-                            debug!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
+                            error!("Device MediaControl1 property change that wasn't previously on the hashmap");
+                            info!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
                             bluetooth_devices.insert(path.to_string(), BluetoothDevice {
                                 device_path: path.to_string(),
                                 has_battery: false,
@@ -1184,7 +1284,7 @@ async fn monitor_dbus() -> Result<()> {
                             });
                             info!("Created new device {} with media capability via PropertiesChanged", path);
                         }
-                        // TODO: Process specific MediaTransport1 properties if needed
+                        // TODO: Process specific MediaControl1 properties if needed
                     }
                     other => {
                         debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);
@@ -1233,11 +1333,36 @@ async fn monitor_dbus() -> Result<()> {
                         match interface_name.as_str() {
                             "org.bluez.Battery1" => {
                                 info!("Dbus monitor: Bluetooth battery interface removed from {}", object_path);
-                                // TODO: Handle cleanup or UI update for removed bluetooth battery interface
+                                let object_path_str = object_path.as_str();
+                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                                    device.has_battery = false;
+                                    device.battery_percentage = None;
+                                    info!("Updated device {} to remove battery capability", object_path);
+
+                                    // Remove device entirely if it has no useful interfaces left
+                                    if !device.has_media && !device.has_battery {
+                                        bluetooth_devices.remove(object_path_str);
+                                        info!("Removed device {} from HashMap (no battery or media interfaces)", object_path);
+                                    }
+                                } else {
+                                    debug!("Battery interface removed from device not in HashMap: {}", object_path);
+                                }
                             }
-                            "org.bluez.MediaTransport1" => {
+                            "org.bluez.MediaControl1" => {
                                 info!("Dbus monitor: Bluetooth media interface removed from {}", object_path);
-                                // TODO: Handle cleanup or UI update for removed bluetooth media interface
+                                let object_path_str = object_path.as_str();
+                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                                    device.has_media = false;
+                                    info!("Updated device {} to remove media capability", object_path);
+
+                                    // Remove device entirely if it has no useful interfaces left
+                                    if !device.has_media && !device.has_battery {
+                                        bluetooth_devices.remove(object_path_str);
+                                        info!("Removed device {} from HashMap (no battery or media interfaces)", object_path);
+                                    }
+                                } else {
+                                    debug!("Media interface removed from device not in HashMap: {}", object_path);
+                                }
                             }
                             "org.freedesktop.UPower.Device" => {
                                 info!("Dbus monitor: UPower battery interface removed from {}", object_path);
@@ -1248,11 +1373,15 @@ async fn monitor_dbus() -> Result<()> {
                     }
                 }
 
-
-
-
-
-
+                // Send GUI update after any Bluetooth device removal
+                let display_string = compute_bluetooth_display_string(&bluetooth_devices);
+                if let Some(sender) = BLUETOOTH_SENDER.get() {
+                    if let Err(e) = sender.send(display_string) {
+                        error!("Failed to send Bluetooth battery update to GUI after device removal: {}", e);
+                    }
+                } else {
+                    error!("Bluetooth sender not initialized, cannot send GUI update after device removal");
+                }
 
             }
             _ => {
@@ -1276,7 +1405,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     load_css_styles(&window)?;
     configure_layer_shell(&window)?;
 
-    let (bar, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
+    let (bar, bt_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
@@ -1284,6 +1413,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     setup_workspace_updates(workspace_widget, title_widget.clone())?;
     setup_title_updates(title_widget)?;
     setup_battery_updates(battery_widget)?;
+    setup_bluetooth_updates(bt_widget)?;
 
     info!("Application activated successfully");
     Ok(())

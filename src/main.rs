@@ -869,6 +869,8 @@ async fn monitor_dbus() -> Result<()> {
 
                         // Only add Bluetooth devices that have battery or media interfaces or have
                         // Device1 interface and thus should in theory have a name and alias
+                        // NOTE: even if the docs say so, in practice we have found multiple
+                        // Device1 interfaces with no name
                         if has_battery || has_media || device_name.is_some() {
                             bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
                                 device_path: object_path.to_string(),

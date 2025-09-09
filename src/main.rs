@@ -825,6 +825,7 @@ async fn monitor_dbus() -> Result<()> {
                         let mut device_name: Option<String> = None;
                         let mut has_media         = false;
 
+                        // TODO: transform to a match and add logs
                         // Check for Device1 interface (basic device info)
                         if let Some(device_interface) = interfaces.get("org.bluez.Device1") {
                             // Extract device name/alias
@@ -866,8 +867,9 @@ async fn monitor_dbus() -> Result<()> {
                             debug!("Found Bluetooth device with media control at: {}", object_path);
                         }
 
-                        // Only add Bluetooth devices that have battery or media interfaces
-                        if has_battery || has_media {
+                        // Only add Bluetooth devices that have battery or media interfaces or have
+                        // Device1 interface and thus should in theory have a name and alias
+                        if has_battery || has_media || device_name.is_some() {
                             bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
                                 device_path: object_path.to_string(),
                                 has_battery,
@@ -1106,6 +1108,62 @@ async fn monitor_dbus() -> Result<()> {
                 debug!("Available interfaces in InterfacesAdded: {:?}", 
                        interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
 
+                let mut device_name: Option<String> = None;
+                match interfaces_and_properties.get::<_, Value>(&bluetooth_interface_key) {
+                    Ok(Some(Value::Dict(device1))) => {
+                        debug!("Found Device1 interface properties: {:?}", device1);
+                        // TODO: use alias, if alias fails use name and log that that is
+                        // not supposed to happend by the bluez device api
+                        // also alias is not supposed to be empty
+                        match device1.get(&zvariant::Str::from("Name")) {
+                            Ok(Some(Value::Str(name))) => {
+                                debug!("Found Bluetooth device name: {}", name);
+                                device_name = Some(name.to_string());
+                            },
+                            Ok(Some(other)) => {
+                                error!("Device Name property has unexpected type: {:?}", other);
+                            },
+                            Ok(None) => {
+                                error!("Device1 interface found but no Name property");
+                            },
+                            Err(e) => {
+                                error!("Failed to get Name property from Device1 interface: {}", e);
+                            },
+                        }
+                        // Update existing device or create new one in HashMap
+                        if let Value::ObjectPath(object_path) = object_path_value {
+                            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                                // Update existing device with name
+                                // maybe allow yourself to update even if none?
+                                if device_name.is_some() {
+                                    device.device_name = device_name.clone();
+                                }
+                                info!("Updated existing device {} with name: {:?}", object_path, device_name);
+                            } else {
+                                // Create new device entry
+                                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                                    device_path: object_path.to_string(),
+                                    has_battery: false,
+                                    has_media: false,
+                                    battery_percentage: None,
+                                    device_name: device_name.clone(),
+                                });
+                                info!("Created new device {} with name: {:?}", object_path, device_name);
+                            }
+                        } else {
+                            error!("Expected ObjectPath for device path, got: {:?}", object_path_value);
+                        }
+                    },
+                    Ok(Some(other)) => {
+                        error!("Device1 interface found but has unexpected type: {:?}", other);
+                    },
+                    Ok(None) => {
+                        debug!("Device1 interface not found in interfaces");
+                    },
+                    Err(e) => {
+                        error!("Failed to get Device1 interface: {}", e);
+                    }
+                }
                 // Check for Bluetooth MediaControl1 interface (indicates media device connection)
                 let media_control_key = zvariant::Str::from("org.bluez.MediaControl1");
                 // TODO: split Ok and Some for better logging
@@ -1116,6 +1174,9 @@ async fn monitor_dbus() -> Result<()> {
                     if let Value::ObjectPath(object_path) = object_path_value {
                         if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
                             device.has_media = true;
+                            if device_name.is_some() {
+                                device.device_name = device_name.clone();
+                            }
                             info!("Updated device {} with media capability", object_path);
                         } else {
                             debug!("Creating new device in hashmap for media: {}", object_path);
@@ -1124,7 +1185,7 @@ async fn monitor_dbus() -> Result<()> {
                                 has_battery: false,
                                 has_media: true,
                                 battery_percentage: None,
-                                device_name: None, // TODO: Extract device name from interfaces if available
+                                device_name: device_name.clone(),
                             });
                             info!("Created new device {} with media capability via InterfacesAdded", object_path);
                         }
@@ -1147,6 +1208,9 @@ async fn monitor_dbus() -> Result<()> {
                             if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
                                 device.has_battery = true;
                                 device.battery_percentage = percentage;
+                                if device_name.is_some() {
+                                    device.device_name = device_name.clone();
+                                }
                                 info!("Updated device {} battery: {:?}%", object_path, percentage);
                             } else {
                                 debug!("Creating new device in hashmap: {}", object_path);
@@ -1155,7 +1219,7 @@ async fn monitor_dbus() -> Result<()> {
                                     has_battery: true,
                                     has_media: false,
                                     battery_percentage: percentage,
-                                    device_name: None, // TODO: Extract device name from interfaces if available
+                                    device_name: device_name.clone(),
                                 });
                                 info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
                             }

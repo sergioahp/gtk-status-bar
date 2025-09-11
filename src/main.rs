@@ -25,10 +25,10 @@ use zbus::zvariant::Value;
 use futures::{TryStreamExt, StreamExt};
 use futures::future::ready;
 
-// PipeWire volume monitoring imports
+// PipeWire volume monitoring imports  
 use pipewire as pw;
-use libspa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
-use libspa::utils::dict::DictRef;
+use pw::spa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
+use pw::spa::utils::dict::DictRef;
 use pw::{
     device::Device,
     node::Node,
@@ -517,6 +517,150 @@ fn is_audio_device(props: &Option<&DictRef>) -> bool {
     }
     
     is_supported_api
+}
+
+// Manage PipeWire objects and listeners on the PipeWire thread
+struct PWKeepAlive {
+    proxies:   HashMap<u32, Box<dyn ProxyT>>,
+    listeners: HashMap<u32, Vec<Box<dyn Listener>>>,
+}
+
+impl PWKeepAlive {
+    fn new() -> Self {
+        debug!("Creating new PWKeepAlive instance");
+        Self {
+            proxies:   HashMap::new(),
+            listeners: HashMap::new(),
+        }
+    }
+
+    fn add_proxy(&mut self, proxy: Box<dyn ProxyT>, listener: Box<dyn Listener>) {
+        let id = proxy.upcast_ref().id();
+        debug!("Adding proxy with ID: {}", id);
+        
+        self.proxies.insert(id, proxy);
+        self.listeners.entry(id).or_default().push(listener);
+        
+        debug!("PWKeepAlive now managing {} proxies", self.proxies.len());
+    }
+
+    fn add_listener(&mut self, id: u32, listener: Box<dyn Listener>) {
+        debug!("Adding additional listener for proxy ID: {}", id);
+        self.listeners.entry(id).or_default().push(listener);
+    }
+
+    fn remove(&mut self, id: u32) {
+        let proxy_removed = self.proxies.remove(&id).is_some();
+        let listeners_removed = self.listeners.remove(&id).is_some();
+        
+        if proxy_removed || listeners_removed {
+            debug!("Removed proxy/listeners for ID: {} (proxy: {}, listeners: {})", 
+                   id, proxy_removed, listeners_removed);
+        } else {
+            debug!("Attempted to remove non-existent proxy ID: {}", id);
+        }
+    }
+}
+
+fn parse_volume_from_pod(param: &Pod) -> Option<String> {
+    debug!("Parsing volume information from POD parameter");
+    
+    let obj = match param.as_object() {
+        Ok(obj) => {
+            debug!("Successfully parsed POD as object with {} properties", 
+                   obj.props().count());
+            obj
+        }
+        Err(e) => {
+            debug!("Failed to parse POD as object: {:?}", e);
+            return None;
+        }
+    };
+    
+    let mut volume: Option<f32> = None;
+    let mut mute: Option<bool> = None;
+    let mut channel_volumes: Vec<f32> = Vec::new();
+
+    // Iterate through all properties in the object
+    for prop in obj.props() {
+        let key = prop.key().0;
+        let value_pod = prop.value();
+        
+        match key {
+            SPA_PROP_VOLUME => {
+                debug!("Found volume property");
+                if let Ok(vol) = value_pod.get_float() {
+                    volume = Some(vol);
+                    debug!("Parsed main volume: {:.2}", vol);
+                } else {
+                    debug!("Volume property found but failed to parse as float");
+                }
+            },
+            SPA_PROP_MUTE => {
+                debug!("Found mute property");
+                if let Ok(m) = value_pod.get_bool() {
+                    mute = Some(m);
+                    debug!("Parsed mute state: {}", m);
+                } else {
+                    debug!("Mute property found but failed to parse as bool");
+                }
+            },
+            SPA_PROP_CHANNEL_VOLUMES => {
+                debug!("Found channel volumes property");
+                match PodDeserializer::deserialize_any_from(value_pod.as_bytes()) {
+                    Ok((_, PodValue::ValueArray(ValueArray::Float(volumes)))) => {
+                        channel_volumes = volumes;
+                        debug!("Parsed {} channel volumes: {:?}", 
+                               channel_volumes.len(), channel_volumes);
+                    }
+                    Ok((_, other)) => {
+                        debug!("Channel volumes property has unexpected type: {:?}", other);
+                    }
+                    Err(e) => {
+                        debug!("Failed to deserialize channel volumes: {:?}", e);
+                    }
+                }
+            },
+            _ => {
+                // Other properties - could be device-specific volume controls
+                debug!("Found other property with key: {}", key);
+            }
+        }
+    }
+
+    // Format volume information for display
+    let mut parts = Vec::new();
+    
+    if let Some(vol) = volume {
+        let volume_percent = (vol * 100.0).round();
+        parts.push(format!("Volume: {:.0}%", volume_percent));
+        debug!("Formatted main volume: {:.0}%", volume_percent);
+    }
+    
+    if let Some(m) = mute {
+        parts.push(format!("Mute: {}", if m { "ON" } else { "OFF" }));
+        debug!("Formatted mute state: {}", if m { "ON" } else { "OFF" });
+    }
+    
+    if !channel_volumes.is_empty() {
+        let channels = channel_volumes.iter().enumerate()
+            .map(|(i, &v)| format!("Ch{}: {:.0}%", i + 1, v * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("Channels: [{}]", channels));
+        debug!("Formatted channel volumes for {} channels", channel_volumes.len());
+    }
+
+    let result = if parts.is_empty() { 
+        debug!("No volume information found, returning generic message");
+        Some("Property changed".to_string()) 
+    } else { 
+        let formatted = parts.join(" | ");
+        debug!("Returning formatted volume info: {}", formatted);
+        Some(formatted)
+    };
+    
+    result
 }
 
 fn create_title_widget() -> Result<gtk::Label> {

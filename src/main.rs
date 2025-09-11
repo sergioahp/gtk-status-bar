@@ -804,6 +804,9 @@ async fn monitor_dbus() -> Result<()> {
     .ok();
 
     // create hashmap of bt devices:
+    // TODO: Consider adding has_device1 field to BluetoothDevice struct for full symmetry
+    // with has_battery and has_media fields. Current approach uses device_name presence
+    // as proxy for Device1 interface availability.
     let mut bluetooth_devices: HashMap<String, BluetoothDevice> = HashMap::new();
 
     if let Some(bluez_proxy) = bluez_proxy {
@@ -1137,9 +1140,7 @@ async fn monitor_dbus() -> Result<()> {
                             if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
                                 // Update existing device with name
                                 // maybe allow yourself to update even if none?
-                                if device_name.is_some() {
-                                    device.device_name = device_name.clone();
-                                }
+                                device.device_name = device_name.clone();
                                 info!("Updated existing device {} with name: {:?}", object_path, device_name);
                             } else {
                                 // Create new device entry
@@ -1176,9 +1177,6 @@ async fn monitor_dbus() -> Result<()> {
                     if let Value::ObjectPath(object_path) = object_path_value {
                         if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
                             device.has_media = true;
-                            if device_name.is_some() {
-                                device.device_name = device_name.clone();
-                            }
                             info!("Updated device {} with media capability", object_path);
                         } else {
                             debug!("Creating new device in hashmap for media: {}", object_path);
@@ -1187,7 +1185,7 @@ async fn monitor_dbus() -> Result<()> {
                                 has_battery: false,
                                 has_media: true,
                                 battery_percentage: None,
-                                device_name: device_name.clone(),
+                                device_name: None,
                             });
                             info!("Created new device {} with media capability via InterfacesAdded", object_path);
                         }
@@ -1210,9 +1208,6 @@ async fn monitor_dbus() -> Result<()> {
                             if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
                                 device.has_battery = true;
                                 device.battery_percentage = percentage;
-                                if device_name.is_some() {
-                                    device.device_name = device_name.clone();
-                                }
                                 info!("Updated device {} battery: {:?}%", object_path, percentage);
                             } else {
                                 debug!("Creating new device in hashmap: {}", object_path);
@@ -1221,7 +1216,7 @@ async fn monitor_dbus() -> Result<()> {
                                     has_battery: true,
                                     has_media: false,
                                     battery_percentage: percentage,
-                                    device_name: device_name.clone(),
+                                    device_name: None,
                                 });
                                 info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
                             }
@@ -1346,7 +1341,7 @@ async fn monitor_dbus() -> Result<()> {
                                 has_battery: false,
                                 has_media: true,
                                 battery_percentage: None,
-                                device_name: None, // TODO: Extract device name if available
+                                device_name: None,
                             });
                             info!("Created new device {} with media capability via PropertiesChanged", path);
                         }
@@ -1405,10 +1400,10 @@ async fn monitor_dbus() -> Result<()> {
                                     device.battery_percentage = None;
                                     info!("Updated device {} to remove battery capability", object_path);
 
-                                    // Remove device entirely if it has no useful interfaces left
-                                    if !device.has_media && !device.has_battery {
+                                    // Remove device entirely if it has no useful interfaces or name left
+                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
                                         bluetooth_devices.remove(object_path_str);
-                                        info!("Removed device {} from HashMap (no battery or media interfaces)", object_path);
+                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
                                     }
                                 } else {
                                     debug!("Battery interface removed from device not in HashMap: {}", object_path);
@@ -1421,13 +1416,29 @@ async fn monitor_dbus() -> Result<()> {
                                     device.has_media = false;
                                     info!("Updated device {} to remove media capability", object_path);
 
-                                    // Remove device entirely if it has no useful interfaces left
-                                    if !device.has_media && !device.has_battery {
+                                    // Remove device entirely if it has no useful interfaces or name left
+                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
                                         bluetooth_devices.remove(object_path_str);
-                                        info!("Removed device {} from HashMap (no battery or media interfaces)", object_path);
+                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
                                     }
                                 } else {
                                     debug!("Media interface removed from device not in HashMap: {}", object_path);
+                                }
+                            }
+                            "org.bluez.Device1" => {
+                                info!("Dbus monitor: Bluetooth Device1 interface removed from {}", object_path);
+                                let object_path_str = object_path.as_str();
+                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                                    device.device_name = None;
+                                    info!("Cleared device name for {}", object_path);
+
+                                    // Remove device entirely if it has no useful interfaces or name left
+                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
+                                        bluetooth_devices.remove(object_path_str);
+                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
+                                    }
+                                } else {
+                                    debug!("Device1 interface removed from device not in HashMap: {}", object_path);
                                 }
                             }
                             "org.freedesktop.UPower.Device" => {

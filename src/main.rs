@@ -35,6 +35,7 @@ static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = Once
 static TITLE_SENDER:     OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 static BATTERY_SENDER:   OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 static BLUETOOTH_SENDER: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+static VOLUME_SENDER:    OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -431,6 +432,25 @@ fn setup_bluetooth_updates(label: gtk::Label) -> Result<()> {
     Ok(())
 }
 
+fn setup_volume_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up volume updates");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    if VOLUME_SENDER.set(tx).is_err() {
+        return Err(anyhow::anyhow!("Failed to set global volume sender"));
+    }
+
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            debug!("Updating volume label: {}", update);
+            label.set_text(&update);
+        }
+    });
+
+    Ok(())
+}
+
 fn create_title_widget() -> Result<gtk::Label> {
     debug!("Creating title widget");
     let label = gtk::Label::new(Some("Application Title"));
@@ -493,6 +513,14 @@ fn create_battery_widget() -> Result<gtk::Label> {
     Ok(label)
 }
 
+fn create_volume_widget() -> Result<gtk::Label> {
+    debug!("Creating volume widget");
+    let label = gtk::Label::new(Some("🔊 ?%"));
+    label.add_css_class("volume-widget");
+    label.set_halign(gtk::Align::End);
+    Ok(label)
+}
+
 fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
     debug!("Creating left group");
 
@@ -527,15 +555,19 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
-fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
 
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
     right_group.set_valign(gtk::Align::End);
+    
     let bt_widget = create_bt_widget()?;
     right_group.append(&bt_widget);
+
+    let volume_widget = create_volume_widget()?;
+    right_group.append(&volume_widget);
 
     let battery_widget = create_battery_widget()?;
     right_group.append(&battery_widget);
@@ -543,10 +575,10 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
 
-    Ok((right_group, bt_widget, battery_widget, time_widget))
+    Ok((right_group, bt_widget, volume_widget, battery_widget, time_widget))
 }
 
-fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
 
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -555,7 +587,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
 
     let (left_group, workspace_widget) = create_left_group()?;
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
-    let (right_group, bt_widget, battery_widget, time_widget) = create_right_group()?;
+    let (right_group, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group()?;
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -563,7 +595,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, bt_widget, battery_widget, time_widget, workspace_widget, title_widget))
+    Ok((main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget))
 }
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
@@ -1482,7 +1514,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     load_css_styles(&window)?;
     configure_layer_shell(&window)?;
 
-    let (bar, bt_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
+    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
@@ -1491,6 +1523,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     setup_title_updates(title_widget)?;
     setup_battery_updates(battery_widget)?;
     setup_bluetooth_updates(bt_widget)?;
+    setup_volume_updates(volume_widget)?;
 
     info!("Application activated successfully");
     Ok(())

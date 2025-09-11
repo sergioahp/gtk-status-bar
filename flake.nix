@@ -38,10 +38,16 @@
             pkgs.gtk4
             # Layer shell library for GTK4 surfaces
             pkgs.gtk4-layer-shell
+            # PipeWire development libraries
+            pkgs.pipewire
+            # Clang for bindgen (required for PipeWire Rust bindings)
+            pkgs.clang
           ];
 
           # Explicit for completeness; rust-analyzer finds it even without this.
           RUST_SRC_PATH = rustLibSrc;
+          # Set LIBCLANG_PATH for bindgen
+          LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
           
         };
       });

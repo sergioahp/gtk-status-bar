@@ -468,6 +468,87 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
         }
     });
 
+    // Start the volume monitoring communication bridge
+    setup_volume_monitoring_bridge()?;
+
+    Ok(())
+}
+
+fn setup_volume_monitoring_bridge() -> Result<()> {
+    debug!("Setting up volume monitoring communication bridge");
+    
+    // Create channel for PipeWire thread -> GTK main thread communication
+    let (sender, receiver) = std::sync::mpsc::channel::<VolumeUpdate>();
+    debug!("Created mpsc channel for volume updates");
+    
+    // Keep receiver alive by moving it into Rc<RefCell<>>
+    let receiver = std::rc::Rc::new(std::cell::RefCell::new(receiver));
+    let receiver_clone = receiver.clone();
+    
+    debug!("Setting up GTK main thread polling for volume updates");
+    
+    // Poll for volume updates on GTK main thread using timeout
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match receiver_clone.borrow().try_recv() {
+            Ok(update) => {
+                debug!("Received volume update: {} - {}", update.name, update.info);
+                
+                // Send formatted update to GTK widget via existing channel
+                if let Some(volume_sender) = VOLUME_SENDER.get() {
+                    let display_text = format!("🔊 {} ({}): {}", 
+                                             update.name, update.id, update.info);
+                    
+                    if let Err(e) = volume_sender.send(display_text) {
+                        error!("Failed to send volume update to GTK widget: {}", e);
+                    } else {
+                        debug!("Successfully forwarded volume update to GTK widget");
+                    }
+                } else {
+                    debug!("Volume sender not yet initialized, skipping update");
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // No messages available - this is normal, continue polling
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                error!("PipeWire volume monitoring thread disconnected");
+                return glib::ControlFlow::Break;
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+    
+    // Keep receiver alive for the lifetime of the application
+    std::mem::forget(receiver);
+    
+    debug!("Volume monitoring bridge setup complete");
+    
+    // TODO: Start actual PipeWire monitoring thread with sender
+    // For now, send test updates to verify channel communication
+    std::thread::spawn(move || {
+        debug!("Test volume monitoring thread started");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        
+        for i in 1..=3 {
+            let test_update = VolumeUpdate {
+                id: i,
+                name: format!("Test Audio Node {}", i),
+                info: format!("Volume: {}0%", i * 2),
+            };
+            
+            debug!("Sending test volume update: {:?}", test_update);
+            
+            if sender.send(test_update).is_err() {
+                error!("Failed to send test volume update - receiver dropped");
+                break;
+            }
+            
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        
+        debug!("Test volume monitoring thread completed");
+    });
+    
     Ok(())
 }
 

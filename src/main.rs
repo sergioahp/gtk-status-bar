@@ -523,31 +523,8 @@ fn setup_volume_monitoring_bridge() -> Result<()> {
     
     debug!("Volume monitoring bridge setup complete");
     
-    // TODO: Start actual PipeWire monitoring thread with sender
-    // For now, send test updates to verify channel communication
-    std::thread::spawn(move || {
-        debug!("Test volume monitoring thread started");
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        
-        for i in 1..=3 {
-            let test_update = VolumeUpdate {
-                id: i,
-                name: format!("Test Audio Node {}", i),
-                info: format!("Volume: {}0%", i * 2),
-            };
-            
-            debug!("Sending test volume update: {:?}", test_update);
-            
-            if sender.send(test_update).is_err() {
-                error!("Failed to send test volume update - receiver dropped");
-                break;
-            }
-            
-            std::thread::sleep(std::time::Duration::from_secs(3));
-        }
-        
-        debug!("Test volume monitoring thread completed");
-    });
+    // Start actual PipeWire monitoring thread with sender
+    start_pipewire_thread(sender)?;
     
     Ok(())
 }
@@ -742,6 +719,143 @@ fn parse_volume_from_pod(param: &Pod) -> Option<String> {
     };
     
     result
+}
+
+// Start PipeWire monitoring on dedicated ThreadLoop thread
+fn start_pipewire_thread(sender: std::sync::mpsc::Sender<VolumeUpdate>) -> Result<()> {
+    debug!("Starting PipeWire monitoring thread");
+    
+    std::thread::spawn(move || {
+        debug!("🔧 Initializing PipeWire on dedicated thread...");
+        
+        // Initialize PipeWire on this thread
+        pw::init();
+        debug!("✅ PipeWire initialized");
+
+        // Create ThreadLoop - manages PipeWire loop on this thread
+        let thread_loop = match unsafe { ThreadLoop::new(None, None) } {
+            Ok(tl) => {
+                debug!("✅ ThreadLoop created");
+                tl
+            }
+            Err(e) => {
+                error!("❌ Failed to create ThreadLoop: {}", e);
+                return;
+            }
+        };
+
+        let context = match pw::context::Context::new(&thread_loop) {
+            Ok(ctx) => {
+                debug!("✅ Context created");
+                ctx
+            }
+            Err(e) => {
+                error!("❌ Failed to create context: {}", e);
+                return;
+            }
+        };
+
+        let core = match context.connect(None) {
+            Ok(c) => {
+                debug!("✅ Core connected");
+                c
+            }
+            Err(e) => {
+                error!("❌ Failed to connect core: {}", e);
+                return;
+            }
+        };
+
+        // Connection status listener
+        let _core_listener = core
+            .add_listener_local()
+            .info(|info| {
+                debug!("📡 PipeWire connected: {}", info.name());
+            })
+            .error(|id, seq, res, message| {
+                error!("❌ PipeWire error id:{} seq:{} res:{}: {}", id, seq, res, message);
+            })
+            .register();
+
+        let registry = match core.get_registry() {
+            Ok(reg) => {
+                debug!("✅ Registry obtained");
+                std::rc::Rc::new(reg)
+            }
+            Err(e) => {
+                error!("❌ Failed to get registry: {}", e);
+                return;
+            }
+        };
+
+        // Object lifecycle management
+        let keep_alive = std::rc::Rc::new(std::cell::RefCell::new(PWKeepAlive::new()));
+
+        debug!("🎵 PipeWire ThreadLoop started - monitoring volume changes");
+
+        // Start the ThreadLoop - this processes PipeWire events on this thread
+        thread_loop.start();
+        debug!("✅ ThreadLoop started successfully");
+
+        // Send initial test update to verify channel communication
+        let test_update = VolumeUpdate {
+            id: 0,
+            name: "PipeWire ThreadLoop".to_string(),
+            info: "Initialized and ready".to_string(),
+        };
+        
+        if let Err(e) = sender.send(test_update) {
+            error!("Failed to send initial PipeWire status update: {}", e);
+        } else {
+            debug!("Sent initial PipeWire status update");
+        }
+
+        debug!("🔄 PipeWire thread running - keeping objects alive...");
+
+        // TODO: Registry listener setup will be added in next commit
+        // For now, send periodic test updates to verify thread is alive
+        for i in 1..=5 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            
+            let heartbeat_update = VolumeUpdate {
+                id: i,
+                name: format!("PipeWire Heartbeat {}", i),
+                info: format!("Thread alive - iteration {}", i),
+            };
+            
+            if sender.send(heartbeat_update).is_err() {
+                error!("Channel closed, PipeWire thread exiting");
+                break;
+            }
+            
+            debug!("Sent heartbeat update {}", i);
+        }
+
+        // Keep the thread alive - in a real app, you'd have a shutdown mechanism
+        // We need to prevent the thread function from ending, not just the objects from being dropped
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            
+            // Send periodic status updates
+            let status_update = VolumeUpdate {
+                id: 999,
+                name: "PipeWire Status".to_string(),
+                info: "Thread running, no volume detection yet".to_string(),
+            };
+            
+            if sender.send(status_update).is_err() {
+                error!("Channel closed, PipeWire thread exiting");
+                break;
+            }
+        }
+
+        #[allow(unreachable_code)]
+        {
+            debug!("⚠️  PipeWire thread function ending");
+        }
+    });
+
+    Ok(())
 }
 
 fn create_title_widget() -> Result<gtk::Label> {

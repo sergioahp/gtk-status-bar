@@ -25,10 +25,30 @@ use zbus::zvariant::Value;
 use futures::{TryStreamExt, StreamExt};
 use futures::future::ready;
 
+// PipeWire volume monitoring imports
+use pipewire as pw;
+use libspa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
+use libspa::utils::dict::DictRef;
+use pw::{
+    device::Device,
+    node::Node,
+    proxy::{Listener, ProxyT},
+    thread_loop::ThreadLoop,
+    types::ObjectType,
+};
+
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
     name: String,
     id: hyprland::shared::WorkspaceId,
+}
+
+// Volume update message sent from PipeWire thread to GTK main thread
+#[derive(Debug, Clone)]
+struct VolumeUpdate {
+    id: u32,
+    name: String,
+    info: String,
 }
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
@@ -449,6 +469,54 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
     });
 
     Ok(())
+}
+
+// SPA property constants for volume control
+const SPA_PROP_VOLUME:          u32 = 65539;  // Main volume (0.0-1.0)
+const SPA_PROP_MUTE:            u32 = 65540;  // Mute state (bool)
+const SPA_PROP_CHANNEL_VOLUMES: u32 = 65544; // Per-channel volumes (array)
+
+// Helper functions to identify audio objects
+fn is_audio_node(props: &Option<&DictRef>) -> bool {
+    let Some(props) = props else {
+        debug!("No properties available for audio node check");
+        return false;
+    };
+    
+    let Some(media_class) = props.get("media.class") else {
+        debug!("No media.class property found");
+        return false;
+    };
+    
+    let is_audio_sink_source = media_class.contains("Audio") &&
+                              (media_class.contains("Sink") || 
+                               media_class.contains("Source"));
+    
+    if is_audio_sink_source {
+        debug!("Found audio node with media.class: {}", media_class);
+    }
+    
+    is_audio_sink_source
+}
+
+fn is_audio_device(props: &Option<&DictRef>) -> bool {
+    let Some(props) = props else {
+        debug!("No properties available for audio device check");
+        return false;
+    };
+    
+    let Some(device_api) = props.get("device.api") else {
+        debug!("No device.api property found");
+        return false;
+    };
+    
+    let is_supported_api = device_api == "alsa" || device_api == "bluez5";
+    
+    if is_supported_api {
+        debug!("Found supported audio device with API: {}", device_api);
+    }
+    
+    is_supported_api
 }
 
 fn create_title_widget() -> Result<gtk::Label> {

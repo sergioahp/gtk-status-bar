@@ -943,38 +943,17 @@ fn start_pipewire_thread(sender: std::sync::mpsc::Sender<VolumeUpdate>) -> Resul
         };
         let _ = sender.send(startup_update);
 
-        // Initial heartbeat messages to show thread is working
-        for i in 1..=5 {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            
-            let heartbeat_update = VolumeUpdate {
-                id: i,
-                name: format!("PipeWire Heartbeat {}", i),
-                info: format!("Thread alive - iteration {}", i),
-            };
-            
-            if sender.send(heartbeat_update).is_err() {
-                error!("Channel closed, PipeWire thread exiting");
-                break;
-            }
-            
-            debug!("Sent heartbeat update {}", i);
-        }
-
-        // Keep the thread alive - in a real app, you'd have a shutdown mechanism
-        // We need to prevent the thread function from ending, not just the objects from being dropped
+        // Keep the thread alive - real volume updates will come from registry events
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_secs(60));
             
-            // Send periodic status updates
-            let status_update = VolumeUpdate {
-                id: 999,
-                name: "PipeWire Status".to_string(),
-                info: "Thread running, no volume detection yet".to_string(),
-            };
-            
-            if sender.send(status_update).is_err() {
-                error!("Channel closed, PipeWire thread exiting");
+            // Minimal keepalive check - no spam messages
+            if sender.send(VolumeUpdate {
+                id: 0,
+                name: "PipeWire".to_string(), 
+                info: "Monitoring active".to_string(),
+            }).is_err() {
+                debug!("Channel closed, PipeWire thread exiting");
                 break;
             }
         }

@@ -810,10 +810,140 @@ fn start_pipewire_thread(sender: std::sync::mpsc::Sender<VolumeUpdate>) -> Resul
             debug!("Sent initial PipeWire status update");
         }
 
-        debug!("🔄 PipeWire thread running - keeping objects alive...");
+        debug!("🔄 PipeWire thread running - setting up registry monitoring...");
 
-        // TODO: Registry listener setup will be added in next commit
-        // For now, send periodic test updates to verify thread is alive
+        // Set up registry listener for discovering audio objects
+        let registry_weak = std::rc::Rc::downgrade(&registry);
+        let keep_alive_weak = std::rc::Rc::downgrade(&keep_alive);
+        let sender_clone = sender.clone();
+
+        let _registry_listener = registry
+            .add_listener_local()
+            .global(move |obj| {
+                if let (Some(reg), Some(keep)) = (registry_weak.upgrade(), keep_alive_weak.upgrade()) {
+                    match obj.type_ {
+                        pw::types::ObjectType::Node if is_audio_node(&obj.props) => {
+                            let node: Node = reg.bind(obj).unwrap();
+                            let id = node.upcast_ref().id();
+                            let name = obj.props
+                                .and_then(|p| p.get("node.description").or_else(|| p.get("node.name")))
+                                .unwrap_or("Unknown Node").to_string();
+
+                            debug!("📱 Monitoring audio node: {} ({})", name, id);
+
+                            // Subscribe to parameter changes
+                            node.subscribe_params(&[
+                                pw::spa::param::ParamType::Props,
+                            ]);
+
+                            let name_clone = name.clone();
+                            let sender_node = sender_clone.clone();
+                            let node_listener = node
+                                .add_listener_local()
+                                .param(move |_seq, param_type, _idx, _next, param| {
+                                    if param_type == pw::spa::param::ParamType::Props {
+                                        if let Some(pod) = param {
+                                            if let Some(info) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Node {}: {} - {}", id, name_clone, info);
+                                                
+                                                let update = VolumeUpdate {
+                                                    id,
+                                                    name: name_clone.clone(),
+                                                    info,
+                                                };
+                                                let _ = sender_node.send(update);
+                                            }
+                                        }
+                                    }
+                                })
+                                .register();
+
+                            // Manage object lifecycle
+                            let proxy: Box<dyn ProxyT> = Box::new(node);
+                            let proxy_id = proxy.upcast_ref().id();
+                            let keep_weak = std::rc::Rc::downgrade(&keep);
+                            let removed_listener = proxy.upcast_ref()
+                                .add_listener_local()
+                                .removed(move || {
+                                    if let Some(k) = keep_weak.upgrade() {
+                                        k.borrow_mut().remove(proxy_id);
+                                    }
+                                })
+                                .register();
+
+                            keep.borrow_mut().add_proxy(proxy, Box::new(node_listener));
+                            keep.borrow_mut().add_listener(id, Box::new(removed_listener));
+                        }
+                        pw::types::ObjectType::Device if is_audio_device(&obj.props) => {
+                            let device: pw::device::Device = reg.bind(obj).unwrap();
+                            let id = device.upcast_ref().id();
+                            let name = obj.props
+                                .and_then(|p| p.get("device.description").or_else(|| p.get("device.name")))
+                                .unwrap_or("Unknown Device").to_string();
+
+                            debug!("🔌 Monitoring audio device: {} ({})", name, id);
+
+                            device.subscribe_params(&[
+                                pw::spa::param::ParamType::Props,
+                            ]);
+
+                            let name_clone = name.clone();
+                            let sender_device = sender_clone.clone();
+                            let device_listener = device
+                                .add_listener_local()
+                                .param(move |_seq, param_type, _idx, _next, param| {
+                                    if param_type == pw::spa::param::ParamType::Props {
+                                        if let Some(pod) = param {
+                                            if let Some(info) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Device {}: {} - {}", id, name_clone, info);
+                                                
+                                                let update = VolumeUpdate {
+                                                    id,
+                                                    name: name_clone.clone(),
+                                                    info,
+                                                };
+                                                let _ = sender_device.send(update);
+                                            }
+                                        }
+                                    }
+                                })
+                                .register();
+
+                            let proxy: Box<dyn ProxyT> = Box::new(device);
+                            let proxy_id = proxy.upcast_ref().id();
+                            let keep_weak = std::rc::Rc::downgrade(&keep);
+                            let removed_listener = proxy.upcast_ref()
+                                .add_listener_local()
+                                .removed(move || {
+                                    if let Some(k) = keep_weak.upgrade() {
+                                        k.borrow_mut().remove(proxy_id);
+                                    }
+                                })
+                                .register();
+
+                            keep.borrow_mut().add_proxy(proxy, Box::new(device_listener));
+                            keep.borrow_mut().add_listener(id, Box::new(removed_listener));
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .global_remove(|id| {
+                debug!("📤 Audio object removed: {}", id);
+            })
+            .register();
+
+        debug!("✅ Registry listener setup complete");
+
+        // Send initial startup status
+        let startup_update = VolumeUpdate {
+            id: 0,
+            name: "PipeWire Volume Monitor".to_string(),
+            info: "Ready - listening for volume changes".to_string(),
+        };
+        let _ = sender.send(startup_update);
+
+        // Initial heartbeat messages to show thread is working
         for i in 1..=5 {
             std::thread::sleep(std::time::Duration::from_secs(5));
             

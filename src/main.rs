@@ -47,7 +47,9 @@ struct WorkspaceUpdate {
 struct VolumeUpdate {
     id: u32,
     name: String,
-    info: String,
+    volume_percent: Option<u8>,  // Main volume 0-100%
+    channel_percent: Option<u8>, // First channel volume 0-100% (most accurate for user changes)
+    is_muted: Option<bool>,
 }
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
@@ -175,7 +177,7 @@ const SPA_PROP_VOLUME: u32 = 65539;
 const SPA_PROP_MUTE: u32 = 65540;
 const SPA_PROP_CHANNEL_VOLUMES: u32 = 65544;
 
-fn parse_volume_from_pod(param: &Pod) -> Option<String> {
+fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<bool>)> {
     let obj = param.as_object().ok()?;
     let mut volume: Option<f32> = None;
     let mut mute: Option<bool> = None;
@@ -206,27 +208,16 @@ fn parse_volume_from_pod(param: &Pod) -> Option<String> {
         }
     }
 
-    // Format volume information
-    let mut parts = Vec::new();
-    if let Some(vol) = volume {
-        parts.push(format!("Volume: {:.0}%", vol * 100.0));
-    }
-    if let Some(m) = mute {
-        parts.push(format!("Mute: {}", if m { "ON" } else { "OFF" }));
-    }
-    if !channel_volumes.is_empty() {
-        let channels = channel_volumes.iter().enumerate()
-            .map(|(i, &v)| format!("Ch{}: {:.0}%", i + 1, v * 100.0))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("Channels: [{}]", channels));
+    // Convert to structured data (no string formatting!)
+    let volume_percent = volume.map(|v| (v * 100.0).round() as u8);
+    let channel_percent = channel_volumes.first().map(|&v| (v * 100.0).round() as u8);
+    
+    // Return None only if we have no volume data at all
+    if volume_percent.is_none() && channel_percent.is_none() && mute.is_none() {
+        return None;
     }
 
-    if parts.is_empty() { 
-        Some("Property changed".to_string()) 
-    } else { 
-        Some(parts.join(" | ")) 
-    }
+    Some((volume_percent, channel_percent, mute))
 }
 
 async fn get_initial_title_state() -> Result<String> {
@@ -579,16 +570,17 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
         debug!("🚀 Starting async volume update loop...");
         
         while let Some(update) = receiver.recv().await {
-            // Only update GUI if we have actual volume data (skip "Property changed" messages)
-            if let Some(volume_percent) = extract_volume_percentage(&update.info) {
-                let display_text = format!("🔊 {}: {}%", 
+            // Use channel volume first (more accurate), fallback to main volume
+            if let Some(volume_percent) = update.channel_percent.or(update.volume_percent) {
+                let display_text = format!("🔊 {}: {}%{}", 
                     update.name.split_whitespace().next().unwrap_or("Audio"),
-                    volume_percent
+                    volume_percent,
+                    if update.is_muted == Some(true) { " 🔇" } else { "" }
                 );
                 label.set_text(&display_text);
                 debug!("📺 GTK UI updated via ASYNC: {}", display_text);
             } else {
-                debug!("📺 Skipping GUI update for: {}", update.info);
+                debug!("📺 Skipping GUI update - no volume data available");
             }
         }
         
@@ -598,29 +590,6 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
     Ok(())
 }
 
-fn extract_volume_percentage(info: &str) -> Option<u8> {
-    // Try to parse channel volumes first: "Channels: [Ch1: 42%, Ch2: 42%]"
-    if let Some(channels_part) = info.split(" | ").find(|s| s.starts_with("Channels: ")) {
-        if let Some(first_channel) = channels_part.split("Ch1: ").nth(1) {
-            if let Some(percent_str) = first_channel.split("%").next() {
-                if let Ok(val) = percent_str.parse::<u8>() {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    
-    // Fallback to main volume: "Volume: 75%"
-    if let Some(volume_part) = info.split(" | ").find(|s| s.starts_with("Volume: ")) {
-        if let Some(percent_str) = volume_part.strip_prefix("Volume: ").and_then(|s| s.strip_suffix("%")) {
-            if let Ok(val) = percent_str.parse::<u8>() {
-                return Some(val);
-            }
-        }
-    }
-    
-    None
-}
 
 // Start PipeWire monitoring on dedicated ThreadLoop thread
 fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<()> {
@@ -718,13 +687,16 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                 .param(move |_seq, param_type, _idx, _next, param| {
                                     if param_type == pw::spa::param::ParamType::Props {
                                         if let Some(pod) = param {
-                                            if let Some(info) = parse_volume_from_pod(pod) {
-                                                debug!("🔊 Node {}: {} - {} [ASYNC DELIVERY]", id, name_clone, info);
+                                            if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
+                                                       id, name_clone, volume_percent, channel_percent, is_muted);
                                                 
                                                 let update = VolumeUpdate {
                                                     id,
                                                     name: name_clone.clone(),
-                                                    info,
+                                                    volume_percent,
+                                                    channel_percent,
+                                                    is_muted,
                                                 };
                                                 // Send via async channel - immediate delivery!
                                                 if let Err(e) = sender_clone.send(update) {
@@ -772,13 +744,16 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                 .param(move |_seq, param_type, _idx, _next, param| {
                                     if param_type == pw::spa::param::ParamType::Props {
                                         if let Some(pod) = param {
-                                            if let Some(info) = parse_volume_from_pod(pod) {
-                                                debug!("🔊 Device {}: {} - {} [ASYNC DELIVERY]", id, name_clone, info);
+                                            if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Device {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
+                                                       id, name_clone, volume_percent, channel_percent, is_muted);
                                                 
                                                 let update = VolumeUpdate {
                                                     id,
                                                     name: name_clone.clone(),
-                                                    info,
+                                                    volume_percent,
+                                                    channel_percent,
+                                                    is_muted,
                                                 };
                                                 if let Err(e) = sender_clone.send(update) {
                                                     error!("Failed to send volume update: {}", e);

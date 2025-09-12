@@ -22,13 +22,32 @@ use zbus::MatchRule;
 use std::collections::HashMap;
 use zbus::zvariant;
 use zbus::zvariant::Value;
-use futures::{TryStreamExt, StreamExt};
-use futures::future::ready;
+use futures::StreamExt;
+
+// PipeWire dependencies
+use pipewire as pw;
+use pw::spa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
+use std::rc::Rc;
+use std::{cell::RefCell};
+use pw::{
+    device::Device,
+    node::Node,
+    proxy::{Listener, ProxyT},
+    thread_loop::ThreadLoop,
+    types::ObjectType,
+};
 
 #[derive(Debug, Clone)]
 struct WorkspaceUpdate {
     name: String,
     id: hyprland::shared::WorkspaceId,
+}
+
+#[derive(Debug, Clone)]
+struct VolumeUpdate {
+    id: u32,
+    name: String,
+    info: String,
 }
 
 static WORKSPACE_SENDER: OnceLock<mpsc::UnboundedSender<WorkspaceUpdate>> = OnceLock::new();
@@ -46,6 +65,14 @@ fn create_workspace_widget() -> Result<gtk::Label> {
     debug!("Creating workspace widget");
     let label = gtk::Label::new(Some("Workspace ?"));
     label.add_css_class("workspace-widget");
+    label.set_halign(gtk::Align::Center);
+    Ok(label)
+}
+
+fn create_volume_widget() -> Result<gtk::Label> {
+    debug!("Creating volume widget");
+    let label = gtk::Label::new(Some("Volume ?"));
+    label.add_css_class("volume-widget");
     label.set_halign(gtk::Align::Center);
     Ok(label)
 }
@@ -91,6 +118,114 @@ fn format_title_string(title: String, max_length: usize) -> String {
             &title[..crop_from_idx],
             &title[crop_to_idx..]
         )
+    }
+}
+
+// Safe wrapper for ThreadLoop constructor to encapsulate unsafe code
+fn new_thread_loop() -> Result<ThreadLoop, pw::Error> {
+    // Safety: ThreadLoop is created on the PW thread, used only there, and stopped before drop.
+    unsafe { ThreadLoop::new(None, None) }
+}
+
+// Manage PipeWire objects and listeners on the PipeWire thread
+struct PWKeepAlive {
+    proxies: HashMap<u32, Box<dyn ProxyT>>,
+    listeners: HashMap<u32, Vec<Box<dyn Listener>>>,
+}
+
+impl PWKeepAlive {
+    fn new() -> Self {
+        Self {
+            proxies: HashMap::new(),
+            listeners: HashMap::new(),
+        }
+    }
+
+    fn add_proxy(&mut self, proxy: Box<dyn ProxyT>, listener: Box<dyn Listener>) {
+        let id = proxy.upcast_ref().id();
+        self.proxies.insert(id, proxy);
+        self.listeners.entry(id).or_default().push(listener);
+    }
+
+    fn add_listener(&mut self, id: u32, listener: Box<dyn Listener>) {
+        self.listeners.entry(id).or_default().push(listener);
+    }
+
+    fn remove(&mut self, id: u32) {
+        self.proxies.remove(&id);
+        self.listeners.remove(&id);
+    }
+}
+
+// Helper functions to identify audio objects
+fn is_audio_node(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
+    props.and_then(|p| p.get("media.class"))
+         .map(|c| c.contains("Audio") && (c.contains("Sink") || c.contains("Source")))
+         .unwrap_or(false)
+}
+
+fn is_audio_device(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
+    props.and_then(|p| p.get("device.api"))
+         .map(|api| api == "alsa" || api == "bluez5")
+         .unwrap_or(false)
+}
+
+// SPA property constants for volume control
+const SPA_PROP_VOLUME: u32 = 65539;
+const SPA_PROP_MUTE: u32 = 65540;
+const SPA_PROP_CHANNEL_VOLUMES: u32 = 65544;
+
+fn parse_volume_from_pod(param: &Pod) -> Option<String> {
+    let obj = param.as_object().ok()?;
+    let mut volume: Option<f32> = None;
+    let mut mute: Option<bool> = None;
+    let mut channel_volumes: Vec<f32> = Vec::new();
+
+    for prop in obj.props() {
+        let key = prop.key().0;
+        let value_pod = prop.value();
+
+        match key {
+            SPA_PROP_VOLUME => {
+                if let Ok(vol) = value_pod.get_float() {
+                    volume = Some(vol);
+                }
+            },
+            SPA_PROP_MUTE => {
+                if let Ok(m) = value_pod.get_bool() {
+                    mute = Some(m);
+                }
+            },
+            SPA_PROP_CHANNEL_VOLUMES => {
+                if let Ok((_, PodValue::ValueArray(ValueArray::Float(volumes)))) = 
+                    PodDeserializer::deserialize_any_from(value_pod.as_bytes()) {
+                    channel_volumes = volumes;
+                }
+            },
+            _ => {}
+        }
+    }
+
+    // Format volume information
+    let mut parts = Vec::new();
+    if let Some(vol) = volume {
+        parts.push(format!("Volume: {:.0}%", vol * 100.0));
+    }
+    if let Some(m) = mute {
+        parts.push(format!("Mute: {}", if m { "ON" } else { "OFF" }));
+    }
+    if !channel_volumes.is_empty() {
+        let channels = channel_volumes.iter().enumerate()
+            .map(|(i, &v)| format!("Ch{}: {:.0}%", i + 1, v * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("Channels: [{}]", channels));
+    }
+
+    if parts.is_empty() { 
+        Some("Property changed".to_string()) 
+    } else { 
+        Some(parts.join(" | ")) 
     }
 }
 
@@ -431,6 +566,255 @@ fn setup_bluetooth_updates(label: gtk::Label) -> Result<()> {
     Ok(())
 }
 
+fn setup_volume_updates(label: gtk::Label) -> Result<()> {
+    debug!("Setting up volume updates with tokio async channels");
+
+    let (sender, mut receiver) = mpsc::unbounded_channel::<VolumeUpdate>();
+
+    // Start PipeWire monitoring on dedicated thread
+    start_pipewire_thread(sender)?;
+
+    // Spawn async task on GTK main thread to handle volume updates
+    glib::spawn_future_local(async move {
+        debug!("🚀 Starting async volume update loop...");
+        
+        while let Some(update) = receiver.recv().await {
+            let display_text = format!("🔊 {}: {:.0}%", 
+                update.name.split_whitespace().next().unwrap_or("Audio"),
+                extract_volume_percentage(&update.info).unwrap_or(0)
+            );
+            label.set_text(&display_text);
+            debug!("📺 GTK UI updated via ASYNC: {}", display_text);
+        }
+        
+        debug!("⚠️ Volume update loop ended");
+    });
+
+    Ok(())
+}
+
+fn extract_volume_percentage(info: &str) -> Option<u8> {
+    // Parse "Volume: 75%" format
+    if let Some(volume_part) = info.split(" | ").find(|s| s.starts_with("Volume: ")) {
+        if let Some(percent_str) = volume_part.strip_prefix("Volume: ").and_then(|s| s.strip_suffix("%")) {
+            percent_str.parse().ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+// Start PipeWire monitoring on dedicated ThreadLoop thread
+fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<()> {
+    std::thread::spawn(move || {
+        debug!("🔧 Initializing PipeWire on dedicated thread...");
+        
+        // Initialize PipeWire on this thread
+        pw::init();
+        debug!("✅ PipeWire initialized");
+
+        // Create ThreadLoop - manages PipeWire loop on this thread
+        let thread_loop = match new_thread_loop() {
+            Ok(tl) => {
+                debug!("✅ ThreadLoop created");
+                tl
+            }
+            Err(e) => {
+                error!("❌ Failed to create ThreadLoop: {}", e);
+                return;
+            }
+        };
+
+        let context = match pw::context::Context::new(&thread_loop) {
+            Ok(ctx) => {
+                debug!("✅ Context created");
+                ctx
+            }
+            Err(e) => {
+                error!("❌ Failed to create context: {}", e);
+                return;
+            }
+        };
+
+        let core = match context.connect(None) {
+            Ok(c) => {
+                debug!("✅ Core connected");
+                c
+            }
+            Err(e) => {
+                error!("❌ Failed to connect core: {}", e);
+                return;
+            }
+        };
+
+        let _core_listener = core
+            .add_listener_local()
+            .info(|info| {
+                debug!("📡 PipeWire connected: {}", info.name());
+            })
+            .error(|id, seq, res, message| {
+                error!("❌ PipeWire error id:{} seq:{} res:{}: {}", id, seq, res, message);
+            })
+            .register();
+
+        let registry = match core.get_registry() {
+            Ok(reg) => {
+                debug!("✅ Registry obtained");
+                Rc::new(reg)
+            }
+            Err(e) => {
+                error!("❌ Failed to get registry: {}", e);
+                return;
+            }
+        };
+        let registry_weak = Rc::downgrade(&registry);
+        let keep_alive = Rc::new(RefCell::new(PWKeepAlive::new()));
+        let keep_alive_weak = Rc::downgrade(&keep_alive);
+
+        debug!("🎵 PipeWire ThreadLoop started - monitoring volume changes with async channels");
+
+        // Registry listener for discovering audio objects
+        let _registry_listener = registry
+            .add_listener_local()
+            .global(move |obj| {
+                if let (Some(reg), Some(keep)) = (registry_weak.upgrade(), keep_alive_weak.upgrade()) {
+                    match obj.type_ {
+                        ObjectType::Node if is_audio_node(&obj.props) => {
+                            let node: Node = reg.bind(obj).unwrap();
+                            let id = node.upcast_ref().id();
+                            let name = obj.props
+                                .and_then(|p| p.get("node.description").or_else(|| p.get("node.name")))
+                                .unwrap_or("Unknown Node").to_string();
+
+                            debug!("📱 Monitoring audio node: {} ({})", name, id);
+
+                            node.subscribe_params(&[
+                                pw::spa::param::ParamType::Props,
+                                pw::spa::param::ParamType::Route,
+                            ]);
+
+                            let name_clone = name.clone();
+                            let sender_clone = sender.clone();
+                            let node_listener = node
+                                .add_listener_local()
+                                .param(move |_seq, param_type, _idx, _next, param| {
+                                    if param_type == pw::spa::param::ParamType::Props {
+                                        if let Some(pod) = param {
+                                            if let Some(info) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Node {}: {} - {} [ASYNC DELIVERY]", id, name_clone, info);
+                                                
+                                                let update = VolumeUpdate {
+                                                    id,
+                                                    name: name_clone.clone(),
+                                                    info,
+                                                };
+                                                // Send via async channel - immediate delivery!
+                                                if let Err(e) = sender_clone.send(update) {
+                                                    error!("Failed to send volume update: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                })
+                                .register();
+
+                            let proxy: Box<dyn ProxyT> = Box::new(node);
+                            let proxy_id = proxy.upcast_ref().id();
+                            let keep_weak = Rc::downgrade(&keep);
+                            let removed_listener = proxy.upcast_ref()
+                                .add_listener_local()
+                                .removed(move || {
+                                    if let Some(k) = keep_weak.upgrade() {
+                                        k.borrow_mut().remove(proxy_id);
+                                    }
+                                })
+                                .register();
+
+                            keep.borrow_mut().add_proxy(proxy, Box::new(node_listener));
+                            keep.borrow_mut().add_listener(id, Box::new(removed_listener));
+                        }
+                        ObjectType::Device if is_audio_device(&obj.props) => {
+                            let device: Device = reg.bind(obj).unwrap();
+                            let id = device.upcast_ref().id();
+                            let name = obj.props
+                                .and_then(|p| p.get("device.description").or_else(|| p.get("device.name")))
+                                .unwrap_or("Unknown Device").to_string();
+
+                            debug!("🔌 Monitoring audio device: {} ({})", name, id);
+
+                            device.subscribe_params(&[
+                                pw::spa::param::ParamType::Props,
+                                pw::spa::param::ParamType::Route,
+                            ]);
+
+                            let name_clone = name.clone();
+                            let sender_clone = sender.clone();
+                            let device_listener = device
+                                .add_listener_local()
+                                .param(move |_seq, param_type, _idx, _next, param| {
+                                    if param_type == pw::spa::param::ParamType::Props {
+                                        if let Some(pod) = param {
+                                            if let Some(info) = parse_volume_from_pod(pod) {
+                                                debug!("🔊 Device {}: {} - {} [ASYNC DELIVERY]", id, name_clone, info);
+                                                
+                                                let update = VolumeUpdate {
+                                                    id,
+                                                    name: name_clone.clone(),
+                                                    info,
+                                                };
+                                                if let Err(e) = sender_clone.send(update) {
+                                                    error!("Failed to send volume update: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                })
+                                .register();
+
+                            let proxy: Box<dyn ProxyT> = Box::new(device);
+                            let proxy_id = proxy.upcast_ref().id();
+                            let keep_weak = Rc::downgrade(&keep);
+                            let removed_listener = proxy.upcast_ref()
+                                .add_listener_local()
+                                .removed(move || {
+                                    if let Some(k) = keep_weak.upgrade() {
+                                        k.borrow_mut().remove(proxy_id);
+                                    }
+                                })
+                                .register();
+
+                            keep.borrow_mut().add_proxy(proxy, Box::new(device_listener));
+                            keep.borrow_mut().add_listener(id, Box::new(removed_listener));
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .register();
+
+        // Start the ThreadLoop
+        thread_loop.start();
+        debug!("✅ ThreadLoop started successfully");
+
+        debug!("🔄 PipeWire thread running - async event delivery active...");
+
+        // Set up graceful shutdown channel  
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        
+        // Block this OS thread until shutdown is requested (no wasteful sleep loop!)
+        // ThreadLoop::start() already manages its own internal event thread
+        stop_rx.recv().ok();
+        
+        debug!("🛑 Shutdown requested, stopping ThreadLoop...");
+        thread_loop.stop();
+        debug!("✅ ThreadLoop stopped gracefully");
+    });
+
+    Ok(())
+}
+
 fn create_title_widget() -> Result<gtk::Label> {
     debug!("Creating title widget");
     let label = gtk::Label::new(Some("Application Title"));
@@ -527,7 +911,7 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
     Ok((center_spacer_start, title_widget, center_spacer_end))
 }
 
-fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
 
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -537,16 +921,19 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label)
     let bt_widget = create_bt_widget()?;
     right_group.append(&bt_widget);
 
+    let volume_widget = create_volume_widget()?;
+    right_group.append(&volume_widget);
+
     let battery_widget = create_battery_widget()?;
     right_group.append(&battery_widget);
 
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
 
-    Ok((right_group, bt_widget, battery_widget, time_widget))
+    Ok((right_group, bt_widget, volume_widget, battery_widget, time_widget))
 }
 
-fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
+fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating experimental bar");
 
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -555,7 +942,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
 
     let (left_group, workspace_widget) = create_left_group()?;
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
-    let (right_group, bt_widget, battery_widget, time_widget) = create_right_group()?;
+    let (right_group, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group()?;
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -563,7 +950,7 @@ fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::L
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, bt_widget, battery_widget, time_widget, workspace_widget, title_widget))
+    Ok((main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget))
 }
 
 fn load_css_styles(window: &gtk::ApplicationWindow) -> Result<()> {
@@ -1482,7 +1869,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     load_css_styles(&window)?;
     configure_layer_shell(&window)?;
 
-    let (bar, bt_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
+    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
     window.set_child(Some(&bar));
     window.show();
 
@@ -1491,6 +1878,7 @@ fn activate(application: &gtk::Application) -> Result<()> {
     setup_title_updates(title_widget)?;
     setup_battery_updates(battery_widget)?;
     setup_bluetooth_updates(bt_widget)?;
+    setup_volume_updates(volume_widget)?;
 
     info!("Application activated successfully");
     Ok(())

@@ -579,12 +579,17 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
         debug!("🚀 Starting async volume update loop...");
         
         while let Some(update) = receiver.recv().await {
-            let display_text = format!("🔊 {}: {:.0}%", 
-                update.name.split_whitespace().next().unwrap_or("Audio"),
-                extract_volume_percentage(&update.info).unwrap_or(0)
-            );
-            label.set_text(&display_text);
-            debug!("📺 GTK UI updated via ASYNC: {}", display_text);
+            // Only update GUI if we have actual volume data (skip "Property changed" messages)
+            if let Some(volume_percent) = extract_volume_percentage(&update.info) {
+                let display_text = format!("🔊 {}: {}%", 
+                    update.name.split_whitespace().next().unwrap_or("Audio"),
+                    volume_percent
+                );
+                label.set_text(&display_text);
+                debug!("📺 GTK UI updated via ASYNC: {}", display_text);
+            } else {
+                debug!("📺 Skipping GUI update for: {}", update.info);
+            }
         }
         
         debug!("⚠️ Volume update loop ended");
@@ -594,16 +599,27 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
 }
 
 fn extract_volume_percentage(info: &str) -> Option<u8> {
-    // Parse "Volume: 75%" format
+    // Try to parse channel volumes first: "Channels: [Ch1: 42%, Ch2: 42%]"
+    if let Some(channels_part) = info.split(" | ").find(|s| s.starts_with("Channels: ")) {
+        if let Some(first_channel) = channels_part.split("Ch1: ").nth(1) {
+            if let Some(percent_str) = first_channel.split("%").next() {
+                if let Ok(val) = percent_str.parse::<u8>() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    
+    // Fallback to main volume: "Volume: 75%"
     if let Some(volume_part) = info.split(" | ").find(|s| s.starts_with("Volume: ")) {
         if let Some(percent_str) = volume_part.strip_prefix("Volume: ").and_then(|s| s.strip_suffix("%")) {
-            percent_str.parse().ok()
-        } else {
-            None
+            if let Ok(val) = percent_str.parse::<u8>() {
+                return Some(val);
+            }
         }
-    } else {
-        None
     }
+    
+    None
 }
 
 // Start PipeWire monitoring on dedicated ThreadLoop thread

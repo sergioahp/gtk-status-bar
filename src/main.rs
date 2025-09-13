@@ -976,15 +976,25 @@ fn create_battery_widget() -> Result<gtk::Label> {
 fn create_left_group() -> Result<(gtk::Box, gtk::Label)> {
     debug!("Creating left group");
 
+    let left_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    left_container.add_css_class("left-container");
+    left_container.set_valign(gtk::Align::Start);
+    left_container.set_hexpand(false);
+
     let left_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
-    left_group.set_valign(gtk::Align::Start);
     left_group.set_hexpand(false);
 
     let workspace_widget = create_workspace_widget()?;
     left_group.append(&workspace_widget);
 
-    Ok((left_group, workspace_widget))
+    let left_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    left_spacer.set_hexpand(true);
+
+    left_container.append(&left_group);
+    left_container.append(&left_spacer);
+
+    Ok((left_container, workspace_widget))
 }
 
 fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
@@ -1010,10 +1020,18 @@ fn create_center_group() -> Result<(gtk::Box, gtk::Label, gtk::Box)> {
 fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {
     debug!("Creating right group");
 
+    let right_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    right_container.add_css_class("right-container");
+    right_container.set_hexpand(false);
+    right_container.set_valign(gtk::Align::End);
+
+    let right_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    right_spacer.set_hexpand(true);
+
     let right_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
-    right_group.set_valign(gtk::Align::End);
+
     let bt_widget = create_bt_widget()?;
     right_group.append(&bt_widget);
 
@@ -1026,7 +1044,10 @@ fn create_right_group() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label,
     let time_widget = create_time_widget()?;
     right_group.append(&time_widget);
 
-    Ok((right_group, bt_widget, volume_widget, battery_widget, time_widget))
+    right_container.append(&right_spacer);
+    right_container.append(&right_group);
+
+    Ok((right_container, bt_widget, volume_widget, battery_widget, time_widget))
 }
 
 fn create_experimental_bar() -> Result<(gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label, gtk::Label)> {

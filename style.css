@@ -1,6 +1,9 @@
 * {
   all: unset;
 }
+/* Reminder that max-width does not work in gtk's css
+ * nor flex
+ * */
 
 .time-widget {
   background-color: rgba(102, 126, 234, 0.5);
@@ -49,6 +52,20 @@
   margin: 0.3em 0.5em 0em;
   font-weight: bold;
   min-width: 4em;
+}
+
+/* Fixed-width containers for perfect centering */
+.left-container {
+  min-width: 20em;
+}
+
+.right-container {
+  min-width: 20em;
+}
+
+/* Equal spacers for perfect centering */
+.center-spacer {
+  min-width: 0px;
 }
 
 window {

@@ -36,6 +36,7 @@ use pw::{
     proxy::{Listener, ProxyT},
     thread_loop::ThreadLoop,
     types::ObjectType,
+    metadata::Metadata,
 };
 
 #[derive(Debug, Clone)]
@@ -593,6 +594,9 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
     std::thread::spawn(move || {
         debug!("🔧 Initializing PipeWire on dedicated thread...");
         
+        // Track the default sink name (not ID, since metadata uses names)
+        let default_sink_name = Rc::new(RefCell::new(None::<String>));
+        
         // Initialize PipeWire on this thread
         pw::init();
         debug!("✅ PipeWire initialized");
@@ -655,7 +659,58 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
         let keep_alive = Rc::new(RefCell::new(PWKeepAlive::new()));
         let keep_alive_weak = Rc::downgrade(&keep_alive);
 
-        debug!("🎵 PipeWire ThreadLoop started - monitoring volume changes with async channels");
+        debug!("🎵 PipeWire ThreadLoop started - monitoring volume changes with default sink filtering");
+        
+        // Set up metadata listener for default sink detection
+        let registry_weak_metadata = Rc::downgrade(&registry);
+        let default_sink_name_for_metadata = Rc::clone(&default_sink_name);
+        
+        // Metadata listener for default sink tracking
+        let _metadata_registry_listener = registry
+            .add_listener_local()
+            .global(move |obj| {
+                if let Some(reg) = registry_weak_metadata.upgrade() {
+                    if obj.type_ == ObjectType::Metadata {
+                        debug!("📋 Found metadata object: {:?}", obj.props);
+                        
+                        let metadata: Metadata = reg.bind(obj).unwrap();
+                        let default_sink_weak = Rc::downgrade(&default_sink_name_for_metadata);
+                        
+                        let _metadata_listener = metadata
+                            .add_listener_local()
+                            .property(move |_subject, key, _type_, value| {
+                                if let Some(key_str) = key {
+                                    if key_str == "default.audio.sink" {
+                                        if let Some(value_str) = value {
+                                            debug!("🎯 Default sink metadata: {}", value_str);
+                                            
+                                            // Parse JSON to extract device name
+                                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value_str) {
+                                                if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
+                                                    info!("🔄 Default sink changed to: {}", name);
+                                                    
+                                                    if let Some(default_sink) = default_sink_weak.upgrade() {
+                                                        *default_sink.borrow_mut() = Some(name.to_string());
+                                                    }
+                                                }
+                                            } else {
+                                                warn!("Failed to parse default sink metadata as JSON: {}", value_str);
+                                            }
+                                        } else {
+                                            info!("🚫 Default sink cleared");
+                                            if let Some(default_sink) = default_sink_weak.upgrade() {
+                                                *default_sink.borrow_mut() = None;
+                                            }
+                                        }
+                                    }
+                                }
+                                0
+                            })
+                            .register();
+                    }
+                }
+            })
+            .register();
 
         // Registry listener for discovering audio objects
         let _registry_listener = registry
@@ -669,8 +724,14 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             let name = obj.props
                                 .and_then(|p| p.get("node.description").or_else(|| p.get("node.name")))
                                 .unwrap_or("Unknown Node").to_string();
+                            
+                            // Get node.name for default sink matching
+                            let node_name = obj.props
+                                .and_then(|p| p.get("node.name"))
+                                .unwrap_or("")
+                                .to_string();
 
-                            debug!("📱 Monitoring audio node: {} ({})", name, id);
+                            debug!("📱 Monitoring audio node: {} ({}) [node.name: {}]", name, id, node_name);
 
                             node.subscribe_params(&[
                                 ParamType::Props,
@@ -678,26 +739,43 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             ]);
 
                             let name_clone = name.clone();
+                            let node_name_clone = node_name.clone();
                             let sender_clone = sender.clone();
+                            let default_sink_weak = Rc::downgrade(&default_sink_name);
                             let node_listener = node
                                 .add_listener_local()
                                 .param(move |_seq, param_type, _idx, _next, param| {
                                     if param_type == ParamType::Props {
                                         if let Some(pod) = param {
                                             if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
-                                                debug!("🔊 Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
-                                                       id, name_clone, volume_percent, channel_percent, is_muted);
-                                                
-                                                let update = VolumeUpdate {
-                                                    id,
-                                                    name: name_clone.clone(),
-                                                    volume_percent,
-                                                    channel_percent,
-                                                    is_muted,
+                                                // Check if this is the default sink
+                                                let is_default = if let Some(default_sink) = default_sink_weak.upgrade() {
+                                                    let current_default = default_sink.borrow();
+                                                    current_default.as_ref().map_or(false, |default| {
+                                                        node_name_clone == *default
+                                                    })
+                                                } else {
+                                                    false
                                                 };
-                                                // Send via async channel - immediate delivery!
-                                                if let Err(e) = sender_clone.send(update) {
-                                                    error!("Failed to send volume update: {}", e);
+                                                
+                                                if is_default {
+                                                    debug!("🔊 DEFAULT Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
+                                                           id, name_clone, volume_percent, channel_percent, is_muted);
+                                                    
+                                                    let update = VolumeUpdate {
+                                                        id,
+                                                        name: name_clone.clone(),
+                                                        volume_percent,
+                                                        channel_percent,
+                                                        is_muted,
+                                                    };
+                                                    // Send via async channel - immediate delivery!
+                                                    if let Err(e) = sender_clone.send(update) {
+                                                        error!("Failed to send volume update: {}", e);
+                                                    }
+                                                } else {
+                                                    debug!("🔇 Non-default node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [FILTERED OUT]", 
+                                                           id, name_clone, volume_percent, channel_percent, is_muted);
                                                 }
                                             }
                                         }

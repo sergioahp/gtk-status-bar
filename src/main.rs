@@ -212,9 +212,9 @@ fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<
         }
     }
 
-    // Convert to structured data (no string formatting!)
-    let volume_percent = volume.map(|v| (v * 100.0).round() as u8);
-    let channel_percent = channel_volumes.first().map(|&v| (v * 100.0).round() as u8);
+    // Convert to structured data with cube root transformation (like wpctl)
+    let volume_percent = volume.map(|v| (v.powf(1.0/3.0) * 100.0).round() as u8);
+    let channel_percent = channel_volumes.first().map(|&v| (v.powf(1.0/3.0) * 100.0).round() as u8);
     
     // Return None only if we have no volume data at all
     if volume_percent.is_none() && channel_percent.is_none() && mute.is_none() {
@@ -929,7 +929,7 @@ fn create_time_widget() -> Result<gtk::Label> {
 }
 
 fn get_current_time() -> Result<String> {
-    Ok(Local::now().format("%H:%M").to_string())
+    Ok(Local::now().format("%l:%M %p").to_string())
 }
 
 fn update_time_widget(label: gtk::Label) -> Result<()> {

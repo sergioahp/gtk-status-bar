@@ -683,7 +683,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                     .and_then(|p| p.get("metadata.name"))
                     .unwrap_or("");
                 if meta_name != "default" {
-                    debug!("Skipping metadata '{}'", meta_name);
+                    debug!("🚫 Skipping metadata '{}' (props: {:?})", meta_name, obj.props);
                     return;
                 }
                 debug!("✅ Processing metadata.name == default");
@@ -702,20 +702,31 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                         let meta_listener = metadata
                             .add_listener_local()
                             .property(move |subject, key, _type_, value| {
-                                debug!("metadata.property subject={:?} key={:?} value={:?}", subject, key, value);
+                                debug!("📝 metadata.property subject={:?} key={:?} value={:?}", subject, key, value);
 
-                                // Keys we care about:
-                                if let (Some(k), Some(v)) = (key, value) {
-                                    if k == "default.audio.sink" {
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(v) {
-                                            if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
-                                                if let Some(default_sink) = default_sink_weak.upgrade() {
-                                                    *default_sink.borrow_mut() = Some(name.to_string());
-                                                    info!("🔄 Default sink -> {}", name);
+                                // Handle empty/None cases explicitly  
+                                match (key, value) {
+                                    (None, _) => debug!("🚫 Skipping metadata property: key is None"),
+                                    (_, None) => debug!("🚫 Skipping metadata property: value is None for key {:?}", key),
+                                    (Some(k), Some(v)) if k.is_empty() => debug!("🚫 Skipping metadata property: empty key"),
+                                    (Some(k), Some(v)) if v.is_empty() => debug!("🚫 Skipping metadata property: empty value for key '{}'", k),
+                                    (Some(k), Some(v)) => {
+                                        debug!("🔍 Processing metadata property: {}={}", k, v);
+                                        if k == "default.audio.sink" {
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(v) {
+                                                if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
+                                                    if let Some(default_sink) = default_sink_weak.upgrade() {
+                                                        let previous_sink = default_sink.borrow().clone();
+                                                        *default_sink.borrow_mut() = Some(name.to_string());
+                                                        info!("🔄 Default sink -> {}", name);
+                                                        debug!("🎯 SINK CHANGE: {:?} -> {} (should trigger volume fetch)", previous_sink, name);
+                                                    }
                                                 }
+                                            } else {
+                                                warn!("❌ default.audio.sink value is not JSON: {}", v);
                                             }
                                         } else {
-                                            warn!("default.audio.sink value is not JSON: {}", v);
+                                            debug!("🔧 Other metadata property: {} (ignored)", k);
                                         }
                                     }
                                 }
@@ -762,6 +773,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                 .to_string();
 
                             debug!("📱 Monitoring audio node: {} ({}) [node.name: {}]", name, id, node_name);
+                            debug!("🔗 ADDING NODE LISTENER for node.name: {}", node_name);
 
                             node.subscribe_params(&[
                                 ParamType::Props,
@@ -776,6 +788,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                 .add_listener_local()
                                 .param(move |_seq, param_type, _idx, _next, param| {
                                     if param_type == ParamType::Props {
+                                        debug!("🎛️  NODE PARAM CALLBACK: {} ({}) received Props param", name_clone, id);
                                         if let Some(pod) = param {
                                             if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
                                                 // Check if this is the default sink
@@ -791,6 +804,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                                 if is_default {
                                                     debug!("🔊 DEFAULT Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
                                                            id, name_clone, volume_percent, channel_percent, is_muted);
+                                                    debug!("📤 SENDING VOLUME UPDATE to UI for default sink");
                                                     
                                                     let update = VolumeUpdate {
                                                         id,
@@ -806,6 +820,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                                 } else {
                                                     debug!("🔇 Non-default node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [FILTERED OUT]", 
                                                            id, name_clone, volume_percent, channel_percent, is_muted);
+                                                    debug!("⏭️  SKIPPING: Not the default sink ({})", node_name_clone);
                                                 }
                                             }
                                         }

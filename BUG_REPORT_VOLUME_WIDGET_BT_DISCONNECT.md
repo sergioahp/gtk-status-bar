@@ -21,10 +21,17 @@ When Bluetooth devices disconnect:
 3. No volume update is sent to the GTK UI
 
 ## Steps to Reproduce
+
+### Method 1: Bluetooth Disconnect
 1. Connect Bluetooth audio device (TOZO-T10 headphones)
 2. Verify volume widget shows: `🔊T90` (works correctly)
 3. Disconnect Bluetooth device
 4. Observe volume widget still shows: `🔊T90` (should update to built-in audio)
+
+### Method 2: Manual Sink Switch (wpctl)
+1. With Bluetooth connected, run: `wpctl set-default 52` (built-in audio)
+2. Observe same issue: volume widget doesn't update to built-in audio volume
+3. Run: `wpctl set-default 187` (back to Bluetooth) - also fails to update
 
 ## Log Analysis
 
@@ -48,6 +55,15 @@ The metadata correctly detects the default sink change, but the volume monitorin
 1. Query the new default sink's volume properties
 2. Send a `VolumeUpdate` to the GTK UI channel
 3. This suggests the PipeWire node listener may not be triggered for the built-in audio device
+
+**Confirmed**: Using `wpctl set-default 52` to manually switch sinks produces identical behavior:
+```
+🔄 Default sink -> alsa_output.pci-0000_00_1b.0.analog-stereo
+🎯 SINK CHANGE: Some("bluez_output.58_FC_C6_23_29_68.1") -> alsa_output.pci-0000_00_1b.0.analog-stereo (should trigger volume fetch)
+```
+**Missing**: No `🎛️ NODE PARAM CALLBACK` or `📤 SENDING VOLUME UPDATE` messages after sink change.
+
+This confirms the issue is **not specific to Bluetooth disconnection** but affects any default sink change where the new sink doesn't immediately fire param callbacks.
 
 ## Technical Details
 - **PipeWire Error**: `res:-14` suggests a resource/node unavailable error when the Bluetooth node is removed

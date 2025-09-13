@@ -576,10 +576,12 @@ fn setup_volume_updates(label: gtk::Label) -> Result<()> {
         while let Some(update) = receiver.recv().await {
             // Use channel volume first (more accurate), fallback to main volume
             if let Some(volume_percent) = update.channel_percent.or(update.volume_percent) {
-                let display_text = format!("🔊 {}: {}%{}", 
-                    update.name.split_whitespace().next().unwrap_or("Audio"),
-                    volume_percent,
-                    if update.is_muted == Some(true) { " 🔇" } else { "" }
+                let first_char = update.name.chars().next().unwrap_or('A');
+                let emoji = if update.is_muted == Some(true) { "🔇" } else { "🔊" };
+                let display_text = format!("{}{}{}",
+                    emoji,
+                    first_char,
+                    volume_percent
                 );
                 label.set_text(&display_text);
                 debug!("📺 GTK UI updated via ASYNC: {}", display_text);

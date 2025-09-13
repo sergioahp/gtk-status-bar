@@ -163,10 +163,16 @@ impl PWKeepAlive {
 
 // Helper functions to identify audio objects
 fn is_audio_node(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
-    props.and_then(|p| p.get("media.class"))
+    let media_class = props.and_then(|p| p.get("media.class"));
+    debug!("🔍 Checking node - media.class: {:?}", media_class);
+    
+    let result = media_class
          // monitor only sinks for now
          .map(|c| c.contains("Audio") && c.contains("Sink"))
-         .unwrap_or(false)
+         .unwrap_or(false);
+    
+    debug!("🔍 Node filter result: {} for media.class: {:?}", result, media_class);
+    result
 }
 
 fn is_audio_device(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
@@ -669,44 +675,66 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
         let _metadata_registry_listener = registry
             .add_listener_local()
             .global(move |obj| {
+                // GPT-5 says:
+                // Only the "default" metadata carries default.audio.sink/source
+                let meta_name = obj.props
+                    .and_then(|p| p.get("metadata.name"))
+                    .unwrap_or("");
+                if meta_name != "default" {
+                    debug!("Skipping metadata '{}'", meta_name);
+                    return;
+                }
+                debug!("✅ Processing metadata.name == default");
+
                 if let Some(reg) = registry_weak_metadata.upgrade() {
                     if obj.type_ == ObjectType::Metadata {
                         debug!("📋 Found metadata object: {:?}", obj.props);
                         
                         let metadata: Metadata = reg.bind(obj).unwrap();
+                        let meta_id = metadata.upcast_ref().id();
+                        debug!("📋 Bound 'default' Metadata (id={})", meta_id);
+
                         let default_sink_weak = Rc::downgrade(&default_sink_name_for_metadata);
-                        
-                        let _metadata_listener = metadata
+
+                        // Listen for property changes
+                        let meta_listener = metadata
                             .add_listener_local()
-                            .property(move |_subject, key, _type_, value| {
-                                if let Some(key_str) = key {
-                                    if key_str == "default.audio.sink" {
-                                        if let Some(value_str) = value {
-                                            debug!("🎯 Default sink metadata: {}", value_str);
-                                            
-                                            // Parse JSON to extract device name
-                                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value_str) {
-                                                if let Some(name) = parsed.get("name").and_then(|n| n.as_str()) {
-                                                    info!("🔄 Default sink changed to: {}", name);
-                                                    
-                                                    if let Some(default_sink) = default_sink_weak.upgrade() {
-                                                        *default_sink.borrow_mut() = Some(name.to_string());
-                                                    }
+                            .property(move |subject, key, _type_, value| {
+                                debug!("metadata.property subject={:?} key={:?} value={:?}", subject, key, value);
+
+                                // Keys we care about:
+                                if let (Some(k), Some(v)) = (key, value) {
+                                    if k == "default.audio.sink" {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(v) {
+                                            if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
+                                                if let Some(default_sink) = default_sink_weak.upgrade() {
+                                                    *default_sink.borrow_mut() = Some(name.to_string());
+                                                    info!("🔄 Default sink -> {}", name);
                                                 }
-                                            } else {
-                                                warn!("Failed to parse default sink metadata as JSON: {}", value_str);
                                             }
                                         } else {
-                                            info!("🚫 Default sink cleared");
-                                            if let Some(default_sink) = default_sink_weak.upgrade() {
-                                                *default_sink.borrow_mut() = None;
-                                            }
+                                            warn!("default.audio.sink value is not JSON: {}", v);
                                         }
                                     }
                                 }
                                 0
                             })
                             .register();
+
+                        // Keep both proxy and listener alive  
+                        let proxy: Box<dyn ProxyT> = Box::new(metadata);
+                        let keep_weak = Rc::downgrade(&keep_alive);
+                        let removed = proxy.upcast_ref()
+                            .add_listener_local()
+                            .removed(move || {
+                                if let Some(k) = keep_weak.upgrade() {
+                                    k.borrow_mut().remove(meta_id);
+                                }
+                            })
+                            .register();
+
+                        keep_alive.borrow_mut().add_proxy(proxy, Box::new(meta_listener));
+                        keep_alive.borrow_mut().add_listener(meta_id, Box::new(removed));
                     }
                 }
             })

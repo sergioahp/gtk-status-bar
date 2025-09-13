@@ -27,6 +27,7 @@ use futures::StreamExt;
 // PipeWire dependencies
 use pipewire as pw;
 use pw::spa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
+use pw::spa::param::ParamType;
 use std::rc::Rc;
 use std::{cell::RefCell};
 use pw::{
@@ -162,7 +163,8 @@ impl PWKeepAlive {
 // Helper functions to identify audio objects
 fn is_audio_node(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
     props.and_then(|p| p.get("media.class"))
-         .map(|c| c.contains("Audio") && (c.contains("Sink") || c.contains("Source")))
+         // monitor only sinks for now
+         .map(|c| c.contains("Audio") && c.contains("Sink"))
          .unwrap_or(false)
 }
 
@@ -171,11 +173,6 @@ fn is_audio_device(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
          .map(|api| api == "alsa" || api == "bluez5")
          .unwrap_or(false)
 }
-
-// SPA property constants for volume control
-const SPA_PROP_VOLUME: u32 = 65539;
-const SPA_PROP_MUTE: u32 = 65540;
-const SPA_PROP_CHANNEL_VOLUMES: u32 = 65544;
 
 fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<bool>)> {
     let obj = param.as_object().ok()?;
@@ -188,17 +185,17 @@ fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<
         let value_pod = prop.value();
 
         match key {
-            SPA_PROP_VOLUME => {
+            pw::spa::sys::SPA_PROP_volume => {
                 if let Ok(vol) = value_pod.get_float() {
                     volume = Some(vol);
                 }
             },
-            SPA_PROP_MUTE => {
+            pw::spa::sys::SPA_PROP_mute => {
                 if let Ok(m) = value_pod.get_bool() {
                     mute = Some(m);
                 }
             },
-            SPA_PROP_CHANNEL_VOLUMES => {
+            pw::spa::sys::SPA_PROP_channelVolumes => {
                 if let Ok((_, PodValue::ValueArray(ValueArray::Float(volumes)))) = 
                     PodDeserializer::deserialize_any_from(value_pod.as_bytes()) {
                     channel_volumes = volumes;
@@ -676,8 +673,8 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             debug!("📱 Monitoring audio node: {} ({})", name, id);
 
                             node.subscribe_params(&[
-                                pw::spa::param::ParamType::Props,
-                                pw::spa::param::ParamType::Route,
+                                ParamType::Props,
+                                ParamType::Route,
                             ]);
 
                             let name_clone = name.clone();
@@ -685,7 +682,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             let node_listener = node
                                 .add_listener_local()
                                 .param(move |_seq, param_type, _idx, _next, param| {
-                                    if param_type == pw::spa::param::ParamType::Props {
+                                    if param_type == ParamType::Props {
                                         if let Some(pod) = param {
                                             if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
                                                 debug!("🔊 Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
@@ -733,8 +730,8 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             debug!("🔌 Monitoring audio device: {} ({})", name, id);
 
                             device.subscribe_params(&[
-                                pw::spa::param::ParamType::Props,
-                                pw::spa::param::ParamType::Route,
+                                ParamType::Props,
+                                ParamType::Route,
                             ]);
 
                             let name_clone = name.clone();
@@ -742,7 +739,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             let device_listener = device
                                 .add_listener_local()
                                 .param(move |_seq, param_type, _idx, _next, param| {
-                                    if param_type == pw::spa::param::ParamType::Props {
+                                    if param_type == ParamType::Props {
                                         if let Some(pod) = param {
                                             if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
                                                 debug!("🔊 Device {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 

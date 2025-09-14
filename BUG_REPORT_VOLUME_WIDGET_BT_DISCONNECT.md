@@ -71,6 +71,14 @@ This confirms the issue is **not specific to Bluetooth disconnection** but affec
 - **Missing Volume Query**: No subsequent volume property fetch for the new default sink
 - **UI Update Gap**: No `VolumeUpdate` sent through async channel after sink change
 
+## Proposed Solution
+Implement a HashMap-based audio node state cache (similar to Bluetooth device tracking):
+1. **Node param callbacks** → Update HashMap with latest volume data for ALL nodes
+2. **Metadata sink change** → Look up new default sink in HashMap → Send cached volume to UI immediately  
+3. **Node removal** → Clean up HashMap entry
+
+This provides immediate volume updates without waiting for param callbacks that may never come.
+
 ## Workaround
 Manually triggering a volume change on the built-in audio device (via volume controls) forces the widget to update correctly.
 

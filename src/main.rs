@@ -289,7 +289,7 @@ fn compute_bluetooth_display_string(bluetooth_devices: &HashMap<String, Bluetoot
         .collect();
     
     if device_strings.is_empty() {
-        "No BT".to_string()
+        "".to_string()  // Return empty string instead of "No BT" so widget gets hidden
     } else {
         device_strings.join(" ")
     }
@@ -510,6 +510,8 @@ fn setup_title_updates(label: gtk::Label) -> Result<()> {
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating title label: {}", update);
+            // NOTE: Title widget always remains visible even when empty, unlike battery/bluetooth widgets.
+            // This provides consistent visual layout and shows the centered position in the bar.
             label.set_text(&update);
         }
     });
@@ -535,7 +537,19 @@ fn setup_battery_updates(label: gtk::Label) -> Result<()> {
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating battery label: {}", update);
-            label.set_text(&update);
+            
+            // Hide widget if no battery data, show if there is data
+            // NOTE: Originally tried CSS approach with label.add_css_class("widget-hidden") 
+            // and .widget-hidden { display: none !important; } but GTK4 CSS specificity
+            // issues prevented it from working. GTK's native set_visible() works reliably.
+            if update.trim().is_empty() {
+                label.set_visible(false);
+                debug!("🙈 HIDING battery widget with set_visible(false)");
+            } else {
+                label.set_visible(true);
+                label.set_text(&update);
+                debug!("👁️  SHOWING battery widget - data: {}", update);
+            }
         }
     });
 
@@ -554,7 +568,17 @@ fn setup_bluetooth_updates(label: gtk::Label) -> Result<()> {
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!("Updating Bluetooth battery label: {}", update);
-            label.set_text(&update);
+            
+            // Hide widget if no Bluetooth devices, show if there are devices
+            // NOTE: Using GTK's native set_visible() since CSS approach didn't work reliably
+            if update.trim().is_empty() {
+                label.set_visible(false);
+                debug!("🙈 HIDING Bluetooth widget - no devices");
+            } else {
+                label.set_visible(true);
+                label.set_text(&update);
+                debug!("👁️  SHOWING Bluetooth widget - data: {}", update);
+            }
         }
     });
 
@@ -974,7 +998,7 @@ fn update_time_widget(label: gtk::Label) -> Result<()> {
 
 fn create_bt_widget() -> Result<gtk::Label> {
     debug!("Creating bluetooth widget");
-    let label = gtk::Label::new(Some("No BT"));
+    let label = gtk::Label::new(None);  // Start with no text, will be hidden until devices found
     label.add_css_class("bt-widget");
     label.set_halign(gtk::Align::End);
     Ok(label)

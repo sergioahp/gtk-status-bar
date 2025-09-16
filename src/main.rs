@@ -629,6 +629,10 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
         // Track the default sink name (not ID, since metadata uses names)
         let default_sink_name = Rc::new(RefCell::new(None::<String>));
         
+        // Create HashMap to track device_id -> (node_name, description, volume_percent, channel_percent, is_muted)
+        let device_map = Rc::new(RefCell::new(HashMap::<u32, (String, String, Option<u8>, Option<u8>, Option<bool>)>::new()));
+        debug!("📋 Created device tracking HashMap for (node_name, description, volume, channel, mute)");
+        
         // Initialize PipeWire on this thread
         pw::init();
         debug!("✅ PipeWire initialized");
@@ -696,6 +700,8 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
         // Set up metadata listener for default sink detection
         let registry_weak_metadata = Rc::downgrade(&registry);
         let default_sink_name_for_metadata = Rc::clone(&default_sink_name);
+        let device_map_for_metadata = Rc::clone(&device_map);
+        let sender_for_metadata = sender.clone();
         
         // Metadata listener for default sink tracking
         let _metadata_registry_listener = registry
@@ -721,6 +727,8 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                         debug!("📋 Bound 'default' Metadata (id={})", meta_id);
 
                         let default_sink_weak = Rc::downgrade(&default_sink_name_for_metadata);
+                        let device_map_weak_metadata = Rc::downgrade(&device_map_for_metadata);
+                        let sender_clone_metadata = sender_for_metadata.clone();
 
                         // Listen for property changes
                         let meta_listener = metadata
@@ -744,6 +752,61 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                                         *default_sink.borrow_mut() = Some(name.to_string());
                                                         info!("🔄 Default sink -> {}", name);
                                                         debug!("🎯 SINK CHANGE: {:?} -> {} (should trigger volume fetch)", previous_sink, name);
+                                                        
+                                                        // Find the device ID that matches this node name and update GUI
+                                                        if let Some(device_map) = device_map_weak_metadata.upgrade() {
+                                                            debug!("🗂️ Searching device map for default sink '{}'", name);
+                                                            
+                                                            // Log all devices we have tracked
+                                                            if let Ok(map) = device_map.try_borrow() {
+                                                                debug!("🗂️ Current device map contents: {:?}", *map);
+                                                                
+                                                                // Match by node.name (first element of tuple)
+                                                                let mut found_device = false;
+                                                                for (device_id, (node_name, device_description, cached_vol, cached_ch, cached_mute)) in map.iter() {
+                                                                    debug!("🔍 Checking device {}: node_name='{}', description='{}' against default sink '{}'", 
+                                                                           device_id, node_name, device_description, name);
+                                                                    
+                                                                    if node_name == name {
+                                                                        debug!("🎯 MATCH! Found device {} with node_name '{}' matching default sink", device_id, node_name);
+                                                                        debug!("🎨 Updating GUI label to: '{}' with cached volume data", device_description);
+                                                                        debug!("💾 Cached volume data: Vol: {:?}%, Ch: {:?}%, Mute: {:?}", cached_vol, cached_ch, cached_mute);
+                                                                        
+                                                                        // Use cached volume data if available, otherwise use reasonable defaults
+                                                                        let volume_percent = *cached_vol;
+                                                                        let channel_percent = *cached_ch;
+                                                                        let is_muted = *cached_mute;
+                                                                        
+                                                                        // Send GUI update with real cached volume data
+                                                                        let update = VolumeUpdate {
+                                                                            id: *device_id,
+                                                                            name: device_description.clone(),
+                                                                            volume_percent,
+                                                                            channel_percent,
+                                                                            is_muted,
+                                                                        };
+                                                                        if let Err(e) = sender_clone_metadata.send(update) {
+                                                                            error!("❌ Failed to send device name update to GUI: {}", e);
+                                                                        } else {
+                                                                            debug!("✅ Sent REAL volume data to GUI: '{}' Vol: {:?}%, Ch: {:?}%, Mute: {:?}", 
+                                                                                   device_description, volume_percent, channel_percent, is_muted);
+                                                                        }
+                                                                        found_device = true;
+                                                                        break; // Found the match, stop searching
+                                                                    }
+                                                                }
+                                                                
+                                                                if !found_device {
+                                                                    warn!("⚠️ Default sink '{}' not found in device map! Map has {} entries", name, map.len());
+                                                                    debug!("🗂️ Available node names: {:?}", 
+                                                                           map.values().map(|(node_name, _, _, _, _)| node_name).collect::<Vec<_>>());
+                                                                }
+                                                            } else {
+                                                                error!("❌ Failed to borrow device_map when default sink changed to '{}'", name);
+                                                            }
+                                                        } else {
+                                                            error!("❌ device_map_weak upgrade failed when default sink changed to '{}'", name);
+                                                        }
                                                     }
                                                 }
                                             } else {
@@ -798,6 +861,15 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
 
                             debug!("📱 Monitoring audio node: {} ({}) [node.name: {}]", name, id, node_name);
                             debug!("🔗 ADDING NODE LISTENER for node.name: {}", node_name);
+                            
+                            // Add device to tracking HashMap with node.name, description, and initial empty volume data
+                            if let Some(mut device_map) = device_map.clone().try_borrow_mut().ok() {
+                                device_map.insert(id, (node_name.clone(), name.clone(), None, None, None));
+                                debug!("📝 Added device to HashMap: {} -> ({}, {}, no volume yet)", id, node_name, name);
+                                debug!("🗂️ Current device map size: {}", device_map.len());
+                            } else {
+                                error!("❌ Failed to borrow device_map for insertion of device {} ({})", id, name);
+                            }
 
                             node.subscribe_params(&[
                                 ParamType::Props,
@@ -808,6 +880,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             let node_name_clone = node_name.clone();
                             let sender_clone = sender.clone();
                             let default_sink_weak = Rc::downgrade(&default_sink_name);
+                            let device_map_weak = Rc::downgrade(&device_map);
                             let node_listener = node
                                 .add_listener_local()
                                 .param(move |_seq, param_type, _idx, _next, param| {
@@ -815,20 +888,44 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                         debug!("🎛️  NODE PARAM CALLBACK: {} ({}) received Props param", name_clone, id);
                                         if let Some(pod) = param {
                                             if let Some((volume_percent, channel_percent, is_muted)) = parse_volume_from_pod(pod) {
-                                                // Check if this is the default sink
+                                                debug!("🔊 Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [CACHING]", 
+                                                       id, name_clone, volume_percent, channel_percent, is_muted);
+                                                
+                                                // Update device volume in HashMap for ALL devices
+                                                if let Some(device_map) = device_map_weak.upgrade() {
+                                                    if let Ok(mut map) = device_map.try_borrow_mut() {
+                                                        if let Some((node_name, description, old_vol, old_ch, old_mute)) = map.get_mut(&id) {
+                                                            *old_vol = volume_percent;
+                                                            *old_ch = channel_percent;
+                                                            *old_mute = is_muted;
+                                                            debug!("📝 Updated volume cache for device {}: {} -> Vol: {:?}%, Ch: {:?}%, Mute: {:?}", 
+                                                                   id, description, volume_percent, channel_percent, is_muted);
+                                                        } else {
+                                                            debug!("⚠️ Device {} not found in HashMap during volume update", id);
+                                                        }
+                                                    } else {
+                                                        error!("❌ Failed to borrow device_map for volume update of device {}", id);
+                                                    }
+                                                } else {
+                                                    error!("❌ device_map_weak upgrade failed during volume update for device {}", id);
+                                                }
+                                                
+                                                // Check if this is the default sink for GUI updates
                                                 let is_default = if let Some(default_sink) = default_sink_weak.upgrade() {
                                                     let current_default = default_sink.borrow();
-                                                    current_default.as_ref().map_or(false, |default| {
+                                                    let result = current_default.as_ref().map_or(false, |default| {
                                                         node_name_clone == *default
-                                                    })
+                                                    });
+                                                    debug!("🎯 Checking if device {} is default: current_default={:?}, node_name={}, is_default={}", 
+                                                           id, current_default, node_name_clone, result);
+                                                    result
                                                 } else {
+                                                    debug!("⚠️ Cannot check default status: default_sink_weak upgrade failed for device {}", id);
                                                     false
                                                 };
                                                 
                                                 if is_default {
-                                                    debug!("🔊 DEFAULT Node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [ASYNC DELIVERY]", 
-                                                           id, name_clone, volume_percent, channel_percent, is_muted);
-                                                    debug!("📤 SENDING VOLUME UPDATE to UI for default sink");
+                                                    debug!("📤 SENDING VOLUME UPDATE to GUI for default sink");
                                                     
                                                     let update = VolumeUpdate {
                                                         id,
@@ -842,9 +939,7 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                                                         error!("Failed to send volume update: {}", e);
                                                     }
                                                 } else {
-                                                    debug!("🔇 Non-default node {}: {} - Vol: {:?}% | Ch: {:?}% | Mute: {:?} [FILTERED OUT]", 
-                                                           id, name_clone, volume_percent, channel_percent, is_muted);
-                                                    debug!("⏭️  SKIPPING: Not the default sink ({})", node_name_clone);
+                                                    debug!("📊 Cached volume for non-default device {} ({})", id, name_clone);
                                                 }
                                             }
                                         }
@@ -855,9 +950,26 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
                             let proxy: Box<dyn ProxyT> = Box::new(node);
                             let proxy_id = proxy.upcast_ref().id();
                             let keep_weak = Rc::downgrade(&keep);
+                            let device_map_weak_remove = Rc::downgrade(&device_map);
                             let removed_listener = proxy.upcast_ref()
                                 .add_listener_local()
                                 .removed(move || {
+                                    debug!("🗑️ Node {} removed, cleaning up", proxy_id);
+                                    if let Some(device_map) = device_map_weak_remove.upgrade() {
+                                        if let Ok(mut map) = device_map.try_borrow_mut() {
+                                            if let Some((removed_node_name, removed_description, _, _, _)) = map.remove(&proxy_id) {
+                                                debug!("✅ Removed device from HashMap: {} -> ({}, {})", proxy_id, removed_node_name, removed_description);
+                                                debug!("🗂️ Device map size after removal: {}", map.len());
+                                            } else {
+                                                debug!("⚠️ Device {} was not in HashMap when removed", proxy_id);
+                                            }
+                                        } else {
+                                            error!("❌ Failed to borrow device_map for removal of device {}", proxy_id);
+                                        }
+                                    } else {
+                                        error!("❌ device_map_weak upgrade failed when removing device {}", proxy_id);
+                                    }
+                                    
                                     if let Some(k) = keep_weak.upgrade() {
                                         k.borrow_mut().remove(proxy_id);
                                     }

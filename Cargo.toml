@@ -21,6 +21,6 @@ zbus = "5.11.0"
 zbus_names = "4.2.0"
 zvariant = "5.7.0"
 futures = "0.3.31"
-pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", rev = "93138d01b23628521b29b5604bbebe991cba4c65" }
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", rev = "524bd67" }
 async-channel = "2.5.0"
 serde_json = "1.0.140"

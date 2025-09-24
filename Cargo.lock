@@ -399,9 +399,6 @@ name = "cookie-factory"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9885fa71e26b8ab7855e2ec7cae6e9b380edff76cd052e07c683a0319d51b3a2"
-dependencies = [
- "futures",
-]
 
 [[package]]
 name = "core-foundation-sys"
@@ -1121,7 +1118,7 @@ dependencies = [
 [[package]]
 name = "libspa"
 version = "0.8.0"
-source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=93138d01b23628521b29b5604bbebe991cba4c65#93138d01b23628521b29b5604bbebe991cba4c65"
+source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=524bd67#524bd67447ab17d576b5d31640c911cfe1dac48f"
 dependencies = [
  "bitflags",
  "cc",
@@ -1137,7 +1134,7 @@ dependencies = [
 [[package]]
 name = "libspa-sys"
 version = "0.8.0"
-source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=93138d01b23628521b29b5604bbebe991cba4c65#93138d01b23628521b29b5604bbebe991cba4c65"
+source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=524bd67#524bd67447ab17d576b5d31640c911cfe1dac48f"
 dependencies = [
  "bindgen",
  "cc",
@@ -1383,7 +1380,7 @@ dependencies = [
 [[package]]
 name = "pipewire"
 version = "0.8.0"
-source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=93138d01b23628521b29b5604bbebe991cba4c65#93138d01b23628521b29b5604bbebe991cba4c65"
+source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=524bd67#524bd67447ab17d576b5d31640c911cfe1dac48f"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -1399,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "pipewire-sys"
 version = "0.8.0"
-source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=93138d01b23628521b29b5604bbebe991cba4c65#93138d01b23628521b29b5604bbebe991cba4c65"
+source = "git+https://gitlab.freedesktop.org/pipewire/pipewire-rs?rev=524bd67#524bd67447ab17d576b5d31640c911cfe1dac48f"
 dependencies = [
  "bindgen",
  "libspa-sys",

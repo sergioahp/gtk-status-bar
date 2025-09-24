@@ -1,26 +1,26 @@
 [package]
 name = "gtklayershelltest"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [dependencies]
-gtk4-layer-shell = "0.5.0"
+gtk4-layer-shell = "0.6.3"
 # GIO (GLib I/O) for Application and signal traits
-gio = "0.20"
-# GTK4 aliased as `gtk` so we can use `use gtk::prelude::*;`
-gtk = { package = "gtk4", version = "0.9" }
-chrono = "0.4"
-tokio = { version = "1", features = ["full"] }
-hyprland = { git = "https://github.com/sergioahp/hyprland-rs", branch = "fix-active-window-ready-state" }
-futures-util = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
-thiserror = "1.0"
-zbus = "5.7.1"
+gio = "0.21.2"
+gtk4 = "0.10.1"
+chrono = "0.4.42"
+tokio = { version = "1.47.1", features = ["full"] }
+hyprland = { git = "https://github.com/hyprland-community/hyprland-rs" }
+futures-util = "0.3.31"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+anyhow = "1.0.99"
+thiserror = "1.0.69"
+zbus = "5.11.0"
 zbus_names = "4.2.0"
-zvariant = "5.5.3"
+zvariant = "5.7.0"
 futures = "0.3.31"
-pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs" }
-async-channel = "2.3"
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", rev = "93138d01b23628521b29b5604bbebe991cba4c65" }
+async-channel = "2.5.0"
+serde_json = "1.0.140"

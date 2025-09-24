@@ -15,7 +15,7 @@ pub enum AppError {
     LayerShell(String),
 
     #[error("Hyprland workspace query failed: {0}")]
-    WorkspaceQuery(#[from] hyprland::shared::HyprError),
+    WorkspaceQuery(String),
 
     #[error("Workspace channel setup failed: {0}")]
     WorkspaceChannel(String),

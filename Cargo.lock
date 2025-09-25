@@ -943,7 +943,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gtklayershelltest"
+name = "gtk-status-bar"
 version = "0.1.0"
 dependencies = [
  "anyhow",

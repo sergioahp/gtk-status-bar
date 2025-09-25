@@ -5,15 +5,48 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
+
+        craneLib = crane.mkLib pkgs;
+        src = craneLib.cleanCargoSource ./.;
+
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
+          # cargoLock = {
+          #   # allowBuiltinFetchGit = true;
+          #   # lockFile = ./Cargo.lock;
+          # };
+          buildInputs = [
+            pkgs.gtk4
+            pkgs.gtk4-layer-shell
+            pkgs.pipewire
+          ];
+          nativeBuildInputs = [
+            pkgs.clang # for bindgen, pipewire needs this
+            pkgs.pkg-config
+          ];
+          LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
+        };
+
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        gtk-status-bar = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+          }
+        );
+
 
         # Pull the latest stable toolchain and add components.
         toolchain = pkgs.rust-bin.stable.latest.default.override {
@@ -24,7 +57,11 @@
         rustLibSrc = "${toolchain}/lib/rustlib/src/rust/library";
       in {
         # `nix build` will produce the Rust toolchain derivation.
-        packages.default = toolchain;
+        packages = {
+          toolchain      = toolchain;
+          default        = gtk-status-bar;
+          gtk-status-bar = gtk-status-bar;
+        };
 
         # `nix develop` drops you into a shell with Rust + rust-src.
         devShells.default = pkgs.mkShell {

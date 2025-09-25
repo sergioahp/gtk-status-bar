@@ -87,5 +87,9 @@
           LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
           
         };
+
+        apps.default = flake-utils.lib.mkApp {
+          drv = gtk-status-bar;
+        };
       });
 }

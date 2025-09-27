@@ -1225,7 +1225,8 @@ fn load_css_styles(window: &gtk4::ApplicationWindow) -> Result<()> {
     debug!("Loading CSS styles");
 
     let css_provider = gtk4::CssProvider::new();
-    css_provider.load_from_path("style.css");
+    let css_data = include_str!("../style.css");
+    css_provider.load_from_data(css_data);
 
     gtk4::style_context_add_provider_for_display(
         &gtk4::prelude::WidgetExt::display(window),

@@ -17,7 +17,7 @@
         };
 
         craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.sourceFilesBySuffices ./. [".rs" ".toml" ".lock" ".css"];
 
         commonArgs = {
           inherit src;

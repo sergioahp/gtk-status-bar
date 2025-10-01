@@ -53,19 +53,25 @@ This is a personal status bar tailored to my specific workflow and aesthetic pre
 
 **📝 Note:** This project is highly specific to my use case and desktop setup. While you're encouraged to fork and modify it, I likely won't accept contributions as the design decisions are very personal and opinionated.
 
-## 🔨 Building
+## 🔨 Building & Running
 
 ### With Nix Flakes (Recommended)
 
 ```bash
+# Run directly
+nix run
+
+# Or build and run manually
 nix develop
 cargo build --release
+./target/release/gtk-status-bar
 ```
 
 ### Traditional Cargo
 
 ```bash
 cargo build --release
+./target/release/gtk-status-bar
 ```
 
 Requires GTK4, layer-shell protocol support, and a Wayland compositor (tested with Hyprland).

@@ -2,6 +2,10 @@
 
 A modern, transparent status bar for Wayland compositors built directly in Rust with GTK4 and layer-shell protocol. Designed for Hyprland with real-time workspace tracking, PipeWire audio monitoring, and async event handling.
 
+## 📸 Screenshot
+
+![GTK Status Bar](assets/bar.png)
+
 ## ✨ Features
 
 - **🎯 Direct GTK4 implementation** - No middleware like eww, built directly on GTK

@@ -291,22 +291,18 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
         }
     };
 
-    // TODO: Add nested function here to extract and validate object path
-    // fn extract_object_path(value: &Value) -> Result<&str, String> {
-    //     match value {
-    //         Value::ObjectPath(path) => Ok(path.as_str()),
-    //         other => Err(format!("Expected ObjectPath, got: {:?}", other))
-    //     }
-    // }
-    // This will allow other InterfacesAdded handling code to reuse path extraction
-
-    let interfaces_and_properties = match interfaces_dict_value {
-        Value::Dict(dict) => dict,
-        other => {
-            error!("Dbus monitor: Expected Dict as second field, got: {:?}", other);
-            return;
-        }
+    // Both the object path and the interface dict get used three times below
+    // (once per interface we recognize). Extract once up front via let-else;
+    // bailing on a malformed body keeps the rest of the function un-nested.
+    let Value::ObjectPath(object_path) = object_path_value else {
+        error!("Dbus monitor: Expected ObjectPath as first field, got: {:?}", object_path_value);
+        return;
     };
+    let Value::Dict(interfaces_and_properties) = interfaces_dict_value else {
+        error!("Dbus monitor: Expected Dict as second field, got: {:?}", interfaces_dict_value);
+        return;
+    };
+    let object_path_str = object_path.as_str();
 
     // Create longer-lived Str bindings
     let bluetooth_interface_key = zvariant::Str::from("org.bluez.Device1");
@@ -339,25 +335,21 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
                 },
             }
             // Update existing device or create new one in HashMap
-            if let Value::ObjectPath(object_path) = object_path_value {
-                if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                    // Update existing device with name
-                    // maybe allow yourself to update even if none?
-                    device.device_name = device_name.clone();
-                    info!("Updated existing device {} with name: {:?}", object_path, device_name);
-                } else {
-                    // Create new device entry
-                    bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                        device_path: object_path.to_string(),
-                        has_battery: false,
-                        has_media: false,
-                        battery_percentage: None,
-                        device_name: device_name.clone(),
-                    });
-                    info!("Created new device {} with name: {:?}", object_path, device_name);
-                }
+            if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                // Update existing device with name
+                // maybe allow yourself to update even if none?
+                device.device_name = device_name.clone();
+                info!("Updated existing device {} with name: {:?}", object_path, device_name);
             } else {
-                error!("Expected ObjectPath for device path, got: {:?}", object_path_value);
+                // Create new device entry
+                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                    device_path: object_path.to_string(),
+                    has_battery: false,
+                    has_media: false,
+                    battery_percentage: None,
+                    device_name: device_name.clone(),
+                });
+                info!("Created new device {} with name: {:?}", object_path, device_name);
             }
         },
         Ok(Some(other)) => {
@@ -370,30 +362,26 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
             error!("Failed to get Device1 interface: {}", e);
         }
     }
+
     // Check for Bluetooth MediaControl1 interface (indicates media device connection)
     let media_control_key = zvariant::Str::from("org.bluez.MediaControl1");
     // TODO: split Ok and Some for better logging
     // TODO: incorporate if let Stuff() instead of two branched match statements
     if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_control_key) {
         info!("Dbus monitor: Bluetooth media device connected");
-        // Update HashMap with media capability
-        if let Value::ObjectPath(object_path) = object_path_value {
-            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                device.has_media = true;
-                info!("Updated device {} with media capability", object_path);
-            } else {
-                debug!("Creating new device in hashmap for media: {}", object_path);
-                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                    device_path: object_path.to_string(),
-                    has_battery: false,
-                    has_media: true,
-                    battery_percentage: None,
-                    device_name: None,
-                });
-                info!("Created new device {} with media capability via InterfacesAdded", object_path);
-            }
+        if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+            device.has_media = true;
+            info!("Updated device {} with media capability", object_path);
         } else {
-            error!("Expected ObjectPath for media device path field, got: {:?}. Skipping update to bluetooth_devices", object_path_value);
+            debug!("Creating new device in hashmap for media: {}", object_path);
+            bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                device_path: object_path.to_string(),
+                has_battery: false,
+                has_media: true,
+                battery_percentage: None,
+                device_name: None,
+            });
+            info!("Created new device {} with media capability via InterfacesAdded", object_path);
         }
     };
 
@@ -406,31 +394,26 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
         },
         Ok(Some(battery_interface_value)) => {
             let percentage = process_bluetooth_battery_interface(&battery_interface_value);
-            // Update HashMap with new battery percentage
-            if let Value::ObjectPath(object_path) = object_path_value {
-                if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                    device.has_battery = true;
-                    device.battery_percentage = percentage;
-                    info!("Updated device {} battery: {:?}%", object_path, percentage);
-                } else {
-                    debug!("Creating new device in hashmap: {}", object_path);
-                    bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                        device_path: object_path.to_string(),
-                        has_battery: true,
-                        has_media: false,
-                        battery_percentage: percentage,
-                        device_name: None,
-                    });
-                    info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
-                }
-
-                // Send GUI update for all Bluetooth devices
-                let display_string = compute_bluetooth_display_string(bluetooth_devices);
-                if let Err(e) = bus::send_bluetooth_update(display_string) {
-                    error!("Failed to send Bluetooth battery update: {}", e);
-                }
+            if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                device.has_battery = true;
+                device.battery_percentage = percentage;
+                info!("Updated device {} battery: {:?}%", object_path, percentage);
             } else {
-                error!("Expected ObjectPath for object path field, got: {:?}. Skiping update to bluetooth_devices", object_path_value);
+                debug!("Creating new device in hashmap: {}", object_path);
+                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                    device_path: object_path.to_string(),
+                    has_battery: true,
+                    has_media: false,
+                    battery_percentage: percentage,
+                    device_name: None,
+                });
+                info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
+            }
+
+            // Send GUI update for all Bluetooth devices
+            let display_string = compute_bluetooth_display_string(bluetooth_devices);
+            if let Err(e) = bus::send_bluetooth_update(display_string) {
+                error!("Failed to send Bluetooth battery update: {}", e);
             }
         }
     };

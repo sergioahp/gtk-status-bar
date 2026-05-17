@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use tracing::{debug, error, info, warn};
 use zbus::Connection;
@@ -142,6 +142,38 @@ fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
             process_battery_state(state_value.clone());
         }
     }
+}
+
+// MatchRule builders. Each .sender/.interface/.member/.path returns
+// Result<MatchRuleBuilder, _>, so we use `?` with anyhow::Context to get a
+// flat layered trace and let the caller match() on the final Result. Replaces
+// the previous .map_err(...).ok().and_then(|builder| ...)-style chains that
+// silently swallowed each failure and made the match rule end up as `None`
+// with no aggregate trace.
+fn build_battery_match_rule() -> Result<MatchRule<'static>> {
+    Ok(MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.UPower")
+            .context("battery rule: set sender")?
+        .interface("org.freedesktop.DBus.Properties")
+            .context("battery rule: set interface")?
+        .member("PropertiesChanged")
+            .context("battery rule: set member")?
+        .path("/org/freedesktop/UPower/devices/battery_BAT0")
+            .context("battery rule: set path")?
+        .build())
+}
+
+fn build_bluez_object_manager_match_rule(member: &'static str) -> Result<MatchRule<'static>> {
+    Ok(MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.bluez")
+            .with_context(|| format!("bluez rule ({}): set sender", member))?
+        .interface("org.freedesktop.DBus.ObjectManager")
+            .with_context(|| format!("bluez rule ({}): set interface", member))?
+        .member(member)
+            .with_context(|| format!("bluez rule ({}): set member", member))?
+        .build())
 }
 
 // Supervised wrapper around monitor_dbus. The inner loop holds one D-Bus
@@ -376,89 +408,27 @@ pub async fn monitor_dbus() -> Result<()> {
     // We should think if select! + multiple streams is better. The current approach is
     // One stream, multiple match rules, branch out depending on the type of event
 
-    // None to signal a fail: (which ok, there is more monitoring to do)
-    let battery_rule: Option<MatchRule> = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .sender("org.freedesktop.UPower")
-        .map_err(|e| error!("Failed to set sender in match rule: {}", e))
-        .ok()
-        .and_then(|builder|
-            builder.interface("org.freedesktop.DBus.Properties")
-            .map_err(|e| error!("Failed to set interface in match rule: {}", e))
-            .ok())
-        .and_then(|builder|
-            builder.member("PropertiesChanged")
-            .map_err(|e|
-            error!("Failed to set member in match rule: {}", e))
-            .ok())
-        .and_then(|builder|
-            builder.path("/org/freedesktop/UPower/devices/battery_BAT0")
-            .map_err(|e| error!("Failed to set path in match rule: {}", e)
-            ).ok())
-        .and_then(|builder| Some(builder.build()));
-
-
-    if let Some(x) = battery_rule {
-        dbus_proxy.add_match_rule(x)
-            .await
-            .map_err(|e| {
-                error!("Failed to add D-Bus match rule for battery property changes: {}", e);
-            })
-            .ok();
-    }
-
-    let bt_interface_added_rule: Option<MatchRule> = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .sender("org.bluez")
-        .map_err(|e|
-            error!("Failed to set sender in Bluetooth match rule: {}", e))
-        .ok()
-        .and_then(|builder|
-            builder.interface("org.freedesktop.DBus.ObjectManager")
-            .map_err(|e|
-            error!("Failed to set interface in Bluetooth match rule: {}", e))
-            .ok())
-        .and_then(|builder|
-            builder.member("InterfacesAdded")
-            .map_err(|e|
-            error!("Failed to set member in Bluetooth match rule: {}", e))
-            .ok())
-        .and_then(|builder| Some(builder.build()));
-
-    if let Some(x) = bt_interface_added_rule {
-        dbus_proxy.add_match_rule(x)
-            .await
-            .map_err(|e| {
-                error!("Failed to add Bluetooth InterfacesAdded match rule: {}", e);
-            })
-            .ok();
-    }
-
-    // Match rule for Bluetooth device disconnections
-    let bt_interface_removed_rule: Option<MatchRule> = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .sender("org.bluez")
-        .map_err(|e| error!("Failed to set sender in Bluetooth InterfacesRemoved match rule: {}", e))
-        .ok()
-        .and_then(|builder|
-            builder.interface("org.freedesktop.DBus.ObjectManager")
-            .map_err(|e|
-            error!("Failed to set interface in Bluetooth InterfacesRemoved match rule: {}", e))
-            .ok())
-        .and_then(|builder|
-            builder.member("InterfacesRemoved")
-            .map_err(|e|
-            error!("Failed to set member in Bluetooth InterfacesRemoved match rule: {}", e))
-            .ok())
-        .and_then(|builder| Some(builder.build()));
-
-    if let Some(x) = bt_interface_removed_rule {
-        dbus_proxy.add_match_rule(x)
-            .await
-            .map_err(|e| {
-                error!("Failed to add Bluetooth InterfacesRemoved match rule: {}", e);
-            })
-            .ok();
+    // Three match rules; if any fails to build or to register we log + carry on,
+    // since the other rules still produce useful signals. monitor_dbus is then
+    // wrapped in run_dbus_monitor_supervised which will reconnect-and-retry
+    // the whole thing if the stream later dies.
+    for (label, rule_result) in [
+        ("battery", build_battery_match_rule()),
+        ("bluez InterfacesAdded", build_bluez_object_manager_match_rule("InterfacesAdded")),
+        ("bluez InterfacesRemoved", build_bluez_object_manager_match_rule("InterfacesRemoved")),
+    ] {
+        match rule_result {
+            Err(e) => {
+                error!("❌ Failed to build {} match rule: {:#}", label, e);
+            }
+            Ok(rule) => {
+                if let Err(e) = dbus_proxy.add_match_rule(rule).await {
+                    error!("❌ Failed to register {} match rule: {}", label, e);
+                } else {
+                    debug!("🔌 Registered {} match rule", label);
+                }
+            }
+        }
     }
 
     let mut stream: zbus::MessageStream = connection.into();

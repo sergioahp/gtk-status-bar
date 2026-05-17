@@ -236,7 +236,11 @@ async fn get_initial_title_state() -> Result<String> {
     Ok(display_name)
 }
 
-async fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
+// These send_*_update helpers are intentionally synchronous. OnceLock::get and
+// UnboundedSender::send are both non-blocking; the previous `async fn` signature
+// was speculative — it forced every caller into an async context for no benefit
+// and mis-signalled that there was a yield point inside.
+fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
     let sender = WORKSPACE_SENDER.get()
         .context("Global workspace sender not initialized")?;
 
@@ -246,7 +250,7 @@ async fn send_workspace_update(update: WorkspaceUpdate) -> Result<()> {
     Ok(())
 }
 
-async fn send_title_update(update: Option<String>) -> Result<()> {
+fn send_title_update(update: Option<String>) -> Result<()> {
     let sender = TITLE_SENDER.get()
         .context("Global title sender not initialized")?;
 
@@ -258,7 +262,7 @@ async fn send_title_update(update: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn send_battery_update(update: String) -> Result<()> {
+fn send_battery_update(update: String) -> Result<()> {
     let sender = BATTERY_SENDER.get()
         .context("Global battery sender not initialized")?;
 
@@ -303,7 +307,7 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
         name: display_name,
         id: workspace_data.id,
     };
-    send_workspace_update(update).await
+    send_workspace_update(update)
 }
 
 fn update_title_widget_workspace_color(title_widget: &gtk4::Label, workspace_id: hyprland::shared::WorkspaceId) {
@@ -353,7 +357,7 @@ async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEv
     if let Some(client) = active_client {
         let formatted_title = format_title_string(client.title, 64);
         debug!("Title changed to: {}", formatted_title);
-        send_title_update(Some(formatted_title)).await
+        send_title_update(Some(formatted_title))
     } else {
         debug!("No active client matches the title change event");
         Ok(())
@@ -376,7 +380,7 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
 
     debug!("Active window changed, title: '{}'", formatted_title);
     debug!("Sending title update: '{}'", formatted_title);
-    send_title_update(Some(formatted_title)).await
+    send_title_update(Some(formatted_title))
 }
 
 
@@ -389,7 +393,7 @@ async fn setup_title_event_listener() -> Result<()> {
             "".to_string()
         });
 
-    if let Err(e) = send_title_update(Some(initial_state)).await {
+    if let Err(e) = send_title_update(Some(initial_state)) {
         error!("Failed to send initial title update: {}", e);
     }
 
@@ -429,7 +433,7 @@ async fn setup_workspace_event_listener() -> Result<()> {
                 name: initial_state,
                 id: workspace.id,
             };
-            if let Err(e) = send_workspace_update(update).await {
+            if let Err(e) = send_workspace_update(update) {
                 error!("Failed to send initial workspace update: {}", e);
             }
         }
@@ -439,7 +443,7 @@ async fn setup_workspace_event_listener() -> Result<()> {
                 name: "Workspace ?".to_string(),
                 id: 1, // WorkspaceId is just an i32
             };
-            if let Err(e) = send_workspace_update(fallback_update).await {
+            if let Err(e) = send_workspace_update(fallback_update) {
                 error!("Failed to send fallback workspace update: {}", e);
             }
         }
@@ -1270,22 +1274,22 @@ fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
         })
 }
 
-async fn process_battery_percentage(value: Value<'_>) {
+fn process_battery_percentage(value: Value<'_>) {
     if let Some(percentage) = f64::try_from(value)
         .inspect_err(|e| {
             error!("Failed to convert battery percentage to f64: {}", e);
         })
-        .ok() 
+        .ok()
     {
         info!("Battery percentage changed to {:.1}%", percentage);
         let battery_text = format!("🔋 {:.0}%", percentage);
-        if let Err(e) = send_battery_update(battery_text).await {
+        if let Err(e) = send_battery_update(battery_text) {
             error!("Failed to send battery update: {}", e);
         }
     }
 }
 
-async fn process_battery_state(value: Value<'_>) {
+fn process_battery_state(value: Value<'_>) {
     if let Some(state) = u32::try_from(value)
         .inspect_err(|e| {
             error!("Failed to convert battery state to u32: {}", e);
@@ -1432,7 +1436,7 @@ async fn monitor_dbus() -> Result<()> {
                     String::new()
                 });
 
-            send_battery_update(battery_text).await
+            send_battery_update(battery_text)
                 .inspect_err(|e| error!("Failed to send battery update: {}", e))
                 .ok();
 
@@ -1442,7 +1446,7 @@ async fn monitor_dbus() -> Result<()> {
                 )
                 .ok()
             {
-                process_battery_state(state_value.into()).await;
+                process_battery_state(state_value.into());
             }
         }
     };
@@ -1941,7 +1945,7 @@ async fn monitor_dbus() -> Result<()> {
                         // Use dedicated function for percentage changes
                         let percentage_key = Value::Str("Percentage".into());
                         if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key) {
-                            process_battery_percentage(percentage_value).await;
+                            process_battery_percentage(percentage_value);
                         }
 
                     }

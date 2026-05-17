@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
 use hyprland::event_listener::AsyncEventListener;
-use hyprland::prelude::async_closure;
 use tracing::{debug, error, info, warn};
 
 use crate::bus::{
@@ -213,20 +212,24 @@ pub async fn setup_title_event_listener() -> Result<()> {
 
     let mut event_listener = AsyncEventListener::new();
 
-    event_listener.add_window_title_changed_handler(async_closure! {
-        |title_data| {
+    // hyprland-rs's add_*_handler takes Fn(T) -> Pin<Box<dyn Future + Send>>;
+    // its older `async_closure!` macro produced exactly that shape (and is now
+    // deprecated). Native async-closure syntax returns `impl Future`, which
+    // doesn't satisfy the trait bound, so we spell the Box::pin out instead.
+    event_listener.add_window_title_changed_handler(|title_data| {
+        Box::pin(async move {
             if let Err(e) = handle_title_change(title_data).await {
                 error!("Failed to handle title change: {}", e);
             }
-        }
+        })
     });
 
-    event_listener.add_active_window_changed_handler(async_closure! {
-        |window_data| {
+    event_listener.add_active_window_changed_handler(|window_data| {
+        Box::pin(async move {
             if let Err(e) = handle_active_window_change(window_data).await {
                 error!("Failed to handle active window change: {}", e);
             }
-        }
+        })
     });
 
     info!("Starting title event listener");
@@ -265,12 +268,12 @@ pub async fn setup_workspace_event_listener() -> Result<()> {
 
     let mut event_listener = AsyncEventListener::new();
 
-    event_listener.add_workspace_changed_handler(async_closure! {
-        |workspace_data| {
+    event_listener.add_workspace_changed_handler(|workspace_data| {
+        Box::pin(async move {
             if let Err(e) = handle_workspace_change(workspace_data).await {
                 error!("Failed to handle workspace change: {}", e);
             }
-        }
+        })
     });
 
     info!("Starting workspace event listener");

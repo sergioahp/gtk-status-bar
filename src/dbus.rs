@@ -9,6 +9,7 @@
 // pushed through BATTERY_SENDER directly.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -140,6 +141,39 @@ fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
         Ok(Some(state_value)) => {
             process_battery_state(state_value.clone());
         }
+    }
+}
+
+// Supervised wrapper around monitor_dbus. The inner loop holds one D-Bus
+// connection and dispatches signals forever; it only returns when the
+// MessageStream ends (system bus crash, connection drop) or when the initial
+// connect/proxy setup fails. Same backoff policy as the Hyprland supervisors —
+// the failure modes are equivalent (IPC peer gone, transient setup error).
+pub async fn run_dbus_monitor_supervised() {
+    let max_delay = Duration::from_secs(60);
+    let reset_threshold = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        let started = Instant::now();
+        info!("🔌 Starting D-Bus monitor");
+        match monitor_dbus().await {
+            Ok(()) => {
+                warn!("⚠️ D-Bus monitor returned cleanly (stream closed)");
+            }
+            Err(e) => {
+                error!("❌ D-Bus monitor crashed: {:#}", e);
+            }
+        }
+
+        if started.elapsed() >= reset_threshold {
+            debug!("🔄 D-Bus monitor ran for {:?}, resetting backoff", started.elapsed());
+            delay = Duration::from_secs(1);
+        }
+
+        warn!("🔄 Reconnecting D-Bus monitor in {:?}", delay);
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, max_delay);
     }
 }
 

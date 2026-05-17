@@ -11,7 +11,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::bus::{BATTERY_SENDER, BLUETOOTH_SENDER, TITLE_SENDER, VolumeUpdate, WORKSPACE_SENDER};
 use crate::{dbus, hypr, pw};
@@ -267,11 +267,7 @@ pub fn setup_workspace_updates(label: gtk4::Label, title_widget: gtk4::Label) ->
         return Err(anyhow::anyhow!("Failed to set global workspace sender"));
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = hypr::setup_workspace_event_listener().await {
-            error!("Workspace event listener failed: {}", e);
-        }
-    });
+    tokio::spawn(hypr::run_workspace_listener_supervised());
 
     // Handle combined workspace updates (name + ID) in single frame
     glib::spawn_future_local(async move {
@@ -295,11 +291,7 @@ pub fn setup_title_updates(label: gtk4::Label) -> Result<()> {
         return Err(anyhow::anyhow!("Failed to set global title sender"));
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = hypr::setup_title_event_listener().await {
-            error!("Title event listener failed: {}", e);
-        }
-    });
+    tokio::spawn(hypr::run_title_listener_supervised());
 
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
@@ -322,11 +314,7 @@ pub fn setup_battery_updates(label: gtk4::Label) -> Result<()> {
         return Err(anyhow::anyhow!("Failed to set global battery sender"));
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = dbus::monitor_dbus().await {
-            error!("Battery monitoring failed: {}", e);
-        }
-    });
+    tokio::spawn(dbus::run_dbus_monitor_supervised());
 
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {

@@ -6,11 +6,13 @@
 // event variant, etc.), the spawned task currently logs and exits — see
 // run_*_listener for the supervised wrappers that retry with backoff.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
 use hyprland::event_listener::AsyncEventListener;
 use hyprland::prelude::async_closure;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::bus::{
     self, WorkspaceUpdate,
@@ -125,6 +127,75 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
     debug!("Active window changed, title: '{}'", formatted_title);
     debug!("Sending title update: '{}'", formatted_title);
     bus::send_title_update(Some(formatted_title))
+}
+
+// Supervised wrapper around setup_title_event_listener. The inner listener
+// returns when Hyprland disconnects the IPC stream (EOF on .socket2.sock, parse
+// failure on an unknown event variant, or any other I/O error in
+// AsyncEventListener::start_listener_async). We log the cause, sleep with
+// exponential backoff (1s -> 2s -> 4s -> ... capped at 60s), and reconnect.
+// Backoff resets if the previous attempt ran for more than 30s, so a stable
+// listener that briefly hiccups recovers fast, while a persistent failure
+// (e.g. wrong env, Hyprland gone) doesn't busy-loop.
+//
+// This function never returns and is meant to be `tokio::spawn`ed from the
+// widget setup.
+pub async fn run_title_listener_supervised() {
+    let max_delay = Duration::from_secs(60);
+    let reset_threshold = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        let started = Instant::now();
+        info!("🔌 Starting title event listener");
+        match setup_title_event_listener().await {
+            Ok(()) => {
+                warn!("⚠️ Title event listener returned cleanly (unexpected)");
+            }
+            Err(e) => {
+                error!("❌ Title event listener crashed: {:#}", e);
+            }
+        }
+
+        if started.elapsed() >= reset_threshold {
+            debug!("🔄 Title listener ran for {:?}, resetting backoff", started.elapsed());
+            delay = Duration::from_secs(1);
+        }
+
+        warn!("🔄 Reconnecting title listener in {:?}", delay);
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, max_delay);
+    }
+}
+
+// Same supervisor for the workspace listener; both consume Hyprland IPC and
+// fail in the same shapes, so the policy is identical.
+pub async fn run_workspace_listener_supervised() {
+    let max_delay = Duration::from_secs(60);
+    let reset_threshold = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        let started = Instant::now();
+        info!("🔌 Starting workspace event listener");
+        match setup_workspace_event_listener().await {
+            Ok(()) => {
+                warn!("⚠️ Workspace event listener returned cleanly (unexpected)");
+            }
+            Err(e) => {
+                error!("❌ Workspace event listener crashed: {:#}", e);
+            }
+        }
+
+        if started.elapsed() >= reset_threshold {
+            debug!("🔄 Workspace listener ran for {:?}, resetting backoff", started.elapsed());
+            delay = Duration::from_secs(1);
+        }
+
+        warn!("🔄 Reconnecting workspace listener in {:?}", delay);
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, max_delay);
+    }
 }
 
 pub async fn setup_title_event_listener() -> Result<()> {

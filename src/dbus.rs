@@ -25,10 +25,11 @@ use zbus_names::InterfaceName;
 use crate::bus;
 
 // UNSAFE assumtion for now: assume Battery1 and MediaTransport1 are on the same object when they
-// exist, but a device could have just one of them or non
+// exist, but a device could have just one of them or non.
+// The D-Bus object path is the HashMap key in monitor_dbus' bluetooth_devices map;
+// it intentionally isn't stored on the value to avoid the redundancy.
 #[derive(Debug, Clone)]
 pub struct BluetoothDevice {
-    pub device_path: String,
     pub has_battery: bool,
     pub has_media: bool,
     pub battery_percentage: Option<u8>,
@@ -67,7 +68,6 @@ mod tests {
         (
             path.to_string(),
             BluetoothDevice {
-                device_path: path.to_string(),
                 has_battery: percentage.is_some(),
                 has_media: false,
                 battery_percentage: percentage,
@@ -343,7 +343,6 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
             } else {
                 // Create new device entry
                 bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                    device_path: object_path.to_string(),
                     has_battery: false,
                     has_media: false,
                     battery_percentage: None,
@@ -375,7 +374,6 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
         } else {
             debug!("Creating new device in hashmap for media: {}", object_path);
             bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                device_path: object_path.to_string(),
                 has_battery: false,
                 has_media: true,
                 battery_percentage: None,
@@ -401,7 +399,6 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
             } else {
                 debug!("Creating new device in hashmap: {}", object_path);
                 bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                    device_path: object_path.to_string(),
                     has_battery: true,
                     has_media: false,
                     battery_percentage: percentage,
@@ -490,7 +487,6 @@ fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices:
                 error!("Device Battery1 property change that wasn't previously on the hashmap");
                 info!("Creating new device in hashmap for battery via PropertiesChanged: {}", path);
                 bluetooth_devices.insert(path.to_string(), BluetoothDevice {
-                    device_path: path.to_string(),
                     has_battery: true,
                     has_media: false,
                     battery_percentage: percentage,
@@ -515,7 +511,6 @@ fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices:
                 error!("Device MediaControl1 property change that wasn't previously on the hashmap");
                 info!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
                 bluetooth_devices.insert(path.to_string(), BluetoothDevice {
-                    device_path: path.to_string(),
                     has_battery: false,
                     has_media: true,
                     battery_percentage: None,
@@ -765,7 +760,6 @@ async fn initial_bluetooth_scan(
                 // Device1 interfaces with no name
                 if has_battery || has_media || device_name.is_some() {
                     bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                        device_path: object_path.to_string(),
                         has_battery,
                         has_media,
                         battery_percentage,

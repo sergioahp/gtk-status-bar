@@ -282,8 +282,8 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                                                                         let is_muted = *cached_mute;
 
                                                                         // Send GUI update with real cached volume data
+                                                                        let _ = device_id; // node id kept around for debug logs above
                                                                         let update = VolumeUpdate {
-                                                                            id: *device_id,
                                                                             name: device_description.clone(),
                                                                             volume_percent,
                                                                             channel_percent,
@@ -429,10 +429,9 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                                                 };
 
                                                 if is_default {
-                                                    debug!("📤 SENDING VOLUME UPDATE to GUI for default sink");
+                                                    debug!("📤 SENDING VOLUME UPDATE to GUI for default sink (node id={})", id);
 
                                                     let update = VolumeUpdate {
-                                                        id,
                                                         name: name_clone.clone(),
                                                         volume_percent,
                                                         channel_percent,
@@ -509,7 +508,6 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                                                        id, name_clone, volume_percent, channel_percent, is_muted);
 
                                                 let update = VolumeUpdate {
-                                                    id,
                                                     name: name_clone.clone(),
                                                     volume_percent,
                                                     channel_percent,

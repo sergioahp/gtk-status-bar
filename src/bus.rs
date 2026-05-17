@@ -22,7 +22,6 @@ pub struct WorkspaceUpdate {
 
 #[derive(Debug, Clone)]
 pub struct VolumeUpdate {
-    pub id: u32,
     pub name: String,
     pub volume_percent: Option<u8>,  // Main volume 0-100%
     pub channel_percent: Option<u8>, // First channel volume 0-100% (most accurate for user changes)

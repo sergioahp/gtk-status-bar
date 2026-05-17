@@ -254,6 +254,389 @@ fn build_bluez_object_manager_match_rule(member: &'static str) -> Result<MatchRu
         .build())
 }
 
+// Drop a bluetooth device from the map if it has lost every interface that
+// would justify displaying it. We track devices via three booleans (battery,
+// media, has-name) and any signal that flips one to false has to check whether
+// the device is now empty.
+fn remove_if_idle(devices: &mut HashMap<String, BluetoothDevice>, path: &str) {
+    let Some(d) = devices.get(path) else { return };
+    if !d.has_media && !d.has_battery && d.device_name.is_none() {
+        devices.remove(path);
+        info!("Removed device {} from HashMap (no battery, media, or name)", path);
+    }
+}
+
+// ObjectManager.InterfacesAdded signal handler. Each signal carries one object
+// path plus a dict of {interface_name => {property => value}}. We learn about
+// Device1 (name), Battery1 (percentage), and MediaControl1 (presence) from
+// here, and seed the local HashMap so subsequent PropertiesChanged signals
+// have something to update. Early-returns replace `continue` in the parent
+// loop; logging stays at the same call sites it was before extraction.
+fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+    info!("Dbus monitor: Received InterfacesAdded signal from ObjectManager");
+    let body = msg.body();
+    let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+        error!("Dbus monitor: Failed to deserialize InterfacesAdded message body as Structure");
+        return;
+    };
+
+    let fields = body_deserialized.fields();
+
+    // Destructure into two separate Values first
+    let (object_path_value, interfaces_dict_value) = match fields {
+        [a, b] => (a, b),
+        other => {
+            error!("Dbus monitor: Expected exactly 2 fields, got: {}", other.len());
+            return;
+        }
+    };
+
+    // TODO: Add nested function here to extract and validate object path
+    // fn extract_object_path(value: &Value) -> Result<&str, String> {
+    //     match value {
+    //         Value::ObjectPath(path) => Ok(path.as_str()),
+    //         other => Err(format!("Expected ObjectPath, got: {:?}", other))
+    //     }
+    // }
+    // This will allow other InterfacesAdded handling code to reuse path extraction
+
+    let interfaces_and_properties = match interfaces_dict_value {
+        Value::Dict(dict) => dict,
+        other => {
+            error!("Dbus monitor: Expected Dict as second field, got: {:?}", other);
+            return;
+        }
+    };
+
+    // Create longer-lived Str bindings
+    let bluetooth_interface_key = zvariant::Str::from("org.bluez.Device1");
+    let upower_interface_key = zvariant::Str::from("org.freedesktop.UPower.Device");
+
+    // Debug: print all available interfaces in the dict
+    debug!("Available interfaces in InterfacesAdded: {:?}",
+           interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
+
+    let mut device_name: Option<String> = None;
+    match interfaces_and_properties.get::<_, Value>(&bluetooth_interface_key) {
+        Ok(Some(Value::Dict(device1))) => {
+            debug!("Found Device1 interface properties: {:?}", device1);
+            // TODO: use alias, if alias fails use name and log that that is
+            // not supposed to happend by the bluez device api
+            // also alias is not supposed to be empty
+            match device1.get(&zvariant::Str::from("Name")) {
+                Ok(Some(Value::Str(name))) => {
+                    debug!("Found Bluetooth device name: {}", name);
+                    device_name = Some(name.to_string());
+                },
+                Ok(Some(other)) => {
+                    error!("Device Name property has unexpected type: {:?}", other);
+                },
+                Ok(None) => {
+                    error!("Device1 interface found but no Name property");
+                },
+                Err(e) => {
+                    error!("Failed to get Name property from Device1 interface: {}", e);
+                },
+            }
+            // Update existing device or create new one in HashMap
+            if let Value::ObjectPath(object_path) = object_path_value {
+                if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                    // Update existing device with name
+                    // maybe allow yourself to update even if none?
+                    device.device_name = device_name.clone();
+                    info!("Updated existing device {} with name: {:?}", object_path, device_name);
+                } else {
+                    // Create new device entry
+                    bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                        device_path: object_path.to_string(),
+                        has_battery: false,
+                        has_media: false,
+                        battery_percentage: None,
+                        device_name: device_name.clone(),
+                    });
+                    info!("Created new device {} with name: {:?}", object_path, device_name);
+                }
+            } else {
+                error!("Expected ObjectPath for device path, got: {:?}", object_path_value);
+            }
+        },
+        Ok(Some(other)) => {
+            error!("Device1 interface found but has unexpected type: {:?}", other);
+        },
+        Ok(None) => {
+            debug!("Device1 interface not found in interfaces");
+        },
+        Err(e) => {
+            error!("Failed to get Device1 interface: {}", e);
+        }
+    }
+    // Check for Bluetooth MediaControl1 interface (indicates media device connection)
+    let media_control_key = zvariant::Str::from("org.bluez.MediaControl1");
+    // TODO: split Ok and Some for better logging
+    // TODO: incorporate if let Stuff() instead of two branched match statements
+    if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_control_key) {
+        info!("Dbus monitor: Bluetooth media device connected");
+        // Update HashMap with media capability
+        if let Value::ObjectPath(object_path) = object_path_value {
+            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                device.has_media = true;
+                info!("Updated device {} with media capability", object_path);
+            } else {
+                debug!("Creating new device in hashmap for media: {}", object_path);
+                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                    device_path: object_path.to_string(),
+                    has_battery: false,
+                    has_media: true,
+                    battery_percentage: None,
+                    device_name: None,
+                });
+                info!("Created new device {} with media capability via InterfacesAdded", object_path);
+            }
+        } else {
+            error!("Expected ObjectPath for media device path field, got: {:?}. Skipping update to bluetooth_devices", object_path_value);
+        }
+    };
+
+    match interfaces_and_properties.get::<_, Value>(&zvariant::Str::from("org.bluez.Battery1")) {
+        Err(e) => {
+            error!("Failed to get bluetooth battery interface: {}", e);
+        },
+        Ok(None) => {
+            debug!("Not a device with org.bluez.Battery1 interface");
+        },
+        Ok(Some(battery_interface_value)) => {
+            let percentage = process_bluetooth_battery_interface(&battery_interface_value);
+            // Update HashMap with new battery percentage
+            if let Value::ObjectPath(object_path) = object_path_value {
+                if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
+                    device.has_battery = true;
+                    device.battery_percentage = percentage;
+                    info!("Updated device {} battery: {:?}%", object_path, percentage);
+                } else {
+                    debug!("Creating new device in hashmap: {}", object_path);
+                    bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                        device_path: object_path.to_string(),
+                        has_battery: true,
+                        has_media: false,
+                        battery_percentage: percentage,
+                        device_name: None,
+                    });
+                    info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
+                }
+
+                // Send GUI update for all Bluetooth devices
+                let display_string = compute_bluetooth_display_string(bluetooth_devices);
+                if let Err(e) = bus::send_bluetooth_update(display_string) {
+                    error!("Failed to send Bluetooth battery update: {}", e);
+                }
+            } else {
+                error!("Expected ObjectPath for object path field, got: {:?}. Skiping update to bluetooth_devices", object_path_value);
+            }
+        }
+    };
+
+    // Check for UPower Device interface
+    if let Some(Value::Dict(_battery_props)) = interfaces_and_properties
+        .get::<_, Value>(&upower_interface_key)
+        .ok()
+        .flatten() {
+        info!("Dbus monitor: Battery device added");
+        // Possibly refresh battery information or re-subscribe if needed
+    }
+}
+
+// Properties.PropertiesChanged: fired when the value of an existing property
+// flips. We branch on which interface owns the property — UPower.Device for
+// the laptop battery, Battery1/MediaControl1 for bluetooth devices.
+fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+    info!("Dbus monitor: Received PropertiesChanged signal");
+    let body = msg.body();
+    let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+        error!("Dbus monitor: Failed to deserialize PropertiesChanged message body as Structure");
+        return;
+    };
+    let fields = body_deserialized.fields();
+    let (interface_name_val, changed_properties_val, _invalidated_properties) = match fields {
+        [a, b, c] => (a, b, c),
+        other => {
+            error!("Dbus monitor: Expected exactly 3 fields, got: {}", other.len());
+            return;
+        }
+    };
+    // Convert name, match if it is battery
+    let interface_names = match interface_name_val {
+        Value::Str(val) => val,
+        other => {
+            error!("Dbus monitor: Expected interface name to be a string, got: {:?}", other);
+            return;
+        }
+    };
+
+    match interface_names.as_str() {
+        "org.freedesktop.UPower.Device" => {
+            let changed_properties = match changed_properties_val {
+                Value::Dict(dict) => dict,
+                other => {
+                    error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", other);
+                    return;
+                }
+            };
+
+            // Use the new battery properties processing function
+            process_battery_device_properties(changed_properties);
+
+            // Use dedicated function for percentage changes
+            let percentage_key = Value::Str("Percentage".into());
+            if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key) {
+                process_battery_percentage(percentage_value);
+            }
+        }
+        "org.bluez.Battery1" => {
+            let Value::Dict(_) = changed_properties_val else {
+                error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", changed_properties_val);
+                return;
+            };
+
+            // Use the existing function by passing changed properties as Value::Dict
+            let percentage = process_bluetooth_battery_interface(changed_properties_val);
+            // Update HashMap with new battery percentage
+            if let Some(device) = bluetooth_devices.get_mut(path) {
+                device.battery_percentage = percentage;
+                info!("Updated device {} battery via PropertiesChanged: {:?}%", path, percentage);
+            } else {
+                error!("Device Battery1 property change that wasn't previously on the hashmap");
+                info!("Creating new device in hashmap for battery via PropertiesChanged: {}", path);
+                bluetooth_devices.insert(path.to_string(), BluetoothDevice {
+                    device_path: path.to_string(),
+                    has_battery: true,
+                    has_media: false,
+                    battery_percentage: percentage,
+                    device_name: None, // TODO: Extract device name if available
+                });
+                info!("Created new device {} with battery capability via PropertiesChanged", path);
+            }
+
+            // Send GUI update for all Bluetooth devices
+            let display_string = compute_bluetooth_display_string(bluetooth_devices);
+            if let Err(e) = bus::send_bluetooth_update(display_string) {
+                error!("Failed to send Bluetooth battery update: {}", e);
+            }
+        }
+        "org.bluez.MediaControl1" => {
+            info!("Dbus monitor: MediaControl1 properties changed for {}", path);
+            // Update HashMap with media capability if device exists
+            if let Some(device) = bluetooth_devices.get_mut(path) {
+                device.has_media = true;
+                info!("Updated device {} with media capability via PropertiesChanged", path);
+            } else {
+                error!("Device MediaControl1 property change that wasn't previously on the hashmap");
+                info!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
+                bluetooth_devices.insert(path.to_string(), BluetoothDevice {
+                    device_path: path.to_string(),
+                    has_battery: false,
+                    has_media: true,
+                    battery_percentage: None,
+                    device_name: None,
+                });
+                info!("Created new device {} with media capability via PropertiesChanged", path);
+            }
+            // TODO: Process specific MediaControl1 properties if needed
+        }
+        other => {
+            debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);
+        }
+    }
+}
+
+// ObjectManager.InterfacesRemoved: counterpart to InterfacesAdded. Each removed
+// interface flips a flag back to false; remove_if_idle drops the device once
+// every flag is false and the name is gone. UPower device removal currently
+// has no UI consequence (laptop battery comes and goes only via hardware).
+fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+    info!("Dbus monitor: Received InterfacesRemoved signal from ObjectManager");
+    let body = msg.body();
+    let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
+        error!("Dbus monitor: Failed to deserialize InterfacesRemoved message body as Structure");
+        return;
+    };
+    let fields = body_deserialized.fields();
+    let (object_path_value, interfaces_array_value) = match fields {
+        [a, b] => (a, b),
+        other => {
+            error!("Dbus monitor: Expected exactly 2 fields in InterfacesRemoved, got: {}", other.len());
+            return;
+        }
+    };
+
+    let object_path = match object_path_value {
+        Value::ObjectPath(object_path) => object_path,
+        other => {
+            error!("Dbus monitor: Expected ObjectPath as first element, got {:?}", other);
+            return;
+        }
+    };
+
+    let interfaces = match interfaces_array_value {
+        Value::Array(arr) => arr,
+        other => {
+            error!("Dbus monitor: Expected Array as second element, got {:?}", other);
+            return;
+        }
+    };
+
+    debug!("Dbus monitor: Interfaces removed from {}: {:?}", object_path, interfaces);
+
+    let object_path_str = object_path.as_str();
+    // Check for bt battery or media interfaces and handle them
+    for iface in interfaces.iter() {
+        let Value::Str(interface_name) = iface else { continue };
+        match interface_name.as_str() {
+            "org.bluez.Battery1" => {
+                info!("Dbus monitor: Bluetooth battery interface removed from {}", object_path);
+                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                    device.has_battery = false;
+                    device.battery_percentage = None;
+                    info!("Updated device {} to remove battery capability", object_path);
+                    remove_if_idle(bluetooth_devices, object_path_str);
+                } else {
+                    debug!("Battery interface removed from device not in HashMap: {}", object_path);
+                }
+            }
+            "org.bluez.MediaControl1" => {
+                info!("Dbus monitor: Bluetooth media interface removed from {}", object_path);
+                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                    device.has_media = false;
+                    info!("Updated device {} to remove media capability", object_path);
+                    remove_if_idle(bluetooth_devices, object_path_str);
+                } else {
+                    debug!("Media interface removed from device not in HashMap: {}", object_path);
+                }
+            }
+            "org.bluez.Device1" => {
+                info!("Dbus monitor: Bluetooth Device1 interface removed from {}", object_path);
+                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
+                    device.device_name = None;
+                    info!("Cleared device name for {}", object_path);
+                    remove_if_idle(bluetooth_devices, object_path_str);
+                } else {
+                    debug!("Device1 interface removed from device not in HashMap: {}", object_path);
+                }
+            }
+            "org.freedesktop.UPower.Device" => {
+                info!("Dbus monitor: UPower battery interface removed from {}", object_path);
+                // TODO: Handle cleanup or UI update for removed battery device
+            }
+            _ => {}
+        }
+    }
+
+    // Send GUI update after any Bluetooth device removal
+    let display_string = compute_bluetooth_display_string(bluetooth_devices);
+    if let Err(e) = bus::send_bluetooth_update(display_string) {
+        error!("Failed to send Bluetooth battery update after device removal: {}", e);
+    }
+}
+
 // Supervised wrapper around monitor_dbus. The inner loop holds one D-Bus
 // connection and dispatches signals forever; it only returns when the
 // MessageStream ends (system bus crash, connection drop) or when the initial
@@ -556,392 +939,20 @@ pub async fn monitor_dbus() -> Result<()> {
 
         info!("Dbus monitor: Received signal");
 
-        match (path, interface, member) {
-            (_, "org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => {
-                info!("Dbus monitor: Received InterfacesAdded signal from ObjectManager");
-                let body = msg.body();
-                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
-                    error!("Dbus monitor: Failed to deserialize InterfacesAdded message body as Structure");
-                    continue;
-                };
-
-                let fields = body_deserialized.fields();
-
-                // Destructure into two separate Values first
-                let (object_path_value, interfaces_dict_value) = match fields {
-                    [a, b] => (a, b),
-                    other => {
-                        error!("Dbus monitor: Expected exactly 2 fields, got: {}", other.len());
-                        continue;
-                    }
-                };
-
-                // TODO: Add nested function here to extract and validate object path
-                // fn extract_object_path(value: &Value) -> Result<&str, String> {
-                //     match value {
-                //         Value::ObjectPath(path) => Ok(path.as_str()),
-                //         other => Err(format!("Expected ObjectPath, got: {:?}", other))
-                //     }
-                // }
-                // This will allow other InterfacesAdded handling code to reuse path extraction
-
-                let interfaces_and_properties = match interfaces_dict_value {
-                    Value::Dict(dict) => dict,
-                    other => {
-                        error!("Dbus monitor: Expected Dict as second field, got: {:?}", other);
-                        continue;
-                    }
-                };
-
-                // Create longer-lived Str bindings
-                let bluetooth_interface_key = zvariant::Str::from("org.bluez.Device1");
-                let upower_interface_key = zvariant::Str::from("org.freedesktop.UPower.Device");
-
-                // Debug: print all available interfaces in the dict
-                debug!("Available interfaces in InterfacesAdded: {:?}",
-                       interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
-
-                let mut device_name: Option<String> = None;
-                match interfaces_and_properties.get::<_, Value>(&bluetooth_interface_key) {
-                    Ok(Some(Value::Dict(device1))) => {
-                        debug!("Found Device1 interface properties: {:?}", device1);
-                        // TODO: use alias, if alias fails use name and log that that is
-                        // not supposed to happend by the bluez device api
-                        // also alias is not supposed to be empty
-                        match device1.get(&zvariant::Str::from("Name")) {
-                            Ok(Some(Value::Str(name))) => {
-                                debug!("Found Bluetooth device name: {}", name);
-                                device_name = Some(name.to_string());
-                            },
-                            Ok(Some(other)) => {
-                                error!("Device Name property has unexpected type: {:?}", other);
-                            },
-                            Ok(None) => {
-                                error!("Device1 interface found but no Name property");
-                            },
-                            Err(e) => {
-                                error!("Failed to get Name property from Device1 interface: {}", e);
-                            },
-                        }
-                        // Update existing device or create new one in HashMap
-                        if let Value::ObjectPath(object_path) = object_path_value {
-                            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                                // Update existing device with name
-                                // maybe allow yourself to update even if none?
-                                device.device_name = device_name.clone();
-                                info!("Updated existing device {} with name: {:?}", object_path, device_name);
-                            } else {
-                                // Create new device entry
-                                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                                    device_path: object_path.to_string(),
-                                    has_battery: false,
-                                    has_media: false,
-                                    battery_percentage: None,
-                                    device_name: device_name.clone(),
-                                });
-                                info!("Created new device {} with name: {:?}", object_path, device_name);
-                            }
-                        } else {
-                            error!("Expected ObjectPath for device path, got: {:?}", object_path_value);
-                        }
-                    },
-                    Ok(Some(other)) => {
-                        error!("Device1 interface found but has unexpected type: {:?}", other);
-                    },
-                    Ok(None) => {
-                        debug!("Device1 interface not found in interfaces");
-                    },
-                    Err(e) => {
-                        error!("Failed to get Device1 interface: {}", e);
-                    }
-                }
-                // Check for Bluetooth MediaControl1 interface (indicates media device connection)
-                let media_control_key = zvariant::Str::from("org.bluez.MediaControl1");
-                // TODO: split Ok and Some for better logging
-                // TODO: incorporate if let Stuff() instead of two branched match statements
-                if let Ok(Some(_)) = interfaces_and_properties.get::<_, Value>(&media_control_key) {
-                    info!("Dbus monitor: Bluetooth media device connected");
-                    // Update HashMap with media capability
-                    if let Value::ObjectPath(object_path) = object_path_value {
-                        if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                            device.has_media = true;
-                            info!("Updated device {} with media capability", object_path);
-                        } else {
-                            debug!("Creating new device in hashmap for media: {}", object_path);
-                            bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                                device_path: object_path.to_string(),
-                                has_battery: false,
-                                has_media: true,
-                                battery_percentage: None,
-                                device_name: None,
-                            });
-                            info!("Created new device {} with media capability via InterfacesAdded", object_path);
-                        }
-                    } else {
-                        error!("Expected ObjectPath for media device path field, got: {:?}. Skipping update to bluetooth_devices", object_path_value);
-                    }
-                };
-
-                match interfaces_and_properties.get::<_, Value>(&zvariant::Str::from("org.bluez.Battery1")) {
-                    Err(e) => {
-                        error!("Failed to get bluetooth battery interface: {}", e);
-                    },
-                    Ok(None) => {
-                        debug!("Not a device with org.bluez.Battery1 interface");
-                    },
-                    Ok(Some(battery_interface_value)) => {
-                        let percentage = process_bluetooth_battery_interface(&battery_interface_value);
-                        // Update HashMap with new battery percentage
-                        if let Value::ObjectPath(object_path) = object_path_value {
-                            if let Some(device) = bluetooth_devices.get_mut(object_path.as_str()) {
-                                device.has_battery = true;
-                                device.battery_percentage = percentage;
-                                info!("Updated device {} battery: {:?}%", object_path, percentage);
-                            } else {
-                                debug!("Creating new device in hashmap: {}", object_path);
-                                bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                                    device_path: object_path.to_string(),
-                                    has_battery: true,
-                                    has_media: false,
-                                    battery_percentage: percentage,
-                                    device_name: None,
-                                });
-                                info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
-                            }
-
-                            // Send GUI update for all Bluetooth devices
-                            let display_string = compute_bluetooth_display_string(&bluetooth_devices);
-                            if let Err(e) = bus::send_bluetooth_update(display_string) {
-                                error!("Failed to send Bluetooth battery update: {}", e);
-                            }
-                        } else {
-                            error!("Expected ObjectPath for object path field, got: {:?}. Skiping update to bluetooth_devices", object_path_value);
-                        }
-                    }
-                };
-
-
-
-                // Check for UPower Device interface
-                if let Some(Value::Dict(_battery_props)) = interfaces_and_properties
-                    .get::<_, Value>(&upower_interface_key)
-                    .ok()
-                    .flatten() {
-                    info!("Dbus monitor: Battery device added");
-                    // Possibly refresh battery information or re-subscribe if needed
-                }
-
+        match (interface, member) {
+            ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => {
+                handle_interfaces_added(&msg, &mut bluetooth_devices);
             }
-            (_, "org.freedesktop.DBus.Properties", "PropertiesChanged") => {
-                info!("Dbus monitor: Received PropertiesChanged signal");
-                let body = msg.body();
-                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
-                    error!("Dbus monitor: Failed to deserialize PropertiesChanged message body as Structure");
-                    continue;
-                };
-                let fields = body_deserialized.fields();
-                let (interface_name_val, changed_properties_val, _invalidated_properties) = match fields {
-                    [a, b, c] => (a, b, c),
-                    other => {
-                        error!("Dbus monitor: Expected exactly 3 fields, got: {}", other.len());
-                        continue;
-                    }
-                };
-                // Convert name, match if it is battery
-                let interface_names = match interface_name_val {
-                    Value::Str(val) => val,
-                    other => {
-                        error!("Dbus monitor: Expected interface name to be a string, got: {:?}", other);
-                        continue;
-                    }
-                };
-
-                match interface_names.as_str() {
-                    "org.freedesktop.UPower.Device" => {
-                        let changed_properties = match changed_properties_val {
-                            Value::Dict(dict) => dict,
-                            other => {
-                                error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", other);
-                                continue;
-                            }
-                        };
-
-                        // Use the new battery properties processing function
-                        process_battery_device_properties(changed_properties);
-
-                        // Use dedicated function for percentage changes
-                        let percentage_key = Value::Str("Percentage".into());
-                        if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key) {
-                            process_battery_percentage(percentage_value);
-                        }
-
-                    }
-                    "org.bluez.Battery1" => {
-                        let Value::Dict(_) = changed_properties_val else {
-                            error!("Dbus monitor: Expected Dict for changed_properties, got: {:?}", changed_properties_val);
-                            continue;
-                        };
-
-                        // Use the existing function by passing changed properties as Value::Dict
-                        let percentage = process_bluetooth_battery_interface(changed_properties_val);
-                        // Update HashMap with new battery percentage
-                        if let Some(device) = bluetooth_devices.get_mut(path) {
-                            device.battery_percentage = percentage;
-                            info!("Updated device {} battery via PropertiesChanged: {:?}%", path, percentage);
-                        } else {
-                            error!("Device Battery1 property change that wasn't previously on the hashmap");
-                            info!("Creating new device in hashmap for battery via PropertiesChanged: {}", path);
-                            bluetooth_devices.insert(path.to_string(), BluetoothDevice {
-                                device_path: path.to_string(),
-                                has_battery: true,
-                                has_media: false,
-                                battery_percentage: percentage,
-                                device_name: None, // TODO: Extract device name if available
-                            });
-                            info!("Created new device {} with battery capability via PropertiesChanged", path);
-                        }
-
-                        // Send GUI update for all Bluetooth devices
-                        let display_string = compute_bluetooth_display_string(&bluetooth_devices);
-                        if let Err(e) = bus::send_bluetooth_update(display_string) {
-                            error!("Failed to send Bluetooth battery update: {}", e);
-                        }
-                    }
-                    "org.bluez.MediaControl1" => {
-                        info!("Dbus monitor: MediaControl1 properties changed for {}", path);
-                        // Update HashMap with media capability if device exists
-                        if let Some(device) = bluetooth_devices.get_mut(path) {
-                            device.has_media = true;
-                            info!("Updated device {} with media capability via PropertiesChanged", path);
-                        } else {
-                            error!("Device MediaControl1 property change that wasn't previously on the hashmap");
-                            info!("Creating new device in hashmap for media via PropertiesChanged: {}", path);
-                            bluetooth_devices.insert(path.to_string(), BluetoothDevice {
-                                device_path: path.to_string(),
-                                has_battery: false,
-                                has_media: true,
-                                battery_percentage: None,
-                                device_name: None,
-                            });
-                            info!("Created new device {} with media capability via PropertiesChanged", path);
-                        }
-                        // TODO: Process specific MediaControl1 properties if needed
-                    }
-                    other => {
-                        debug!("Dbus monitor: Ignored PropertiesChanged for interface: {:?}", other);
-                        continue;
-                    }
-                };
-
+            ("org.freedesktop.DBus.Properties", "PropertiesChanged") => {
+                handle_properties_changed(&msg, path, &mut bluetooth_devices);
             }
-            (_, "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
-                info!("Dbus monitor: Received InterfacesRemoved signal from ObjectManager");
-                let body = msg.body();
-                let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
-                    error!("Dbus monitor: Failed to deserialize InterfacesRemoved message body as Structure");
-                    continue;
-                };
-                let fields = body_deserialized.fields();
-                let (object_path_value, interfaces_array_value) = match fields {
-                    [a, b] => (a, b),
-                    other => {
-                        error!("Dbus monitor: Expected exactly 2 fields in InterfacesRemoved, got: {}", other.len());
-                        continue;
-                    }
-                };
-
-                let object_path = match object_path_value {
-                    Value::ObjectPath(object_path) => object_path,
-                    other => {
-                        error!("Dbus monitor: Expected ObjectPath as first element, got {:?}", other);
-                        continue;
-                    }
-                };
-
-                let interfaces = match interfaces_array_value {
-                    Value::Array(arr) => arr,
-                    other => {
-                        error!("Dbus monitor: Expected Array as second element, got {:?}", other);
-                        continue;
-                    }
-                };
-
-                debug!("Dbus monitor: Interfaces removed from {}: {:?}", object_path, interfaces);
-
-                // Check for bt battery or media interfaces and handle them
-                for iface in interfaces.iter() {
-                    if let Value::Str(interface_name) = iface {
-                        match interface_name.as_str() {
-                            "org.bluez.Battery1" => {
-                                info!("Dbus monitor: Bluetooth battery interface removed from {}", object_path);
-                                let object_path_str = object_path.as_str();
-                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
-                                    device.has_battery = false;
-                                    device.battery_percentage = None;
-                                    info!("Updated device {} to remove battery capability", object_path);
-
-                                    // Remove device entirely if it has no useful interfaces or name left
-                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
-                                        bluetooth_devices.remove(object_path_str);
-                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
-                                    }
-                                } else {
-                                    debug!("Battery interface removed from device not in HashMap: {}", object_path);
-                                }
-                            }
-                            "org.bluez.MediaControl1" => {
-                                info!("Dbus monitor: Bluetooth media interface removed from {}", object_path);
-                                let object_path_str = object_path.as_str();
-                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
-                                    device.has_media = false;
-                                    info!("Updated device {} to remove media capability", object_path);
-
-                                    // Remove device entirely if it has no useful interfaces or name left
-                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
-                                        bluetooth_devices.remove(object_path_str);
-                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
-                                    }
-                                } else {
-                                    debug!("Media interface removed from device not in HashMap: {}", object_path);
-                                }
-                            }
-                            "org.bluez.Device1" => {
-                                info!("Dbus monitor: Bluetooth Device1 interface removed from {}", object_path);
-                                let object_path_str = object_path.as_str();
-                                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
-                                    device.device_name = None;
-                                    info!("Cleared device name for {}", object_path);
-
-                                    // Remove device entirely if it has no useful interfaces or name left
-                                    if !device.has_media && !device.has_battery && device.device_name.is_none() {
-                                        bluetooth_devices.remove(object_path_str);
-                                        info!("Removed device {} from HashMap (no battery, media, or name)", object_path);
-                                    }
-                                } else {
-                                    debug!("Device1 interface removed from device not in HashMap: {}", object_path);
-                                }
-                            }
-                            "org.freedesktop.UPower.Device" => {
-                                info!("Dbus monitor: UPower battery interface removed from {}", object_path);
-                                // TODO: Handle cleanup or UI update for removed battery device
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Send GUI update after any Bluetooth device removal
-                let display_string = compute_bluetooth_display_string(&bluetooth_devices);
-                if let Err(e) = bus::send_bluetooth_update(display_string) {
-                    error!("Failed to send Bluetooth battery update after device removal: {}", e);
-                }
-
+            ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
+                handle_interfaces_removed(&msg, &mut bluetooth_devices);
             }
             _ => {
                 warn!("Dbus monitor: Unhandled signal: path: {}, interface: {}, member: {}", path, interface, member);
             }
         }
-
     }
 
     error!("Dbus monitor: Message stream ended unexpectedly");

@@ -1,5 +1,3 @@
-mod error;
-
 use anyhow::{Context, Result};
 
 use gio::prelude::*;
@@ -13,7 +11,6 @@ use hyprland::event_listener::AsyncEventListener;
 use hyprland::prelude::async_closure;
 use std::sync::OnceLock;
 use tracing::{info, warn, error, debug};
-// use error::{AppError, Result};
 use zbus::Connection;
 use zbus::fdo;
 use zbus_names::InterfaceName;

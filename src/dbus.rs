@@ -637,6 +637,206 @@ fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMa
     }
 }
 
+// Initial UPower battery query: read Percentage + State for the BAT0 device
+// and push one update through the bus. Silently no-ops on desktop systems
+// where the proxy/property is absent (logs at info!, not error!). Subsequent
+// updates arrive via the PropertiesChanged match rule + handle_properties_changed.
+async fn initial_battery_query(connection: &Connection) {
+    // TODO: what if there is no battery (for example, in a desktop?)
+    // Probably should monitor if a battery comes into existance so
+    // you should not return
+
+    // will .ok() later
+    let properties_proxy = zbus::fdo::PropertiesProxy::new(
+        connection,
+        "org.freedesktop.UPower",
+        "/org/freedesktop/UPower/devices/battery_BAT0",
+    ).await
+    .inspect_err(|_e| error!("different style to construction battery_BAT0 proxy failed"))
+    .ok();
+
+    let Some(proxy) = properties_proxy else { return };
+    let Some(battery_interface_name) = InterfaceName::try_from("org.freedesktop.UPower.Device")
+        .inspect_err(|e| error!("Failed to create interface name: {}", e))
+        .ok()
+    else { return };
+
+    let battery_percentage = proxy.get(battery_interface_name.clone(), "Percentage").await
+        .inspect_err(|e|
+            info!("No battery detected initially (likely desktop system): {}", e)
+        )
+        .ok()
+        .and_then(|battery|
+            f64::try_from(battery)
+            .inspect_err(|e| {
+                error!("Failed to convert battery percentage to f64: {}", e);
+            })
+            .ok());
+
+    let battery_text = battery_percentage
+        .map(|percentage| {
+            info!("Battery is at {:.1}%", percentage);
+            format!("🔋 {:.0}%", percentage)
+        })
+        .unwrap_or_else(|| {
+            debug!("Using empty battery text");
+            String::new()
+        });
+
+    bus::send_battery_update(battery_text)
+        .inspect_err(|e| error!("Failed to send battery update: {}", e))
+        .ok();
+
+    if let Some(state_value) = proxy.get(battery_interface_name, "State").await
+        .inspect_err(|e|
+            info!("No battery state detected initially (likely desktop system): {}", e)
+        )
+        .ok()
+    {
+        process_battery_state(state_value.into());
+    }
+}
+
+// Initial BlueZ scan via ObjectManager.GetManagedObjects: enumerate every
+// known device path, pick up Device1 (name), Battery1 (percentage), and
+// MediaControl1 (presence), and seed bluetooth_devices. Sends one display
+// update through the bus once the scan completes so the widget has data on
+// first paint (or empty string if no devices).
+async fn initial_bluetooth_scan(
+    connection: &Connection,
+    bluetooth_devices: &mut HashMap<String, BluetoothDevice>,
+) {
+    let bluez_proxy = zbus::fdo::PropertiesProxy::new(
+        connection,
+        "org.bluez",
+        "/", // ObjectManager path
+    ).await
+    .inspect_err(|e| error!("Failed to create Bluez ObjectManager proxy: {}", e))
+    .ok();
+
+    let Some(_bluez_proxy) = bluez_proxy else { return };
+
+    // Use ObjectManager to get all managed objects
+    let object_manager = zbus::fdo::ObjectManagerProxy::new(connection, "org.bluez", "/").await
+        .inspect_err(|e| error!("Failed to create Bluez ObjectManager: {}", e))
+        .ok();
+    let Some(object_manager) = object_manager else { return };
+
+    match object_manager.get_managed_objects().await {
+        Ok(objects) => {
+            info!("Found {} Bluetooth objects", objects.len());
+
+            // Look for Bluetooth devices and populate HashMap
+            for (object_path, interfaces) in objects {
+                // Track all BT devices, some might gain battery/media interfaces later
+                let mut has_battery        = false;
+                let mut battery_percentage: Option<u8> = None;
+                let mut device_name: Option<String> = None;
+                let mut has_media         = false;
+
+                // TODO: transform to a match and add logs
+                // Check for Device1 interface (basic device info)
+                if let Some(device_interface) = interfaces.get("org.bluez.Device1") {
+                    // Extract device name/alias
+                    if let Some(name_value) = device_interface.get("Alias")
+                        .or_else(|| device_interface.get("Name")) {
+                        if let Ok(name) = String::try_from(name_value.clone()) {
+                            device_name = Some(name);
+                        }
+                    }
+                }
+
+                // Check for Battery1 interface
+                if let Some(battery_interface) = interfaces.get("org.bluez.Battery1") {
+                    info!("Found Bluetooth device with battery at: {}", object_path);
+                    has_battery = true;
+
+                    // Get the battery percentage if available
+                    if let Some(percentage_value) = battery_interface.get("Percentage") {
+                        battery_percentage = process_bluetooth_battery_percentage(percentage_value.clone().into());
+                    } else {
+                        debug!("Bluetooth battery device at {} has no Percentage property", object_path);
+                    }
+                }
+
+                // Check for MediaControl1 interface (changed from MediaTransport1)
+                // TODO: Problem: on the top level bt device of my earbuds
+                // we see MediaControl1 but not MediaTransport1
+                // this breaks the assumption that we wouldn't need to corelate
+                // multiple paths to a single physical device
+                // OR we could use MediaControl1
+                // we also assume the toplevel one is the one with
+                // Device1
+                //
+                // In case you need to corelate devices, check the
+                // .Device property on the multiple devices, it seems
+                // to point to the appropiate top level device
+                if interfaces.contains_key("org.bluez.MediaControl1") {
+                    has_media = true;
+                    debug!("Found Bluetooth device with media control at: {}", object_path);
+                }
+
+                // Only add Bluetooth devices that have battery or media interfaces or have
+                // Device1 interface and thus should in theory have a name and alias
+                // NOTE: even if the docs say so, in practice we have found multiple
+                // Device1 interfaces with no name
+                if has_battery || has_media || device_name.is_some() {
+                    bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
+                        device_path: object_path.to_string(),
+                        has_battery,
+                        has_media,
+                        battery_percentage,
+                        device_name,
+                    });
+                    debug!("Added device {} to HashMap (has_battery: {}, has_media: {})", object_path, has_battery, has_media);
+                }
+            }
+            debug!("Initial bluetooth devices: {:?}", bluetooth_devices);
+
+            // Send initial GUI update for discovered devices
+            let display_string = compute_bluetooth_display_string(bluetooth_devices);
+            info!("Sent initial Bluetooth display: {}", display_string);
+            if let Err(e) = bus::send_bluetooth_update(display_string) {
+                error!("Failed to send initial Bluetooth display update: {}", e);
+            }
+        }
+        Err(e) => {
+            info!("No Bluetooth devices found or failed to query: {}", e);
+
+            // Send "No BT" update even when no devices found
+            let display_string = compute_bluetooth_display_string(bluetooth_devices);
+            if let Err(e) = bus::send_bluetooth_update(display_string) {
+                error!("Failed to send 'No BT' display update: {}", e);
+            }
+        }
+    }
+}
+
+// Register the three D-Bus match rules we care about. If any one fails to
+// build or to register we log + carry on — the other rules will still
+// produce useful signals, and run_dbus_monitor_supervised will retry the
+// whole monitor if the stream later dies.
+async fn register_match_rules(dbus_proxy: &fdo::DBusProxy<'_>) {
+    for (label, rule_result) in [
+        ("battery", build_battery_match_rule()),
+        ("bluez InterfacesAdded", build_bluez_object_manager_match_rule("InterfacesAdded")),
+        ("bluez InterfacesRemoved", build_bluez_object_manager_match_rule("InterfacesRemoved")),
+    ] {
+        match rule_result {
+            Err(e) => {
+                error!("❌ Failed to build {} match rule: {:#}", label, e);
+            }
+            Ok(rule) => {
+                if let Err(e) = dbus_proxy.add_match_rule(rule).await {
+                    error!("❌ Failed to register {} match rule: {}", label, e);
+                } else {
+                    debug!("🔌 Registered {} match rule", label);
+                }
+            }
+        }
+    }
+}
+
 // Supervised wrapper around monitor_dbus. The inner loop holds one D-Bus
 // connection and dispatches signals forever; it only returns when the
 // MessageStream ends (system bus crash, connection drop) or when the initial
@@ -677,177 +877,14 @@ pub async fn monitor_dbus() -> Result<()> {
             error!("Failed to connect to system D-Bus: {}", e);
             e
         })?;
-    // Get initial status
-    // TODO: what if there is no battery (for example, in a desktop?)
-    // Probably should monitor if a battery comes into existance so
-    // you should not return
 
+    initial_battery_query(&connection).await;
 
-    // will .ok() later
-    let properties_proxy = zbus::fdo::PropertiesProxy::new(
-        &connection,
-        "org.freedesktop.UPower",
-        "/org/freedesktop/UPower/devices/battery_BAT0",
-    ).await
-    .inspect_err(|_e| error!("different style to construction battery_BAT0 proxy failed"))
-    .ok();
-
-    if let Some(proxy) = properties_proxy {
-        let battery_interface_name = InterfaceName::try_from("org.freedesktop.UPower.Device")
-        .inspect_err(|e| error!("Failed to create interface name: {}", e))
-        .ok();
-        if let Some(battery_interface_name) = battery_interface_name {
-            let battery_percentage = proxy.get(battery_interface_name.clone(), "Percentage").await
-            .inspect_err(|e|
-                info!("No battery detected initially (likely desktop system): {}", e)
-            )
-            .ok()
-            .and_then(|battery|
-                f64::try_from(battery)
-                .inspect_err(|e| {
-                    error!("Failed to convert battery percentage to f64: {}", e);
-                })
-                .ok());
-
-            let battery_text = battery_percentage
-                .map(|percentage| {
-                    info!("Battery is at {:.1}%", percentage);
-                    format!("🔋 {:.0}%", percentage)
-                })
-                .unwrap_or_else(|| {
-                    debug!("Using empty battery text");
-                    String::new()
-                });
-
-            bus::send_battery_update(battery_text)
-                .inspect_err(|e| error!("Failed to send battery update: {}", e))
-                .ok();
-
-            if let Some(state_value) = proxy.get(battery_interface_name.clone(), "State").await
-                .inspect_err(|e|
-                    info!("No battery state detected initially (likely desktop system): {}", e)
-                )
-                .ok()
-            {
-                process_battery_state(state_value.into());
-            }
-        }
-    };
-
-    // Initial Bluetooth battery query - check for connected devices with battery info
-    let bluez_proxy = zbus::fdo::PropertiesProxy::new(
-        &connection,
-        "org.bluez",
-        "/", // ObjectManager path
-    ).await
-    .inspect_err(|e| error!("Failed to create Bluez ObjectManager proxy: {}", e))
-    .ok();
-
-    // create hashmap of bt devices:
     // TODO: Consider adding has_device1 field to BluetoothDevice struct for full symmetry
     // with has_battery and has_media fields. Current approach uses device_name presence
     // as proxy for Device1 interface availability.
     let mut bluetooth_devices: HashMap<String, BluetoothDevice> = HashMap::new();
-
-    if let Some(_bluez_proxy) = bluez_proxy {
-        // Use ObjectManager to get all managed objects
-        let object_manager = zbus::fdo::ObjectManagerProxy::new(&connection, "org.bluez", "/").await
-            .inspect_err(|e| error!("Failed to create Bluez ObjectManager: {}", e))
-            .ok();
-
-        if let Some(object_manager) = object_manager {
-            match object_manager.get_managed_objects().await {
-                Ok(objects) => {
-                    info!("Found {} Bluetooth objects", objects.len());
-
-                    // Look for Bluetooth devices and populate HashMap
-                    for (object_path, interfaces) in objects {
-                        // Track all BT devices, some might gain battery/media interfaces later
-                        let mut has_battery        = false;
-                        let mut battery_percentage: Option<u8> = None;
-                        let mut device_name: Option<String> = None;
-                        let mut has_media         = false;
-
-                        // TODO: transform to a match and add logs
-                        // Check for Device1 interface (basic device info)
-                        if let Some(device_interface) = interfaces.get("org.bluez.Device1") {
-                            // Extract device name/alias
-                            if let Some(name_value) = device_interface.get("Alias")
-                                .or_else(|| device_interface.get("Name")) {
-                                if let Ok(name) = String::try_from(name_value.clone()) {
-                                    device_name = Some(name);
-                                }
-                            }
-                        }
-
-                        // Check for Battery1 interface
-                        if let Some(battery_interface) = interfaces.get("org.bluez.Battery1") {
-                            info!("Found Bluetooth device with battery at: {}", object_path);
-                            has_battery = true;
-
-                            // Get the battery percentage if available
-                            if let Some(percentage_value) = battery_interface.get("Percentage") {
-                                battery_percentage = process_bluetooth_battery_percentage(percentage_value.clone().into());
-                            } else {
-                                debug!("Bluetooth battery device at {} has no Percentage property", object_path);
-                            }
-                        }
-
-                        // Check for MediaControl1 interface (changed from MediaTransport1)
-                        // TODO: Problem: on the top level bt device of my earbuds
-                        // we see MediaControl1 but not MediaTransport1
-                        // this breaks the assumption that we wouldn't need to corelate
-                        // multiple paths to a single physical device
-                        // OR we could use MediaControl1
-                        // we also assume the toplevel one is the one with
-                        // Device1
-                        //
-                        // In case you need to corelate devices, check the
-                        // .Device property on the multiple devices, it seems
-                        // to point to the appropiate top level device
-                        if interfaces.contains_key("org.bluez.MediaControl1") {
-                            has_media = true;
-                            debug!("Found Bluetooth device with media control at: {}", object_path);
-                        }
-
-                        // Only add Bluetooth devices that have battery or media interfaces or have
-                        // Device1 interface and thus should in theory have a name and alias
-                        // NOTE: even if the docs say so, in practice we have found multiple
-                        // Device1 interfaces with no name
-                        if has_battery || has_media || device_name.is_some() {
-                            bluetooth_devices.insert(object_path.to_string(), BluetoothDevice {
-                                device_path: object_path.to_string(),
-                                has_battery,
-                                has_media,
-                                battery_percentage,
-                                device_name,
-                            });
-                            debug!("Added device {} to HashMap (has_battery: {}, has_media: {})", object_path, has_battery, has_media);
-                        }
-                    }
-                    debug!("Initial bluetooth devices: {:?}", bluetooth_devices);
-
-                    // Send initial GUI update for discovered devices
-                    let display_string = compute_bluetooth_display_string(&bluetooth_devices);
-                    info!("Sent initial Bluetooth display: {}", display_string);
-                    if let Err(e) = bus::send_bluetooth_update(display_string) {
-                        error!("Failed to send initial Bluetooth display update: {}", e);
-                    }
-                }
-                Err(e) => {
-                    info!("No Bluetooth devices found or failed to query: {}", e);
-
-                    // Send "No BT" update even when no devices found
-                    let display_string = compute_bluetooth_display_string(&bluetooth_devices);
-                    if let Err(e) = bus::send_bluetooth_update(display_string) {
-                        error!("Failed to send 'No BT' display update: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-
+    initial_bluetooth_scan(&connection, &mut bluetooth_devices).await;
 
     // Subscribe to UPower property changes before creating MessageStream.
     // Without this subscription, the MessageStream receives no messages because
@@ -857,41 +894,16 @@ pub async fn monitor_dbus() -> Result<()> {
     // "Changes to properties on existing interfaces are not reported using this interface"
     // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
     let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
+    register_match_rules(&dbus_proxy).await;
 
     // from the connection, we get the dbus_proxy, we add the rules to the proxy
     // which makes it so that when we do connection.into() to get a stream
-    // we can think of the rules being *inside* that connection
-
-    // Probably we have tried to go from dbus_proxy to stream, should have
-    // documented the attempt but we didn't
-
-    // Some code online seems to use select!, which merges multiple async sources into one
-    // We should think if select! + multiple streams is better. The current approach is
-    // One stream, multiple match rules, branch out depending on the type of event
-
-    // Three match rules; if any fails to build or to register we log + carry on,
-    // since the other rules still produce useful signals. monitor_dbus is then
-    // wrapped in run_dbus_monitor_supervised which will reconnect-and-retry
-    // the whole thing if the stream later dies.
-    for (label, rule_result) in [
-        ("battery", build_battery_match_rule()),
-        ("bluez InterfacesAdded", build_bluez_object_manager_match_rule("InterfacesAdded")),
-        ("bluez InterfacesRemoved", build_bluez_object_manager_match_rule("InterfacesRemoved")),
-    ] {
-        match rule_result {
-            Err(e) => {
-                error!("❌ Failed to build {} match rule: {:#}", label, e);
-            }
-            Ok(rule) => {
-                if let Err(e) = dbus_proxy.add_match_rule(rule).await {
-                    error!("❌ Failed to register {} match rule: {}", label, e);
-                } else {
-                    debug!("🔌 Registered {} match rule", label);
-                }
-            }
-        }
-    }
-
+    // we can think of the rules being *inside* that connection.
+    //
+    // Some code online seems to use select!, which merges multiple async sources
+    // into one. We should think if select! + multiple streams is better. The
+    // current approach is: one stream, multiple match rules, branch on event
+    // shape in the loop below.
     let mut stream: zbus::MessageStream = connection.into();
     info!("Dbus monitor: Starting to listen for D-Bus messages");
 

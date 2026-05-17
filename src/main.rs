@@ -62,20 +62,23 @@ fn setup_logging() {
         .init();
 }
 
-fn create_workspace_widget() -> Result<gtk4::Label> {
+// Widget constructors are infallible — gtk4::Label::new, add_css_class, and
+// set_halign all return (). The previous Result<…> signatures were speculative,
+// forcing every caller to `?`-thread an error that could not be produced.
+fn create_workspace_widget() -> gtk4::Label {
     debug!("Creating workspace widget");
     let label = gtk4::Label::new(Some("Workspace ?"));
     label.add_css_class("workspace-widget");
     label.set_halign(gtk4::Align::Center);
-    Ok(label)
+    label
 }
 
-fn create_volume_widget() -> Result<gtk4::Label> {
+fn create_volume_widget() -> gtk4::Label {
     debug!("Creating volume widget");
     let label = gtk4::Label::new(Some("Volume ?"));
     label.add_css_class("volume-widget");
     label.set_halign(gtk4::Align::Center);
-    Ok(label)
+    label
 }
 
 fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
@@ -1063,28 +1066,28 @@ fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<
     Ok(())
 }
 
-fn create_title_widget() -> Result<gtk4::Label> {
+fn create_title_widget() -> gtk4::Label {
     debug!("Creating title widget");
     let label = gtk4::Label::new(Some("Application Title"));
     label.add_css_class("title-widget");
     label.set_halign(gtk4::Align::End);
-    Ok(label)
+    label
 }
 
-fn create_time_widget() -> Result<gtk4::Label> {
+fn create_time_widget() -> gtk4::Label {
     debug!("Creating time widget");
-    let time_str = get_current_time()?;
+    let time_str = get_current_time();
     let label = gtk4::Label::new(Some(&time_str));
     label.add_css_class("time-widget");
     label.set_halign(gtk4::Align::End);
-    Ok(label)
+    label
 }
 
-fn get_current_time() -> Result<String> {
-    Ok(Local::now().format("%l:%M %p").to_string())
+fn get_current_time() -> String {
+    Local::now().format("%l:%M %p").to_string()
 }
 
-fn update_time_widget(label: gtk4::Label) -> Result<()> {
+fn update_time_widget(label: gtk4::Label) {
     debug!("Setting up time widget updates");
 
     let label_weak = label.downgrade();
@@ -1094,38 +1097,28 @@ fn update_time_widget(label: gtk4::Label) -> Result<()> {
             return glib::ControlFlow::Break;
         };
 
-        let time_str = match get_current_time() {
-            Ok(time) => time,
-            Err(e) => {
-                error!("Failed to get current time: {}", e);
-                "??:??".to_string()
-            }
-        };
-
-        label.set_text(&time_str);
+        label.set_text(&get_current_time());
         glib::ControlFlow::Continue
     });
-
-    Ok(())
 }
 
-fn create_bt_widget() -> Result<gtk4::Label> {
+fn create_bt_widget() -> gtk4::Label {
     debug!("Creating bluetooth widget");
     let label = gtk4::Label::new(None);  // Start with no text, will be hidden until devices found
     label.add_css_class("bt-widget");
     label.set_halign(gtk4::Align::End);
-    Ok(label)
+    label
 }
 
-fn create_battery_widget() -> Result<gtk4::Label> {
+fn create_battery_widget() -> gtk4::Label {
     debug!("Creating battery widget");
     let label = gtk4::Label::new(Some("🔋 ??%"));
     label.add_css_class("battery-widget");
     label.set_halign(gtk4::Align::End);
-    Ok(label)
+    label
 }
 
-fn create_left_group() -> Result<(gtk4::Box, gtk4::Label)> {
+fn create_left_group() -> (gtk4::Box, gtk4::Label) {
     debug!("Creating left group");
 
     let left_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1137,7 +1130,7 @@ fn create_left_group() -> Result<(gtk4::Box, gtk4::Label)> {
     left_group.add_css_class("left-group");
     left_group.set_hexpand(false);
 
-    let workspace_widget = create_workspace_widget()?;
+    let workspace_widget = create_workspace_widget();
     left_group.append(&workspace_widget);
 
     let left_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1146,10 +1139,10 @@ fn create_left_group() -> Result<(gtk4::Box, gtk4::Label)> {
     left_container.append(&left_group);
     left_container.append(&left_spacer);
 
-    Ok((left_container, workspace_widget))
+    (left_container, workspace_widget)
 }
 
-fn create_center_group() -> Result<(gtk4::Box, gtk4::Label, gtk4::Box)> {
+fn create_center_group() -> (gtk4::Box, gtk4::Label, gtk4::Box) {
     debug!("Creating center group");
 
     let center_spacer_start = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1160,16 +1153,16 @@ fn create_center_group() -> Result<(gtk4::Box, gtk4::Label, gtk4::Box)> {
     center_group.set_valign(gtk4::Align::Center);
     center_group.set_hexpand(false);
 
-    let title_widget = create_title_widget()?;
+    let title_widget = create_title_widget();
     center_group.append(&title_widget);
 
     let center_spacer_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     center_spacer_end.set_hexpand(true);
 
-    Ok((center_spacer_start, title_widget, center_spacer_end))
+    (center_spacer_start, title_widget, center_spacer_end)
 }
 
-fn create_right_group() -> Result<(gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label)> {
+fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
     debug!("Creating right group");
 
     let right_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1184,34 +1177,34 @@ fn create_right_group() -> Result<(gtk4::Box, gtk4::Label, gtk4::Label, gtk4::La
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
 
-    let bt_widget = create_bt_widget()?;
+    let bt_widget = create_bt_widget();
     right_group.append(&bt_widget);
 
-    let volume_widget = create_volume_widget()?;
+    let volume_widget = create_volume_widget();
     right_group.append(&volume_widget);
 
-    let battery_widget = create_battery_widget()?;
+    let battery_widget = create_battery_widget();
     right_group.append(&battery_widget);
 
-    let time_widget = create_time_widget()?;
+    let time_widget = create_time_widget();
     right_group.append(&time_widget);
 
     right_container.append(&right_spacer);
     right_container.append(&right_group);
 
-    Ok((right_container, bt_widget, volume_widget, battery_widget, time_widget))
+    (right_container, bt_widget, volume_widget, battery_widget, time_widget)
 }
 
-fn create_experimental_bar() -> Result<(gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label)> {
+fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
     debug!("Creating experimental bar");
 
     let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
     main_box.set_valign(gtk4::Align::Center);
 
-    let (left_group, workspace_widget) = create_left_group()?;
-    let (center_spacer_start, title_widget, center_spacer_end) = create_center_group()?;
-    let (right_group, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group()?;
+    let (left_group, workspace_widget) = create_left_group();
+    let (center_spacer_start, title_widget, center_spacer_end) = create_center_group();
+    let (right_group, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group();
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -1219,10 +1212,10 @@ fn create_experimental_bar() -> Result<(gtk4::Box, gtk4::Label, gtk4::Label, gtk
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    Ok((main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget))
+    (main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget)
 }
 
-fn load_css_styles(window: &gtk4::ApplicationWindow) -> Result<()> {
+fn load_css_styles(window: &gtk4::ApplicationWindow) {
     debug!("Loading CSS styles");
 
     let css_provider = gtk4::CssProvider::new();
@@ -1236,10 +1229,9 @@ fn load_css_styles(window: &gtk4::ApplicationWindow) -> Result<()> {
     );
 
     info!("CSS styles loaded successfully");
-    Ok(())
 }
 
-fn configure_layer_shell(window: &gtk4::ApplicationWindow) -> Result<()> {
+fn configure_layer_shell(window: &gtk4::ApplicationWindow) {
     debug!("Configuring layer shell");
 
     window.init_layer_shell();
@@ -1260,7 +1252,6 @@ fn configure_layer_shell(window: &gtk4::ApplicationWindow) -> Result<()> {
     window.set_default_height(30);
 
     info!("Layer shell configured successfully");
-    Ok(())
 }
 
 fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
@@ -2136,14 +2127,14 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     let window = gtk4::ApplicationWindow::new(application);
     window.add_css_class("layer-bar");
 
-    load_css_styles(&window)?;
-    configure_layer_shell(&window)?;
+    load_css_styles(&window);
+    configure_layer_shell(&window);
 
-    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar()?;
+    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) = create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
 
-    update_time_widget(time_widget)?;
+    update_time_widget(time_widget);
     setup_workspace_updates(workspace_widget, title_widget.clone())?;
     setup_title_updates(title_widget)?;
     setup_battery_updates(battery_widget)?;

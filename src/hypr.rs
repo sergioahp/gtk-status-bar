@@ -238,6 +238,100 @@ pub async fn setup_title_event_listener() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyprland::shared::WorkspaceType;
+
+    // format_title_string: short input passes through unchanged.
+    #[test]
+    fn format_title_short_passthrough() {
+        assert_eq!(format_title_string("hello".to_string(), 10), "hello");
+    }
+
+    // Exactly max_length chars also passes through (≤ comparison).
+    #[test]
+    fn format_title_exact_max_length_passthrough() {
+        let s = "0123456789".to_string();
+        assert_eq!(s.chars().count(), 10);
+        assert_eq!(format_title_string(s.clone(), 10), s);
+    }
+
+    // Empty string is a no-op regardless of max_length.
+    #[test]
+    fn format_title_empty_passthrough() {
+        assert_eq!(format_title_string(String::new(), 64), "");
+    }
+
+    // Long input gets cropped with an ellipsis in the middle. Concretely for
+    // max_length=10 the algorithm yields chars_left=4, chars_right=6, so we
+    // keep the first 4 and last 6 chars of the input and join with "…".
+    #[test]
+    fn format_title_long_cropped_with_ellipsis() {
+        let input = "1234567890ABCDEF".to_string();
+        let out = format_title_string(input, 10);
+        assert_eq!(out, "1234…ABCDEF");
+        assert!(out.contains('…'));
+        // Output is chars_left + 1 (…) + chars_right chars.
+        assert_eq!(out.chars().count(), 11);
+    }
+
+    // Multi-byte UTF-8 must crop on character boundaries, not byte indices —
+    // slicing a multi-byte char mid-byte would panic. Each emoji is 4 bytes
+    // but counts as 1 char, so chars().count() and byte length diverge.
+    #[test]
+    fn format_title_multibyte_utf8_crops_on_char_boundary() {
+        // 16 chars, each a 4-byte emoji => 64 bytes total.
+        let input: String = "🚀".repeat(16);
+        assert_eq!(input.chars().count(), 16);
+        assert_eq!(input.len(), 64);
+        let out = format_title_string(input, 10);
+        // Should not panic, should contain the ellipsis.
+        assert!(out.contains('…'));
+        // 4 emoji + … + 6 emoji = 11 chars
+        assert_eq!(out.chars().count(), 11);
+    }
+
+    // format_workspace_name_from_string: empty name falls back to id.
+    #[test]
+    fn workspace_name_from_string_empty_uses_id() {
+        assert_eq!(format_workspace_name_from_string("", 3), "Workspace 3");
+    }
+
+    #[test]
+    fn workspace_name_from_string_non_empty() {
+        assert_eq!(format_workspace_name_from_string("dev", 1), "Workspace dev");
+    }
+
+    // format_workspace_name_from_type: Regular delegates to the string form.
+    #[test]
+    fn workspace_name_from_type_regular_delegates() {
+        let ws = WorkspaceType::Regular("scratch".to_string());
+        assert_eq!(format_workspace_name_from_type(&ws, 7), "Workspace scratch");
+    }
+
+    // Special with a name uses "Special: <name>".
+    #[test]
+    fn workspace_name_from_type_special_with_name() {
+        let ws = WorkspaceType::Special(Some("magic".to_string()));
+        assert_eq!(format_workspace_name_from_type(&ws, 4), "Special: magic");
+    }
+
+    // Special with None falls back to "Special <id>".
+    #[test]
+    fn workspace_name_from_type_special_none_uses_id() {
+        let ws = WorkspaceType::Special(None);
+        assert_eq!(format_workspace_name_from_type(&ws, 5), "Special 5");
+    }
+
+    // Special with Some("") is treated like None per the guard `if !name.is_empty()`.
+    #[test]
+    fn workspace_name_from_type_special_empty_string_uses_id() {
+        let ws = WorkspaceType::Special(Some(String::new()));
+        assert_eq!(format_workspace_name_from_type(&ws, 9), "Special 9");
+    }
+}
+
 pub async fn setup_workspace_event_listener() -> Result<()> {
     debug!("Setting up workspace event listener");
 

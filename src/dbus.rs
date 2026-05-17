@@ -59,6 +59,84 @@ pub fn compute_bluetooth_display_string(bluetooth_devices: &HashMap<String, Blue
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(path: &str, name: Option<&str>, percentage: Option<u8>) -> (String, BluetoothDevice) {
+        (
+            path.to_string(),
+            BluetoothDevice {
+                device_path: path.to_string(),
+                has_battery: percentage.is_some(),
+                has_media: false,
+                battery_percentage: percentage,
+                device_name: name.map(str::to_string),
+            },
+        )
+    }
+
+    // Empty map => empty string (NOT "No BT"); the widget layer uses this as
+    // the hide signal via set_visible(false).
+    #[test]
+    fn bt_display_empty_map_is_empty_string() {
+        let map: HashMap<String, BluetoothDevice> = HashMap::new();
+        assert_eq!(compute_bluetooth_display_string(&map), "");
+    }
+
+    // Devices without a battery percentage are filtered out entirely. If the
+    // map only contains such devices, the result is the same as empty.
+    #[test]
+    fn bt_display_devices_without_battery_filtered() {
+        let map: HashMap<String, BluetoothDevice> =
+            [device("/d1", Some("Pixel"), None), device("/d2", None, None)]
+                .into_iter()
+                .collect();
+        assert_eq!(compute_bluetooth_display_string(&map), "");
+    }
+
+    // One named device with battery: first char of name + integer percentage.
+    #[test]
+    fn bt_display_single_named_device() {
+        let map: HashMap<String, BluetoothDevice> =
+            [device("/d1", Some("Pixel Buds"), Some(80))].into_iter().collect();
+        assert_eq!(compute_bluetooth_display_string(&map), "P80");
+    }
+
+    // Device with battery but no name falls back to 'D' (for "device").
+    #[test]
+    fn bt_display_device_no_name_uses_d_prefix() {
+        let map: HashMap<String, BluetoothDevice> =
+            [device("/d1", None, Some(42))].into_iter().collect();
+        assert_eq!(compute_bluetooth_display_string(&map), "D42");
+    }
+
+    // First *character* (not byte) of the device name — verifies multi-byte
+    // UTF-8 doesn't slice mid-byte.
+    #[test]
+    fn bt_display_multibyte_name_uses_first_char() {
+        let map: HashMap<String, BluetoothDevice> =
+            [device("/d1", Some("🎧 Sony"), Some(55))].into_iter().collect();
+        assert_eq!(compute_bluetooth_display_string(&map), "🎧55");
+    }
+
+    // Two devices: assert via set comparison since HashMap iteration order is
+    // not guaranteed. We split on space to avoid order-dependent equality.
+    #[test]
+    fn bt_display_two_devices_joined_by_space() {
+        let map: HashMap<String, BluetoothDevice> = [
+            device("/d1", Some("Pixel"), Some(80)),
+            device("/d2", Some("Sony"), Some(60)),
+        ]
+        .into_iter()
+        .collect();
+        let out = compute_bluetooth_display_string(&map);
+        let mut parts: Vec<&str> = out.split(' ').collect();
+        parts.sort();
+        assert_eq!(parts, vec!["P80", "S60"]);
+    }
+}
+
 fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
     u8::try_from(value)
         .inspect_err(|e| {

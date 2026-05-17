@@ -258,6 +258,52 @@ fn get_workspace_color(workspace_id: hyprland::shared::WorkspaceId) -> &'static 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Workspaces 1..=10 have explicit color entries; everything else hits the
+    // default arm. Tests pin the boundaries — a typo in the match arms
+    // (e.g. duplicate id, wrong default fallthrough) would flip these.
+    #[test]
+    fn workspace_color_1_is_blue_ish() {
+        assert_eq!(get_workspace_color(1), "rgba(122, 162, 247, 0.5)");
+    }
+
+    #[test]
+    fn workspace_color_10_is_last_explicit() {
+        assert_eq!(get_workspace_color(10), "rgba(13, 185, 215, 0.5)");
+    }
+
+    #[test]
+    fn workspace_color_11_falls_through_to_default() {
+        let default = "rgba(67, 233, 123, 0.5)";
+        assert_eq!(get_workspace_color(11), default);
+        assert_eq!(get_workspace_color(100), default);
+    }
+
+    // Hyprland uses negative workspace IDs for special workspaces; verify we
+    // don't accidentally match a positive arm and that we hit the default.
+    #[test]
+    fn workspace_color_negative_id_falls_through_to_default() {
+        let default = "rgba(67, 233, 123, 0.5)";
+        assert_eq!(get_workspace_color(-1), default);
+        assert_eq!(get_workspace_color(-99), default);
+    }
+
+    // Every explicit arm returns a different color — if a regression turns
+    // two of them into the same rgba, this catches it.
+    #[test]
+    fn workspace_colors_are_all_distinct() {
+        let mut colors: Vec<&str> = (1..=10).map(get_workspace_color).collect();
+        colors.push(get_workspace_color(0)); // default
+        colors.sort();
+        let len_before = colors.len();
+        colors.dedup();
+        assert_eq!(colors.len(), len_before, "expected all distinct colors");
+    }
+}
+
 pub fn setup_workspace_updates(label: gtk4::Label, title_widget: gtk4::Label) -> Result<()> {
     debug!("Setting up workspace updates");
 

@@ -69,6 +69,10 @@
   border-radius: 1.25em;
   margin: 0.3em 0.25em 0em;
   padding: 0em 0.45em;
+  /* Symbolic tray icons are recolored to this `color`; without it the earlier
+   * `* { all: unset; }` reset leaves them dark-on-dark and effectively invisible
+   * (e.g. fcitx's input-keyboard-symbolic). */
+  color: #c0caf5;
 }
 
 .tray-item {
@@ -76,6 +80,7 @@
   min-height: 20px;
   min-width: 20px;
   padding: 0.1em;
+  color: #c0caf5;
 }
 
 .tray-item:hover {

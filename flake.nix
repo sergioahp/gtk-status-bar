@@ -45,6 +45,22 @@
             commonArgs
             // {
               inherit cargoArtifacts;
+
+              # Tray icons like fcitx's `input-keyboard-symbolic` and KDE Connect's
+              # `kdeconnectindicatordark` ship only as SVG. GTK renders themed SVGs
+              # through the gdk-pixbuf librsvg loader, which the bare Cargo binary
+              # has no way to find at runtime. wrapGAppsHook4 builds a loaders.cache
+              # (via GDK_PIXBUF_MODULE_FILE) and wires up XDG_DATA_DIRS/schemas, so
+              # SVG-only icons stop falling back to the "image-missing" glyph.
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+                pkgs.wrapGAppsHook4
+              ];
+              buildInputs = commonArgs.buildInputs ++ [
+                pkgs.librsvg
+                pkgs.gdk-pixbuf
+                pkgs.glib
+                pkgs.gsettings-desktop-schemas
+              ];
             }
           );
 

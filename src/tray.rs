@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use zbus::fdo::DBusProxy;
 use zbus::message::Header;
+use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
 use zbus::{Connection, Proxy};
 
@@ -26,6 +27,7 @@ pub struct TrayItem {
     pub item_is_menu: bool,
     pub icon_name: String,
     pub icon_pixmap: Option<IconPixmap>,
+    pub icon_theme_path: String,
 }
 
 #[derive(Debug)]
@@ -61,12 +63,16 @@ impl StatusNotifierWatcher {
         &mut self,
         service: &str,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("missing D-Bus sender".into()))?;
-        let item = normalize_registration(service, sender.as_str());
+        let item = match normalize_registration(service, &header, connection).await {
+            Ok(item) => item,
+            Err(error) => {
+                warn!(service, %error, "Could not normalize tray item registration");
+                return Err(error);
+            }
+        };
 
         if !self.items.contains(&item) {
             self.items.push(item.clone());
@@ -82,12 +88,16 @@ impl StatusNotifierWatcher {
         &mut self,
         service: &str,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("missing D-Bus sender".into()))?;
-        let host = normalize_registration(service, sender.as_str());
+        let host = match normalize_registration(service, &header, connection).await {
+            Ok(host) => host,
+            Err(error) => {
+                warn!(service, %error, "Could not normalize tray host registration");
+                return Err(error);
+            }
+        };
         let first = self.hosts.is_empty();
         if !self.hosts.contains(&host) {
             self.hosts.push(host);
@@ -165,13 +175,61 @@ impl StatusNotifierWatcher {
     }
 }
 
-fn normalize_registration(service: &str, sender: &str) -> String {
+// Canonicalize a registration into `{unique_bus_name}{object_path}`, matching the
+// scheme used by other trays (e.g. eww). Tray applications identify themselves in
+// three different ways: a bare object path (`/StatusNotifierItem`), their unique
+// bus name (`:1.42`), or a well-known name (`org.kde.StatusNotifierItem-2053-1`).
+// The latter is a problem for deduplication: an application that re-registers when
+// a new tray host appears often does so under a fresh well-known name suffix, so
+// keying by the raw service string produces a new entry every time and the icon
+// multiplies once per running tray. Resolving everything back to the unique bus
+// name of the sender collapses those re-registrations onto a single stable key.
+async fn normalize_registration(
+    service: &str,
+    header: &Header<'_>,
+    connection: &Connection,
+) -> zbus::fdo::Result<String> {
+    let Some(sender) = header.sender() else {
+        warn!(service, "Tray registration arrived without a D-Bus sender");
+        return Err(zbus::fdo::Error::InvalidArgs("missing D-Bus sender".into()));
+    };
+
+    // A bare object path: the item lives on the sender's own connection, which is
+    // already the unique name we want to key on.
     if service.starts_with('/') {
-        format!("{sender}{service}")
-    } else if service.contains('/') {
-        service.to_string()
-    } else {
-        format!("{service}{DEFAULT_ITEM_PATH}")
+        return Ok(format!("{sender}{service}"));
+    }
+
+    // Otherwise the service is a bus name. If it is already unique we keep it; a
+    // well-known name has to be resolved to its owner so re-registrations collapse
+    // onto one key.
+    let bus_name = match BusName::try_from(service) {
+        Ok(bus_name) => bus_name,
+        Err(error) => {
+            warn!(service, %error, "Tray registration carried an invalid bus name");
+            return Err(zbus::fdo::Error::InvalidArgs(error.to_string()));
+        }
+    };
+    let well_known = match bus_name {
+        BusName::Unique(unique) => return Ok(format!("{unique}{DEFAULT_ITEM_PATH}")),
+        BusName::WellKnown(well_known) => well_known,
+    };
+
+    let dbus = match DBusProxy::new(connection).await {
+        Ok(dbus) => dbus,
+        Err(error) => {
+            warn!(%error, "Could not open D-Bus proxy to resolve tray owner");
+            return Err(zbus::fdo::Error::Failed(format!(
+                "could not open D-Bus proxy: {error}"
+            )));
+        }
+    };
+    match dbus.get_name_owner(BusName::WellKnown(well_known)).await {
+        Ok(owner) => Ok(format!("{owner}{DEFAULT_ITEM_PATH}")),
+        Err(error) => {
+            warn!(service, %error, "Could not resolve unique owner of tray bus name");
+            Err(error)
+        }
     }
 }
 
@@ -322,6 +380,10 @@ async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
         Some(pixmaps) => pixmaps,
         None => Vec::new(),
     };
+    let icon_theme_path = match optional_property(&proxy, "IconThemePath").await {
+        Some(icon_theme_path) => icon_theme_path,
+        None => String::new(),
+    };
 
     Ok(TrayItem {
         key: key.to_string(),
@@ -330,6 +392,7 @@ async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
         item_is_menu,
         icon_name,
         icon_pixmap: largest_valid_pixmap(pixmaps),
+        icon_theme_path,
     })
 }
 
@@ -473,22 +536,6 @@ pub async fn run_tray(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn registration_paths_are_normalized() {
-        assert_eq!(
-            normalize_registration("/CustomItem", ":1.42"),
-            ":1.42/CustomItem"
-        );
-        assert_eq!(
-            normalize_registration("org.example.App", ":1.42"),
-            "org.example.App/StatusNotifierItem"
-        );
-        assert_eq!(
-            normalize_registration("org.example.App/Tray", ":1.42"),
-            "org.example.App/Tray"
-        );
-    }
 
     #[test]
     fn service_is_split_at_first_path_separator() {

@@ -232,11 +232,34 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
     let display = image.display();
     let icon_theme = gtk4::IconTheme::for_display(&display);
 
-    if !item.icon_name.is_empty() && Path::new(&item.icon_name).is_file() {
+    // Some trays (fcitx5, KDE/appindicator apps) ship their icons in a private
+    // directory and advertise it through IconThemePath rather than installing into
+    // a standard XDG theme. Register that directory so has_icon/set_icon_name can
+    // find the named icon; without this those items fall through to image-missing.
+    if !item.icon_theme_path.is_empty() {
+        let theme_path = Path::new(&item.icon_theme_path);
+        let already_searched = icon_theme
+            .search_path()
+            .iter()
+            .any(|existing| existing == theme_path);
+        if !already_searched {
+            debug!(path = item.icon_theme_path, "Adding tray icon theme path");
+            icon_theme.add_search_path(theme_path);
+        }
+    }
+
+    // An absolute path points straight at an icon file on disk.
+    if !item.icon_name.is_empty()
+        && Path::new(&item.icon_name).is_absolute()
+        && Path::new(&item.icon_name).is_file()
+    {
         image.set_from_file(Some(&item.icon_name));
         image.set_pixel_size(20);
         return;
     }
+    // A named icon is resolved through the theme. set_icon_name (rather than
+    // hand-loading a pixbuf) lets GTK recolor symbolic icons to the widget's CSS
+    // color, which is what keeps fctix's input-keyboard-symbolic visible.
     if !item.icon_name.is_empty() && icon_theme.has_icon(&item.icon_name) {
         image.set_icon_name(Some(&item.icon_name));
         image.set_pixel_size(20);

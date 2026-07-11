@@ -45,9 +45,13 @@ pub fn format_title_string(title: String, max_length: usize) -> String {
     if title.chars().count() <= max_length {
         title
     } else {
-        // reserve 1 for the …
-        let chars_left = (max_length / 2) - 1;
-        let chars_right = max_length - chars_left;
+        // Reserve 1 of the max_length chars for the …, split the rest between
+        // the two sides (right gets the odd char). The previous arithmetic
+        // reserved nothing — output was max_length + 1 chars — and underflowed
+        // for max_length < 2. saturating_sub keeps the degenerate max_length=0
+        // case at a bare "…" instead of panicking.
+        let chars_left = max_length.saturating_sub(1) / 2;
+        let chars_right = max_length.saturating_sub(1) - chars_left;
         let crop_from_idx = title.char_indices()
             .nth(chars_left)
             .map(|(idx, _)| idx)
@@ -272,17 +276,17 @@ mod tests {
         assert_eq!(format_title_string(String::new(), 64), "");
     }
 
-    // Long input gets cropped with an ellipsis in the middle. Concretely for
-    // max_length=10 the algorithm yields chars_left=4, chars_right=6, so we
-    // keep the first 4 and last 6 chars of the input and join with "…".
+    // Long input gets cropped with an ellipsis in the middle, and the output
+    // fits max_length exactly (the … counts toward the limit). For
+    // max_length=10: chars_left=4, chars_right=5.
     #[test]
     fn format_title_long_cropped_with_ellipsis() {
         let input = "1234567890ABCDEF".to_string();
         let out = format_title_string(input, 10);
-        assert_eq!(out, "1234…ABCDEF");
+        assert_eq!(out, "1234…BCDEF");
         assert!(out.contains('…'));
-        // Output is chars_left + 1 (…) + chars_right chars.
-        assert_eq!(out.chars().count(), 11);
+        // Output is chars_left + 1 (…) + chars_right = max_length chars.
+        assert_eq!(out.chars().count(), 10);
     }
 
     // Multi-byte UTF-8 must crop on character boundaries, not byte indices —
@@ -297,8 +301,19 @@ mod tests {
         let out = format_title_string(input, 10);
         // Should not panic, should contain the ellipsis.
         assert!(out.contains('…'));
-        // 4 emoji + … + 6 emoji = 11 chars
-        assert_eq!(out.chars().count(), 11);
+        // 4 emoji + … + 5 emoji = 10 chars
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    // Degenerate limits must not underflow usize (the old arithmetic panicked
+    // for max_length < 2 on any over-long input). max_length=1 crops to just
+    // the ellipsis; max_length=0 degrades to the same single char.
+    #[test]
+    fn format_title_tiny_max_length_does_not_underflow() {
+        assert_eq!(format_title_string("abcdef".to_string(), 1), "…");
+        assert_eq!(format_title_string("abcdef".to_string(), 0), "…");
+        // max_length=2: 0 left, 1 right.
+        assert_eq!(format_title_string("abcdef".to_string(), 2), "…f");
     }
 
     // format_workspace_name_from_string: empty name falls back to id.

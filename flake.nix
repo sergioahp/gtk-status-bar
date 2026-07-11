@@ -81,7 +81,28 @@
           };
 
           # `nix develop` drops you into a shell with Rust + rust-src.
-          devShells.default = pkgs.mkShell {
+          #
+          # The released binary is wrapped by wrapGAppsHook4, which points
+          # GDK_PIXBUF_MODULE_FILE at a loaders cache that includes the librsvg
+          # SVG decoder. A bare mkShell does not, so `cargo run` cannot decode
+          # SVG tray icons. Build the same combined cache here and export it so
+          # the dev environment matches `nix run`.
+          devShells.default = let
+            gdkPixbufLoaders = pkgs.runCommand "gdk-pixbuf-loaders-cache" {
+              nativeBuildInputs = [ pkgs.gdk-pixbuf pkgs.librsvg ];
+            } ''
+              mkdir -p $out/lib/gdk-pixbuf-2.0/2.10.0/loaders
+              for f in ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so; do
+                ln -sf "$f" $out/lib/gdk-pixbuf-2.0/2.10.0/loaders/
+              done
+              for f in ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so; do
+                ln -sf "$f" $out/lib/gdk-pixbuf-2.0/2.10.0/loaders/
+              done
+              ${pkgs.gdk-pixbuf.dev}/bin/gdk-pixbuf-query-loaders \
+                $out/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+                > $out/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
+            '';
+          in pkgs.mkShell {
             name = "rust-dev-shell";
             # Include Rust toolchain and required C libraries for GTK4
             nativeBuildInputs = [
@@ -96,12 +117,27 @@
               pkgs.pipewire
               # Clang for bindgen (required for PipeWire Rust bindings)
               pkgs.clang
+              # SVG gdk-pixbuf loader, needed so the dev shell can decode SVG
+              # tray icons the same way the wrapped `nix run` binary does.
+              pkgs.librsvg
             ];
 
             # Explicit for completeness; rust-analyzer finds it even without this.
             RUST_SRC_PATH = rustLibSrc;
             # Set LIBCLANG_PATH for bindgen
             LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
+
+            # Combined gdk-pixbuf loaders cache (incl. librsvg SVG decoder).
+            GDK_PIXBUF_MODULE_FILE = "${gdkPixbufLoaders}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache";
+            XDG_DATA_DIRS = "${pkgs.gtk4}/share:${pkgs.glib}/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.librsvg}/share:${pkgs.gdk-pixbuf}/share";
+
+            # Package setup hooks (gdk-pixbuf/librsvg) also export
+            # GDK_PIXBUF_MODULE_FILE at shell init, clobbering the attribute
+            # above. Re-export our combined cache last so SVG decoding works
+            # under `cargo run` exactly like the wrapped `nix run` binary.
+            shellHook = ''
+              export GDK_PIXBUF_MODULE_FILE=${gdkPixbufLoaders}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
+            '';
 
           };
 

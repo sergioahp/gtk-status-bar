@@ -9,6 +9,7 @@ mod bus;
 mod dbus;
 mod hypr;
 mod pw;
+mod tray;
 mod widgets;
 
 use anyhow::{Context, Result};

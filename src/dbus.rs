@@ -6,7 +6,7 @@
 // InterfacesAdded, InterfacesRemoved) and dispatches each incoming signal in a
 // big match over (path, interface, member). Local HashMap<path, BluetoothDevice>
 // is the source of truth for the bluetooth display string; battery state is
-// pushed through BATTERY_SENDER directly.
+// pushed through the Bus handle the monitor was spawned with.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ use zbus::zvariant;
 use zbus::zvariant::Value;
 use zbus_names::InterfaceName;
 
-use crate::bus;
+use crate::bus::Bus;
 
 // UNSAFE assumtion for now: assume Battery1 and MediaTransport1 are on the same object when they
 // exist, but a device could have just one of them or non.
@@ -148,7 +148,7 @@ fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
         })
 }
 
-fn process_battery_percentage(value: Value<'_>) {
+fn process_battery_percentage(value: Value<'_>, bus: &Bus) {
     if let Some(percentage) = f64::try_from(value)
         .inspect_err(|e| {
             error!("Failed to convert battery percentage to f64: {}", e);
@@ -157,7 +157,7 @@ fn process_battery_percentage(value: Value<'_>) {
     {
         info!("Battery percentage changed to {:.1}%", percentage);
         let battery_text = format!("🔋 {:.0}%", percentage);
-        if let Err(e) = bus::send_battery_update(battery_text) {
+        if let Err(e) = bus.send_battery_update(battery_text) {
             error!("Failed to send battery update: {}", e);
         }
     }
@@ -272,7 +272,7 @@ fn remove_if_idle(devices: &mut HashMap<String, BluetoothDevice>, path: &str) {
 // here, and seed the local HashMap so subsequent PropertiesChanged signals
 // have something to update. Early-returns replace `continue` in the parent
 // loop; logging stays at the same call sites it was before extraction.
-fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>, bus: &Bus) {
     info!("Dbus monitor: Received InterfacesAdded signal from ObjectManager");
     let body = msg.body();
     let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
@@ -409,7 +409,7 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
 
             // Send GUI update for all Bluetooth devices
             let display_string = compute_bluetooth_display_string(bluetooth_devices);
-            if let Err(e) = bus::send_bluetooth_update(display_string) {
+            if let Err(e) = bus.send_bluetooth_update(display_string) {
                 error!("Failed to send Bluetooth battery update: {}", e);
             }
         }
@@ -428,7 +428,7 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
 // Properties.PropertiesChanged: fired when the value of an existing property
 // flips. We branch on which interface owns the property — UPower.Device for
 // the laptop battery, Battery1/MediaControl1 for bluetooth devices.
-fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices: &mut HashMap<String, BluetoothDevice>, bus: &Bus) {
     info!("Dbus monitor: Received PropertiesChanged signal");
     let body = msg.body();
     let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
@@ -468,7 +468,7 @@ fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices:
             // Use dedicated function for percentage changes
             let percentage_key = Value::Str("Percentage".into());
             if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key) {
-                process_battery_percentage(percentage_value);
+                process_battery_percentage(percentage_value, bus);
             }
         }
         "org.bluez.Battery1" => {
@@ -497,7 +497,7 @@ fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices:
 
             // Send GUI update for all Bluetooth devices
             let display_string = compute_bluetooth_display_string(bluetooth_devices);
-            if let Err(e) = bus::send_bluetooth_update(display_string) {
+            if let Err(e) = bus.send_bluetooth_update(display_string) {
                 error!("Failed to send Bluetooth battery update: {}", e);
             }
         }
@@ -530,7 +530,7 @@ fn handle_properties_changed(msg: &zbus::Message, path: &str, bluetooth_devices:
 // interface flips a flag back to false; remove_if_idle drops the device once
 // every flag is false and the name is gone. UPower device removal currently
 // has no UI consequence (laptop battery comes and goes only via hardware).
-fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>) {
+fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMap<String, BluetoothDevice>, bus: &Bus) {
     info!("Dbus monitor: Received InterfacesRemoved signal from ObjectManager");
     let body = msg.body();
     let Ok(body_deserialized) = body.deserialize::<zvariant::Structure>() else {
@@ -610,7 +610,7 @@ fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMa
 
     // Send GUI update after any Bluetooth device removal
     let display_string = compute_bluetooth_display_string(bluetooth_devices);
-    if let Err(e) = bus::send_bluetooth_update(display_string) {
+    if let Err(e) = bus.send_bluetooth_update(display_string) {
         error!("Failed to send Bluetooth battery update after device removal: {}", e);
     }
 }
@@ -619,7 +619,7 @@ fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMa
 // and push one update through the bus. Silently no-ops on desktop systems
 // where the proxy/property is absent (logs at info!, not error!). Subsequent
 // updates arrive via the PropertiesChanged match rule + handle_properties_changed.
-async fn initial_battery_query(connection: &Connection) {
+async fn initial_battery_query(connection: &Connection, bus: &Bus) {
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
@@ -661,7 +661,7 @@ async fn initial_battery_query(connection: &Connection) {
             String::new()
         });
 
-    bus::send_battery_update(battery_text)
+    bus.send_battery_update(battery_text)
         .inspect_err(|e| error!("Failed to send battery update: {}", e))
         .ok();
 
@@ -683,6 +683,7 @@ async fn initial_battery_query(connection: &Connection) {
 async fn initial_bluetooth_scan(
     connection: &Connection,
     bluetooth_devices: &mut HashMap<String, BluetoothDevice>,
+    bus: &Bus,
 ) {
     let bluez_proxy = zbus::fdo::PropertiesProxy::new(
         connection,
@@ -773,7 +774,7 @@ async fn initial_bluetooth_scan(
             // Send initial GUI update for discovered devices
             let display_string = compute_bluetooth_display_string(bluetooth_devices);
             info!("Sent initial Bluetooth display: {}", display_string);
-            if let Err(e) = bus::send_bluetooth_update(display_string) {
+            if let Err(e) = bus.send_bluetooth_update(display_string) {
                 error!("Failed to send initial Bluetooth display update: {}", e);
             }
         }
@@ -782,7 +783,7 @@ async fn initial_bluetooth_scan(
 
             // Send "No BT" update even when no devices found
             let display_string = compute_bluetooth_display_string(bluetooth_devices);
-            if let Err(e) = bus::send_bluetooth_update(display_string) {
+            if let Err(e) = bus.send_bluetooth_update(display_string) {
                 error!("Failed to send 'No BT' display update: {}", e);
             }
         }
@@ -819,7 +820,7 @@ async fn register_match_rules(dbus_proxy: &fdo::DBusProxy<'_>) {
 // MessageStream ends (system bus crash, connection drop) or when the initial
 // connect/proxy setup fails. Same backoff policy as the Hyprland supervisors —
 // the failure modes are equivalent (IPC peer gone, transient setup error).
-pub async fn run_dbus_monitor_supervised() {
+pub async fn run_dbus_monitor_supervised(bus: Bus) {
     let max_delay = Duration::from_secs(60);
     let reset_threshold = Duration::from_secs(30);
     let mut delay = Duration::from_secs(1);
@@ -827,7 +828,7 @@ pub async fn run_dbus_monitor_supervised() {
     loop {
         let started = Instant::now();
         info!("🔌 Starting D-Bus monitor");
-        match monitor_dbus().await {
+        match monitor_dbus(&bus).await {
             Ok(()) => {
                 warn!("⚠️ D-Bus monitor returned cleanly (stream closed)");
             }
@@ -847,7 +848,7 @@ pub async fn run_dbus_monitor_supervised() {
     }
 }
 
-pub async fn monitor_dbus() -> Result<()> {
+pub async fn monitor_dbus(bus: &Bus) -> Result<()> {
     info!("Starting D-Bus monitoring task");
     let connection = Connection::system().await
         .map_err(|e| {
@@ -855,13 +856,13 @@ pub async fn monitor_dbus() -> Result<()> {
             e
         })?;
 
-    initial_battery_query(&connection).await;
+    initial_battery_query(&connection, bus).await;
 
     // TODO: Consider adding has_device1 field to BluetoothDevice struct for full symmetry
     // with has_battery and has_media fields. Current approach uses device_name presence
     // as proxy for Device1 interface availability.
     let mut bluetooth_devices: HashMap<String, BluetoothDevice> = HashMap::new();
-    initial_bluetooth_scan(&connection, &mut bluetooth_devices).await;
+    initial_bluetooth_scan(&connection, &mut bluetooth_devices, bus).await;
 
     // Subscribe to UPower property changes before creating MessageStream.
     // Without this subscription, the MessageStream receives no messages because
@@ -930,13 +931,13 @@ pub async fn monitor_dbus() -> Result<()> {
 
         match (interface, member) {
             ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded") => {
-                handle_interfaces_added(&msg, &mut bluetooth_devices);
+                handle_interfaces_added(&msg, &mut bluetooth_devices, bus);
             }
             ("org.freedesktop.DBus.Properties", "PropertiesChanged") => {
-                handle_properties_changed(&msg, path, &mut bluetooth_devices);
+                handle_properties_changed(&msg, path, &mut bluetooth_devices, bus);
             }
             ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
-                handle_interfaces_removed(&msg, &mut bluetooth_devices);
+                handle_interfaces_removed(&msg, &mut bluetooth_devices, bus);
             }
             _ => {
                 warn!("Dbus monitor: Unhandled signal: path: {}, interface: {}, member: {}", path, interface, member);

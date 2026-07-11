@@ -13,9 +13,7 @@ use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
 use hyprland::event_listener::AsyncEventListener;
 use tracing::{debug, error, info, warn};
 
-use crate::bus::{
-    self, WorkspaceUpdate,
-};
+use crate::bus::{Bus, WorkspaceUpdate};
 
 pub fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
     if name.is_empty() {
@@ -76,7 +74,7 @@ async fn get_initial_title_state() -> Result<String> {
     Ok(display_name)
 }
 
-async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData) -> Result<()> {
+async fn handle_workspace_change(workspace_data: hyprland::event_listener::WorkspaceEventData, bus: &Bus) -> Result<()> {
     debug!("Handling workspace change event");
 
     let display_name = format_workspace_name_from_type(&workspace_data.name, workspace_data.id);
@@ -87,10 +85,10 @@ async fn handle_workspace_change(workspace_data: hyprland::event_listener::Works
         name: display_name,
         id: workspace_data.id,
     };
-    bus::send_workspace_update(update)
+    bus.send_workspace_update(update)
 }
 
-async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEventData) -> Result<()> {
+async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEventData, bus: &Bus) -> Result<()> {
     debug!("Handling title change event");
 
     // If not active client skip event except if there is no active client, use title_data.address
@@ -102,14 +100,14 @@ async fn handle_title_change(title_data: hyprland::event_listener::WindowTitleEv
     if let Some(client) = active_client {
         let formatted_title = format_title_string(client.title, 64);
         debug!("Title changed to: {}", formatted_title);
-        bus::send_title_update(Some(formatted_title))
+        bus.send_title_update(Some(formatted_title))
     } else {
         debug!("No active client matches the title change event");
         Ok(())
     }
 }
 
-async fn handle_active_window_change(window_data: Option<hyprland::event_listener::WindowEventData>) -> Result<()> {
+async fn handle_active_window_change(window_data: Option<hyprland::event_listener::WindowEventData>, bus: &Bus) -> Result<()> {
     debug!("Handling active window change event");
 
     let formatted_title = match &window_data {
@@ -125,7 +123,7 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
 
     debug!("Active window changed, title: '{}'", formatted_title);
     debug!("Sending title update: '{}'", formatted_title);
-    bus::send_title_update(Some(formatted_title))
+    bus.send_title_update(Some(formatted_title))
 }
 
 // Supervised wrapper around setup_title_event_listener. The inner listener
@@ -139,7 +137,7 @@ async fn handle_active_window_change(window_data: Option<hyprland::event_listene
 //
 // This function never returns and is meant to be `tokio::spawn`ed from the
 // widget setup.
-pub async fn run_title_listener_supervised() {
+pub async fn run_title_listener_supervised(bus: Bus) {
     let max_delay = Duration::from_secs(60);
     let reset_threshold = Duration::from_secs(30);
     let mut delay = Duration::from_secs(1);
@@ -147,7 +145,7 @@ pub async fn run_title_listener_supervised() {
     loop {
         let started = Instant::now();
         info!("🔌 Starting title event listener");
-        match setup_title_event_listener().await {
+        match setup_title_event_listener(&bus).await {
             Ok(()) => {
                 warn!("⚠️ Title event listener returned cleanly (unexpected)");
             }
@@ -169,7 +167,7 @@ pub async fn run_title_listener_supervised() {
 
 // Same supervisor for the workspace listener; both consume Hyprland IPC and
 // fail in the same shapes, so the policy is identical.
-pub async fn run_workspace_listener_supervised() {
+pub async fn run_workspace_listener_supervised(bus: Bus) {
     let max_delay = Duration::from_secs(60);
     let reset_threshold = Duration::from_secs(30);
     let mut delay = Duration::from_secs(1);
@@ -177,7 +175,7 @@ pub async fn run_workspace_listener_supervised() {
     loop {
         let started = Instant::now();
         info!("🔌 Starting workspace event listener");
-        match setup_workspace_event_listener().await {
+        match setup_workspace_event_listener(&bus).await {
             Ok(()) => {
                 warn!("⚠️ Workspace event listener returned cleanly (unexpected)");
             }
@@ -197,7 +195,7 @@ pub async fn run_workspace_listener_supervised() {
     }
 }
 
-pub async fn setup_title_event_listener() -> Result<()> {
+pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     debug!("Setting up title event listener");
 
     let initial_state = get_initial_title_state().await
@@ -206,7 +204,7 @@ pub async fn setup_title_event_listener() -> Result<()> {
             "".to_string()
         });
 
-    if let Err(e) = bus::send_title_update(Some(initial_state)) {
+    if let Err(e) = bus.send_title_update(Some(initial_state)) {
         error!("Failed to send initial title update: {}", e);
     }
 
@@ -216,17 +214,23 @@ pub async fn setup_title_event_listener() -> Result<()> {
     // its older `async_closure!` macro produced exactly that shape (and is now
     // deprecated). Native async-closure syntax returns `impl Future`, which
     // doesn't satisfy the trait bound, so we spell the Box::pin out instead.
-    event_listener.add_window_title_changed_handler(|title_data| {
+    // Each handler clones the Bus twice: once into the closure (which must be
+    // Fn, callable many times) and once per invocation into the async move.
+    let title_bus = bus.clone();
+    event_listener.add_window_title_changed_handler(move |title_data| {
+        let bus = title_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_title_change(title_data).await {
+            if let Err(e) = handle_title_change(title_data, &bus).await {
                 error!("Failed to handle title change: {}", e);
             }
         })
     });
 
-    event_listener.add_active_window_changed_handler(|window_data| {
+    let window_bus = bus.clone();
+    event_listener.add_active_window_changed_handler(move |window_data| {
+        let bus = window_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_active_window_change(window_data).await {
+            if let Err(e) = handle_active_window_change(window_data, &bus).await {
                 error!("Failed to handle active window change: {}", e);
             }
         })
@@ -332,7 +336,7 @@ mod tests {
     }
 }
 
-pub async fn setup_workspace_event_listener() -> Result<()> {
+pub async fn setup_workspace_event_listener(bus: &Bus) -> Result<()> {
     debug!("Setting up workspace event listener");
 
     let workspace_result = hyprland::data::Workspace::get_active_async().await;
@@ -344,7 +348,7 @@ pub async fn setup_workspace_event_listener() -> Result<()> {
                 name: initial_state,
                 id: workspace.id,
             };
-            if let Err(e) = bus::send_workspace_update(update) {
+            if let Err(e) = bus.send_workspace_update(update) {
                 error!("Failed to send initial workspace update: {}", e);
             }
         }
@@ -354,7 +358,7 @@ pub async fn setup_workspace_event_listener() -> Result<()> {
                 name: "Workspace ?".to_string(),
                 id: 1, // WorkspaceId is just an i32
             };
-            if let Err(e) = bus::send_workspace_update(fallback_update) {
+            if let Err(e) = bus.send_workspace_update(fallback_update) {
                 error!("Failed to send fallback workspace update: {}", e);
             }
         }
@@ -362,9 +366,11 @@ pub async fn setup_workspace_event_listener() -> Result<()> {
 
     let mut event_listener = AsyncEventListener::new();
 
-    event_listener.add_workspace_changed_handler(|workspace_data| {
+    let workspace_bus = bus.clone();
+    event_listener.add_workspace_changed_handler(move |workspace_data| {
+        let bus = workspace_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_workspace_change(workspace_data).await {
+            if let Err(e) = handle_workspace_change(workspace_data, &bus).await {
                 error!("Failed to handle workspace change: {}", e);
             }
         })

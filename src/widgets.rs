@@ -1,9 +1,12 @@
 // Widget layer: builds the GTK4 bar tree and owns the consumer side of every
-// subsystem channel. Each setup_*_updates pairs an mpsc::UnboundedReceiver
-// drained on the GTK main thread (glib::spawn_future_local) with a tokio::spawn
-// that runs the producer. The producer comes from one of the subsystem modules
-// (hypr, dbus, pw); this module never knows what's inside the channel, only
-// that strings/structs come out and labels go in.
+// subsystem channel. Each setup_*_updates takes a receiver from Bus::new and
+// drains it onto its label on the GTK main thread (glib::spawn_future_local).
+// The producers are spawned separately by activate() with Bus clones, AFTER
+// all consumers here are wired — so a producer's first send can never race an
+// unwired channel. This module never knows what's inside the channel, only
+// that strings/structs come out and labels go in. The volume path is the
+// exception: pw's producer is a std::thread, so setup_volume_updates still
+// owns both the channel and the thread spawn.
 
 use anyhow::Result;
 use chrono::Local;
@@ -13,8 +16,8 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::bus::{BATTERY_SENDER, BLUETOOTH_SENDER, TITLE_SENDER, VolumeUpdate, WORKSPACE_SENDER};
-use crate::{dbus, hypr, pw};
+use crate::bus::{VolumeUpdate, WorkspaceUpdate};
+use crate::pw;
 
 // Widget constructors are infallible — gtk4::Label::new, add_css_class, and
 // set_halign all return (). The previous Result<…> signatures were speculative,
@@ -304,16 +307,11 @@ mod tests {
     }
 }
 
-pub fn setup_workspace_updates(label: gtk4::Label, title_widget: gtk4::Label) -> Result<()> {
+// setup_*_updates are infallible now that there is no global sender to
+// double-initialize — they only move a receiver into a glib-local drain task.
+
+pub fn setup_workspace_updates(mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>, label: gtk4::Label, title_widget: gtk4::Label) {
     debug!("Setting up workspace updates");
-
-    // Set up combined workspace updates
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    if WORKSPACE_SENDER.set(tx).is_err() {
-        return Err(anyhow::anyhow!("Failed to set global workspace sender"));
-    }
-
-    tokio::spawn(hypr::run_workspace_listener_supervised());
 
     // Handle combined workspace updates (name + ID) in single frame
     glib::spawn_future_local(async move {
@@ -324,20 +322,10 @@ pub fn setup_workspace_updates(label: gtk4::Label, title_widget: gtk4::Label) ->
             update_title_widget_workspace_color(&title_widget, update.id);
         }
     });
-
-    Ok(())
 }
 
-pub fn setup_title_updates(label: gtk4::Label) -> Result<()> {
+pub fn setup_title_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
     debug!("Setting up title updates");
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    if TITLE_SENDER.set(tx).is_err() {
-        return Err(anyhow::anyhow!("Failed to set global title sender"));
-    }
-
-    tokio::spawn(hypr::run_title_listener_supervised());
 
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
@@ -347,20 +335,10 @@ pub fn setup_title_updates(label: gtk4::Label) -> Result<()> {
             label.set_text(&update);
         }
     });
-
-    Ok(())
 }
 
-pub fn setup_battery_updates(label: gtk4::Label) -> Result<()> {
+pub fn setup_battery_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
     debug!("Setting up battery updates");
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    if BATTERY_SENDER.set(tx).is_err() {
-        return Err(anyhow::anyhow!("Failed to set global battery sender"));
-    }
-
-    tokio::spawn(dbus::run_dbus_monitor_supervised());
 
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
@@ -380,18 +358,10 @@ pub fn setup_battery_updates(label: gtk4::Label) -> Result<()> {
             }
         }
     });
-
-    Ok(())
 }
 
-pub fn setup_bluetooth_updates(label: gtk4::Label) -> Result<()> {
+pub fn setup_bluetooth_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
     debug!("Setting up Bluetooth battery updates");
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    if BLUETOOTH_SENDER.set(tx).is_err() {
-        return Err(anyhow::anyhow!("Failed to set global Bluetooth sender"));
-    }
 
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
@@ -409,8 +379,6 @@ pub fn setup_bluetooth_updates(label: gtk4::Label) -> Result<()> {
             }
         }
     });
-
-    Ok(())
 }
 
 pub fn setup_volume_updates(label: gtk4::Label) -> Result<()> {

@@ -1,9 +1,9 @@
 // Entry point: bring up tracing, the tokio runtime, the GTK application, and
-// wire each subsystem's GUI fan-out to its widget. Each setup_*_updates owns
-// (a) creating the channel, (b) installing the sender into the global bus, and
-// (c) spawning the producer task (which lives in the corresponding subsystem
-// module). Producer crashes are logged but currently not retried — see TODO in
-// each subsystem's setup_*_event_listener.
+// wire each subsystem's GUI fan-out to its widget. activate() creates one Bus,
+// hands each receiver to its widget drain (setup_*_updates), and only then
+// spawns the supervised producer tasks with Bus clones — so every consumer is
+// wired before the first producer can send. Producers that crash are restarted
+// with exponential backoff by their run_*_supervised wrappers.
 
 mod bus;
 mod dbus;
@@ -37,12 +37,21 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     window.set_child(Some(&bar));
     window.show();
 
+    let (bus, receivers) = bus::Bus::new();
+
     widgets::update_time_widget(time_widget);
-    widgets::setup_workspace_updates(workspace_widget, title_widget.clone())?;
-    widgets::setup_title_updates(title_widget)?;
-    widgets::setup_battery_updates(battery_widget)?;
-    widgets::setup_bluetooth_updates(bt_widget)?;
+    widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
+    widgets::setup_title_updates(receivers.title, title_widget);
+    widgets::setup_battery_updates(receivers.battery, battery_widget);
+    widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
     widgets::setup_volume_updates(volume_widget)?;
+
+    // Every consumer above is wired before any producer below spawns; the
+    // D-Bus monitor serves both the battery and bluetooth channels, so this
+    // ordering is what makes its first sends race-free.
+    tokio::spawn(hypr::run_workspace_listener_supervised(bus.clone()));
+    tokio::spawn(hypr::run_title_listener_supervised(bus.clone()));
+    tokio::spawn(dbus::run_dbus_monitor_supervised(bus));
 
     info!("Application activated successfully");
     Ok(())
@@ -63,8 +72,18 @@ fn main() -> Result<()> {
     let application = gtk4::Application::new(Some("sh.wmww.gtk-layer-example"), Default::default());
 
     application.connect_activate(|app| {
+        // GApplication re-fires activate on the primary instance when a second
+        // copy of the binary launches under the same application id. Rebuilding
+        // the bar would double-spawn every producer, so present the existing
+        // window instead. Previously this path failed the OnceLock sender init
+        // and exit(1)'d the healthy bar.
+        if let Some(window) = app.active_window() {
+            info!("Already activated; presenting existing window");
+            window.present();
+            return;
+        }
         if let Err(e) = activate(app) {
-            error!("Application activation failed: {}", e);
+            error!("Application activation failed: {:#}", e);
             std::process::exit(1);
         }
     });

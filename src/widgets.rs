@@ -228,6 +228,30 @@ fn argb_to_rgba(width: i32, height: i32, argb: &[u8]) -> Option<Vec<u8>> {
     Some(rgba)
 }
 
+// A themed icon that has_icon() reports as present can still be impossible to
+// draw: when the matching file needs a gdk-pixbuf loader that is not installed
+// (e.g. an SVG-only icon with no librsvg loader) GTK resolves it to nothing and
+// silently paints "image-missing". Reproduce the decode here so the failure is
+// observable in the logs and callers can fall back instead of showing a broken
+// glyph. Returns None when the icon is drawable, or Some(reason) when it is not.
+fn named_icon_render_error(icon_theme: &gtk4::IconTheme, name: &str, scale: i32) -> Option<String> {
+    let paintable = icon_theme.lookup_icon(
+        name,
+        &[],
+        20,
+        scale.max(1),
+        gtk4::TextDirection::None,
+        gtk4::IconLookupFlags::empty(),
+    );
+    let Some(path) = paintable.file().and_then(|file| file.path()) else {
+        return Some("theme entry resolved to no drawable file".to_string());
+    };
+    match gdk::Texture::from_file(&gtk4::gio::File::for_path(&path)) {
+        Ok(_texture) => None,
+        Err(error) => Some(format!("{} failed to decode: {error}", path.display())),
+    }
+}
+
 fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
     let display = image.display();
     let icon_theme = gtk4::IconTheme::for_display(&display);
@@ -259,11 +283,23 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
     }
     // A named icon is resolved through the theme. set_icon_name (rather than
     // hand-loading a pixbuf) lets GTK recolor symbolic icons to the widget's CSS
-    // color, which is what keeps fctix's input-keyboard-symbolic visible.
+    // color, which is what keeps fctix's input-keyboard-symbolic visible. Verify
+    // the icon can actually be drawn first: has_icon() only checks the theme
+    // index, so a missing pixbuf loader would otherwise fail silently.
     if !item.icon_name.is_empty() && icon_theme.has_icon(&item.icon_name) {
-        image.set_icon_name(Some(&item.icon_name));
-        image.set_pixel_size(20);
-        return;
+        match named_icon_render_error(&icon_theme, &item.icon_name, image.scale_factor()) {
+            None => {
+                image.set_icon_name(Some(&item.icon_name));
+                image.set_pixel_size(20);
+                return;
+            }
+            Some(reason) => warn!(
+                item = item.key,
+                icon = item.icon_name,
+                reason,
+                "Named tray icon is in the theme but cannot be drawn (missing gdk-pixbuf loader?); falling back"
+            ),
+        }
     }
 
     match &item.icon_pixmap {

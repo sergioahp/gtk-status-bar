@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::Result;
 use chrono::Local;
 use gtk4::gdk;
+use gtk4::gio::prelude::*;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::bus::{BATTERY_SENDER, BLUETOOTH_SENDER, TITLE_SENDER, VolumeUpdate, WORKSPACE_SENDER};
-use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayUpdate};
+use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUpdate};
 use crate::{dbus, hypr, pw, tray};
 
 // Widget constructors are infallible — gtk4::Label::new, add_css_class, and
@@ -358,11 +359,32 @@ fn create_tray_button(
 
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(0);
+    // Run in the capture phase and claim the sequence so the button's own
+    // internal GestureClick does not swallow the release — without this our
+    // `released` handler never fires and clicks do nothing.
+    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let key = item.key.clone();
     let item_is_menu = item.item_is_menu;
+    let menu_path = item.menu_path.clone();
     let commands = commands.clone();
     let button_for_click = button.clone();
+    let key_pressed = key.clone();
+    gesture.connect_pressed(move |gesture_pressed, _press_count, x, y| {
+        debug!(
+            item = key_pressed,
+            button = gesture_pressed.current_button(),
+            x, y,
+            "Tray button pressed"
+        );
+        gesture_pressed.set_state(gtk4::EventSequenceState::Claimed);
+    });
     gesture.connect_released(move |gesture, _press_count, x, y| {
+        debug!(
+            item = key,
+            button = gesture.current_button(),
+            x, y,
+            "Tray button released (item_is_menu={})", item_is_menu
+        );
         let action = match gesture.current_button() {
             1 if item_is_menu => TrayAction::ContextMenu,
             1 => TrayAction::Activate,
@@ -400,6 +422,7 @@ fn create_tray_button(
             action,
             x,
             y,
+            menu_path: menu_path.clone(),
         };
         if let Err(error) = commands.send(command) {
             warn!(item = key, %error, "Could not send tray click to D-Bus backend");
@@ -414,39 +437,180 @@ pub fn setup_tray_updates(container: gtk4::Box) {
     debug!("Setting up system tray updates");
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (menu_tx, mut menu_rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        if let Err(error) = tray::run_tray(update_tx, command_rx).await {
+        if let Err(error) = tray::run_tray(update_tx, command_rx, menu_tx).await {
             warn!(%error, "System tray backend stopped");
         }
     });
 
     glib::spawn_future_local(async move {
         let mut items: HashMap<String, (gtk4::Button, gtk4::Image)> = HashMap::new();
-        while let Some(update) = update_rx.recv().await {
-            match update {
-                TrayUpdate::Upsert(item) => match items.get(&item.key) {
-                    Some((button, image)) => update_tray_button(button, image, &item),
-                    None => {
-                        let (button, image) = create_tray_button(&item, &command_tx);
-                        container.append(&button);
-                        items.insert(item.key.clone(), (button, image));
-                        container.set_visible(true);
-                        info!(item = item.key, "Added system tray item");
+        loop {
+            tokio::select! {
+                update = update_rx.recv() => {
+                    let Some(update) = update else { break };
+                    match update {
+                        TrayUpdate::Upsert(item) => match items.get(&item.key) {
+                            Some((button, image)) => update_tray_button(button, image, &item),
+                            None => {
+                                let (button, image) = create_tray_button(&item, &command_tx);
+                                container.append(&button);
+                                items.insert(item.key.clone(), (button, image));
+                                container.set_visible(true);
+                                info!(item = item.key, "Added system tray item");
+                            }
+                        },
+                        TrayUpdate::Remove(key) => match items.remove(&key) {
+                            Some((button, _image)) => {
+                                container.remove(&button);
+                                container.set_visible(!items.is_empty());
+                                info!(item = key, "Removed system tray item");
+                            }
+                            None => debug!(item = key, "Ignoring removal of unknown tray item"),
+                        },
                     }
-                },
-                TrayUpdate::Remove(key) => match items.remove(&key) {
-                    Some((button, _image)) => {
-                        container.remove(&button);
-                        container.set_visible(!items.is_empty());
-                        info!(item = key, "Removed system tray item");
+                }
+                menu = menu_rx.recv() => {
+                    let Some(menu) = menu else { continue };
+                    match items.get(&menu.key) {
+                        Some((button, _image)) => show_tray_menu(button, &menu, &command_tx),
+                        None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
-                    None => debug!(item = key, "Ignoring removal of unknown tray item"),
-                },
+                }
             }
         }
         debug!("System tray UI update channel closed");
     });
+}
+
+// Render a tray item's dbusmenu as a native GTK popover. We build the menu from
+// concrete `Button` widgets (instead of `PopoverMenu::from_model`) because the
+// model-based popover constructs its widgets lazily and cannot measure its size
+// at `popup()` time, which makes it present at zero width/height on a
+// layer-shell surface. Concrete widgets measure immediately. Activating an entry
+// forwards the entry id back to the backend, which calls dbusmenu's `Event`.
+fn show_tray_menu(
+    button: &gtk4::Button,
+    menu: &TrayMenu,
+    command_tx: &mpsc::UnboundedSender<TrayCommand>,
+) {
+    let popover = gtk4::Popover::builder().build();
+    popover.set_parent(button);
+    popover.set_position(gtk4::PositionType::Bottom);
+    popover.set_has_arrow(false);
+
+    let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    box_.add_css_class("tray-menu");
+    debug!(
+        item = menu.key,
+        labels = ?menu.items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+        "Tray menu entry labels"
+    );
+    let popover_weak = gtk4::glib::object::WeakRef::new();
+    popover_weak.set(Some(&popover));
+    build_menu_box(&box_, &menu.items, command_tx, &menu.key, &popover_weak);
+
+    popover.set_child(Some(&box_));
+    debug!(
+        item = menu.key,
+        entries = menu.items.len(),
+        "Presenting tray menu"
+    );
+    popover.popup();
+}
+
+// Recursively fill `box_` with the dbusmenu entries. `popover_weak` is the top
+// popover so any leaf entry activation can close the whole menu, including
+// submenus (whose own activation bubbles up to the same popover).
+fn build_menu_box(
+    box_: &gtk4::Box,
+    items: &[TrayMenuItem],
+    command_tx: &mpsc::UnboundedSender<TrayCommand>,
+    key: &str,
+    popover_weak: &gtk4::glib::object::WeakRef<gtk4::Popover>,
+) {
+    for item in items {
+        if !item.visible {
+            continue;
+        }
+        if item.is_separator {
+            box_.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+            continue;
+        }
+
+        let entry = gtk4::Button::new();
+        entry.set_has_frame(false);
+        entry.add_css_class("tray-menu-item");
+        entry.set_hexpand(true);
+        if !item.enabled {
+            entry.set_sensitive(false);
+        }
+
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        content.set_margin_top(4);
+        content.set_margin_bottom(4);
+
+        let leading = match (&item.toggle_type, item.toggle_state) {
+            (Some(toggle_type), Some(true)) if toggle_type == "checkmark" => {
+                Some(gtk4::Image::from_icon_name("object-select-symbolic"))
+            }
+            (Some(toggle_type), Some(true)) if toggle_type == "radio" => {
+                Some(gtk4::Image::from_icon_name("media-record-symbolic"))
+            }
+            _ => item
+                .icon_name
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .map(|name| gtk4::Image::from_icon_name(name)),
+        };
+        if let Some(icon) = leading {
+            content.append(&icon);
+        }
+        let label = gtk4::Label::new(item.label.as_deref());
+        label.set_halign(gtk4::Align::Start);
+        label.set_hexpand(true);
+        content.append(&label);
+        entry.set_child(Some(&content));
+
+        if item.children.is_empty() {
+            let command_tx = command_tx.clone();
+            let key = key.to_string();
+            let popover_weak = popover_weak.clone();
+            let id = item.id;
+            entry.connect_clicked(move |_button| {
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+                let command = TrayCommand {
+                    key: key.clone(),
+                    action: TrayAction::MenuEvent(id),
+                    x: 0,
+                    y: 0,
+                    menu_path: String::new(),
+                };
+                if let Err(error) = command_tx.send(command) {
+                    warn!(item = key, %error, "Could not send tray menu event to backend");
+                }
+            });
+        } else {
+            let sub_popover = gtk4::Popover::builder().build();
+            sub_popover.set_parent(&entry);
+            sub_popover.set_position(gtk4::PositionType::Right);
+            let sub_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            sub_box.add_css_class("tray-menu");
+            build_menu_box(&sub_box, &item.children, command_tx, key, popover_weak);
+            sub_popover.set_child(Some(&sub_box));
+            entry.connect_clicked(move |_button| {
+                sub_popover.popup();
+            });
+        }
+
+        box_.append(&entry);
+    }
 }
 
 pub fn load_css_styles(window: &gtk4::ApplicationWindow) {

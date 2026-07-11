@@ -121,3 +121,34 @@ window.layer-bar {
 * {
   background-color: transparent;
 }
+
+/* Tray dropdown menus (native GTK popovers rendering com.canonical.dbusmenu).
+ * These must override the global `* { background-color: transparent }` reset so
+ * the menu is legible against the transparent bar. */
+.tray-menu {
+  background-color: rgba(30, 34, 50, 0.96);
+  color: #c0caf5;
+  border-radius: 0.5em;
+  padding: 0.25em;
+}
+
+.tray-menu label {
+  color: #c0caf5;
+}
+
+.tray-menu-item {
+  background-color: transparent;
+  color: #c0caf5;
+  border-radius: 0.35em;
+  padding: 0.1em 0.3em;
+}
+
+.tray-menu-item:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.tray-menu separator {
+  background-color: rgba(192, 202, 245, 0.25);
+  min-height: 1px;
+  margin: 0.2em 0.4em;
+}

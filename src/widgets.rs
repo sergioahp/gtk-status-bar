@@ -300,9 +300,12 @@ fn create_tray_button(
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(0);
     let key = item.key.clone();
+    let item_is_menu = item.item_is_menu;
     let commands = commands.clone();
+    let button_for_click = button.clone();
     gesture.connect_released(move |gesture, _press_count, x, y| {
         let action = match gesture.current_button() {
+            1 if item_is_menu => TrayAction::ContextMenu,
             1 => TrayAction::Activate,
             2 => TrayAction::SecondaryActivate,
             3 => TrayAction::ContextMenu,
@@ -311,11 +314,33 @@ fn create_tray_button(
                 return;
             }
         };
+        let (x, y) = match button_for_click.root() {
+            Some(root) => match root.downcast::<gtk4::Window>() {
+                Ok(root_window) => {
+                    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+                    match button_for_click.compute_point(&root_window, &point) {
+                        Some(point) => (point.x().round() as i32, point.y().round() as i32),
+                        None => {
+                            debug!(item = key, "Could not translate tray click to bar coordinates");
+                            (x.round() as i32, y.round() as i32)
+                        }
+                    }
+                }
+                Err(_root) => {
+                    debug!(item = key, "Tray root is not a GTK window");
+                    (x.round() as i32, y.round() as i32)
+                }
+            },
+            None => {
+                debug!(item = key, "Tray button has no root during click");
+                (x.round() as i32, y.round() as i32)
+            }
+        };
         let command = TrayCommand {
             key: key.clone(),
             action,
-            x: x.round() as i32,
-            y: y.round() as i32,
+            x,
+            y,
         };
         if let Err(error) = commands.send(command) {
             warn!(item = key, %error, "Could not send tray click to D-Bus backend");

@@ -23,6 +23,7 @@ pub struct TrayItem {
     pub key: String,
     pub title: String,
     pub status: String,
+    pub item_is_menu: bool,
     pub icon_name: String,
     pub icon_pixmap: Option<IconPixmap>,
 }
@@ -297,6 +298,10 @@ async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
         Some(status) => status,
         None => "Active".to_string(),
     };
+    let item_is_menu = match optional_property(&proxy, "ItemIsMenu").await {
+        Some(item_is_menu) => item_is_menu,
+        None => false,
+    };
 
     let needs_attention = status.eq_ignore_ascii_case("NeedsAttention");
     let icon_name_property = if needs_attention {
@@ -322,6 +327,7 @@ async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
         key: key.to_string(),
         title,
         status,
+        item_is_menu,
         icon_name,
         icon_pixmap: largest_valid_pixmap(pixmaps),
     })

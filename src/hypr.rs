@@ -15,6 +15,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::bus::{Bus, WorkspaceUpdate};
 
+// Special workspaces have negative ids in Hyprland, but the activespecial
+// event only carries names. Any negative id lands on the default arm of
+// get_workspace_color; -99 is pinned by a widgets test.
+const SPECIAL_WORKSPACE_COLOR_ID: hyprland::shared::WorkspaceId = -99;
+
 pub fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
     if name.is_empty() {
         return format!("Workspace {}", id);
@@ -372,6 +377,59 @@ pub async fn setup_workspace_event_listener(bus: &Bus) -> Result<()> {
         Box::pin(async move {
             if let Err(e) = handle_workspace_change(workspace_data, &bus).await {
                 error!("Failed to handle workspace change: {}", e);
+            }
+        })
+    });
+
+    // Special workspaces arrive via their own Hyprland event ("activespecial"),
+    // not the workspace-changed one, so without these two handlers toggling a
+    // special workspace left the bar frozen on the previous regular workspace
+    // (VM evidence run, item W3). hyprland-rs splits the event: non-empty name
+    // means a special workspace became visible, empty name (SpecialRemoved)
+    // means it was hidden again.
+    let special_bus = bus.clone();
+    event_listener.add_changed_special_handler(move |special_data| {
+        let bus = special_bus.clone();
+        Box::pin(async move {
+            // The event carries names only; special workspaces have negative
+            // ids in Hyprland, so use a sentinel that hits the default color
+            // arm of get_workspace_color.
+            let name = special_data.workspace_name
+                .strip_prefix("special:")
+                .unwrap_or(&special_data.workspace_name)
+                .to_string();
+            let update = WorkspaceUpdate {
+                name: format_workspace_name_from_type(
+                    &hyprland::shared::WorkspaceType::Special(Some(name)),
+                    SPECIAL_WORKSPACE_COLOR_ID,
+                ),
+                id: SPECIAL_WORKSPACE_COLOR_ID,
+            };
+            if let Err(e) = bus.send_workspace_update(update) {
+                error!("Failed to send special workspace update: {}", e);
+            }
+        })
+    });
+
+    let special_removed_bus = bus.clone();
+    event_listener.add_special_removed_handler(move |_monitor| {
+        let bus = special_removed_bus.clone();
+        Box::pin(async move {
+            // The special workspace was hidden; restore the regular active
+            // workspace (name + color) by querying it.
+            match hyprland::data::Workspace::get_active_async().await {
+                Ok(workspace) => {
+                    let update = WorkspaceUpdate {
+                        name: format_workspace_name_from_string(&workspace.name, workspace.id),
+                        id: workspace.id,
+                    };
+                    if let Err(e) = bus.send_workspace_update(update) {
+                        error!("Failed to send workspace update after special removal: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to query active workspace after special removal: {}", e);
+                }
             }
         })
     });

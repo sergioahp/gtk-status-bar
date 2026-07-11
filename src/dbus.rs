@@ -1,9 +1,10 @@
 // D-Bus subsystem: UPower battery + BlueZ bluetooth device tracking.
 //
-// monitor_dbus() opens one system-bus connection, does an initial query of the
-// battery and the bluetooth ObjectManager to seed the local HashMap, then
-// subscribes to three signal types via MatchRules (PropertiesChanged,
-// InterfacesAdded, InterfacesRemoved) and dispatches each incoming signal in a
+// monitor_dbus() opens one system-bus connection, registers four MatchRules
+// (UPower PropertiesChanged, bluez PropertiesChanged, InterfacesAdded,
+// InterfacesRemoved) and creates the MessageStream, then does an initial
+// query of the battery and the bluetooth ObjectManager to seed the local
+// HashMap, and dispatches each incoming signal in a
 // big match over (path, interface, member). Local HashMap<path, BluetoothDevice>
 // is the source of truth for the bluetooth display string; battery state is
 // pushed through the Bus handle the monitor was spawned with.
@@ -254,6 +255,24 @@ fn build_bluez_object_manager_match_rule(member: &'static str) -> Result<MatchRu
         .build())
 }
 
+// Battery1/MediaControl1 property changes on already-connected devices arrive
+// as Properties.PropertiesChanged from org.bluez — NOT via ObjectManager,
+// which only reports interface addition/removal. Without this rule the
+// bluetooth arms of handle_properties_changed were unreachable and a
+// connected device's battery percentage was frozen at its connect-time value
+// (confirmed live in the VM evidence run, item BT6).
+fn build_bluez_properties_match_rule() -> Result<MatchRule<'static>> {
+    Ok(MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.bluez")
+            .context("bluez properties rule: set sender")?
+        .interface("org.freedesktop.DBus.Properties")
+            .context("bluez properties rule: set interface")?
+        .member("PropertiesChanged")
+            .context("bluez properties rule: set member")?
+        .build())
+}
+
 // Drop a bluetooth device from the map if it has lost every interface that
 // would justify displaying it. We track devices via three booleans (battery,
 // media, has-name) and any signal that flips one to false has to check whether
@@ -312,6 +331,12 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
     debug!("Available interfaces in InterfacesAdded: {:?}",
            interfaces_and_properties.iter().map(|(k, _v)| k).collect::<Vec<_>>());
 
+    // One display update at the end covers every arm below. Previously only
+    // the Battery1 arm sent, so a Device1 name arriving in a later signal
+    // than its Battery1 left the 'D' fallback prefix on screen until the
+    // next battery event.
+    let mut map_changed = false;
+
     let mut device_name: Option<String> = None;
     match interfaces_and_properties.get::<_, Value>(&bluetooth_interface_key) {
         Ok(Some(Value::Dict(device1))) => {
@@ -350,6 +375,7 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
                 });
                 info!("Created new device {} with name: {:?}", object_path, device_name);
             }
+            map_changed = true;
         },
         Ok(Some(other)) => {
             error!("Device1 interface found but has unexpected type: {:?}", other);
@@ -381,6 +407,7 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
             });
             info!("Created new device {} with media capability via InterfacesAdded", object_path);
         }
+        map_changed = true;
     };
 
     match interfaces_and_properties.get::<_, Value>(&zvariant::Str::from("org.bluez.Battery1")) {
@@ -406,12 +433,7 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
                 });
                 info!("Created new device {} with battery: {:?}% via InterfacesAdded", object_path, percentage);
             }
-
-            // Send GUI update for all Bluetooth devices
-            let display_string = compute_bluetooth_display_string(bluetooth_devices);
-            if let Err(e) = bus.send_bluetooth_update(display_string) {
-                error!("Failed to send Bluetooth battery update: {}", e);
-            }
+            map_changed = true;
         }
     };
 
@@ -422,6 +444,14 @@ fn handle_interfaces_added(msg: &zbus::Message, bluetooth_devices: &mut HashMap<
         .flatten() {
         info!("Dbus monitor: Battery device added");
         // Possibly refresh battery information or re-subscribe if needed
+    }
+
+    // Send one GUI update covering whatever the arms above changed
+    if map_changed {
+        let display_string = compute_bluetooth_display_string(bluetooth_devices);
+        if let Err(e) = bus.send_bluetooth_update(display_string) {
+            error!("Failed to send Bluetooth display update: {}", e);
+        }
     }
 }
 
@@ -592,10 +622,15 @@ fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMa
             }
             "org.bluez.Device1" => {
                 info!("Dbus monitor: Bluetooth Device1 interface removed from {}", object_path);
-                if let Some(device) = bluetooth_devices.get_mut(object_path_str) {
-                    device.device_name = None;
-                    info!("Cleared device name for {}", object_path);
-                    remove_if_idle(bluetooth_devices, object_path_str);
+                // Device1 IS the device: BlueZ only removes it when the whole
+                // object goes away, and a Battery1/MediaControl1 reading
+                // without its device is meaningless. Drop the entry outright
+                // instead of merely clearing the name — a removal signal that
+                // doesn't list every interface explicitly used to leave ghost
+                // battery entries ("D80") on screen forever (VM evidence run,
+                // item BT7).
+                if bluetooth_devices.remove(object_path_str).is_some() {
+                    info!("Removed device {} from HashMap (Device1 gone)", object_path);
                 } else {
                     debug!("Device1 interface removed from device not in HashMap: {}", object_path);
                 }
@@ -616,13 +651,24 @@ fn handle_interfaces_removed(msg: &zbus::Message, bluetooth_devices: &mut HashMa
 }
 
 // Initial UPower battery query: read Percentage + State for the BAT0 device
-// and push one update through the bus. Silently no-ops on desktop systems
-// where the proxy/property is absent (logs at info!, not error!). Subsequent
-// updates arrive via the PropertiesChanged match rule + handle_properties_changed.
+// and push one update through the bus. On desktop systems where the
+// proxy/property is absent this sends the empty string (hides the widget,
+// logged at info!, not error!). Subsequent updates arrive via the
+// PropertiesChanged match rule + handle_properties_changed.
+//
+// Every early return sends SOMETHING: the supervisor re-runs this per
+// reconnect, and bailing silently would leave the widget frozen on
+// pre-outage data (stale "80%" while the service is actually unreachable).
 async fn initial_battery_query(connection: &Connection, bus: &Bus) {
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
+
+    let send_empty = || {
+        bus.send_battery_update(String::new())
+            .inspect_err(|e| error!("Failed to send empty battery update: {:#}", e))
+            .ok();
+    };
 
     // will .ok() later
     let properties_proxy = zbus::fdo::PropertiesProxy::new(
@@ -630,14 +676,20 @@ async fn initial_battery_query(connection: &Connection, bus: &Bus) {
         "org.freedesktop.UPower",
         "/org/freedesktop/UPower/devices/battery_BAT0",
     ).await
-    .inspect_err(|_e| error!("different style to construction battery_BAT0 proxy failed"))
+    .inspect_err(|e| error!("Failed constructing battery_BAT0 properties proxy: {:#}", e))
     .ok();
 
-    let Some(proxy) = properties_proxy else { return };
+    let Some(proxy) = properties_proxy else {
+        send_empty();
+        return;
+    };
     let Some(battery_interface_name) = InterfaceName::try_from("org.freedesktop.UPower.Device")
         .inspect_err(|e| error!("Failed to create interface name: {}", e))
         .ok()
-    else { return };
+    else {
+        send_empty();
+        return;
+    };
 
     let battery_percentage = proxy.get(battery_interface_name.clone(), "Percentage").await
         .inspect_err(|e|
@@ -685,21 +737,18 @@ async fn initial_bluetooth_scan(
     bluetooth_devices: &mut HashMap<String, BluetoothDevice>,
     bus: &Bus,
 ) {
-    let bluez_proxy = zbus::fdo::PropertiesProxy::new(
-        connection,
-        "org.bluez",
-        "/", // ObjectManager path
-    ).await
-    .inspect_err(|e| error!("Failed to create Bluez ObjectManager proxy: {}", e))
-    .ok();
-
-    let Some(_bluez_proxy) = bluez_proxy else { return };
-
-    // Use ObjectManager to get all managed objects
+    // As with initial_battery_query: every early return sends the current
+    // (empty) display so a reconnect can't leave stale devices on screen.
     let object_manager = zbus::fdo::ObjectManagerProxy::new(connection, "org.bluez", "/").await
         .inspect_err(|e| error!("Failed to create Bluez ObjectManager: {}", e))
         .ok();
-    let Some(object_manager) = object_manager else { return };
+    let Some(object_manager) = object_manager else {
+        let display_string = compute_bluetooth_display_string(bluetooth_devices);
+        bus.send_bluetooth_update(display_string)
+            .inspect_err(|e| error!("Failed to send empty Bluetooth display update: {:#}", e))
+            .ok();
+        return;
+    };
 
     match object_manager.get_managed_objects().await {
         Ok(objects) => {
@@ -790,29 +839,26 @@ async fn initial_bluetooth_scan(
     }
 }
 
-// Register the three D-Bus match rules we care about. If any one fails to
-// build or to register we log + carry on — the other rules will still
-// produce useful signals, and run_dbus_monitor_supervised will retry the
-// whole monitor if the stream later dies.
-async fn register_match_rules(dbus_proxy: &fdo::DBusProxy<'_>) {
+// Register the four D-Bus match rules we care about. Failures propagate:
+// a monitor whose subscriptions didn't register would sit on a perfectly
+// healthy MessageStream that never yields a signal — indistinguishable from
+// "no events" — and the supervisor would never know to retry. Returning Err
+// makes run_dbus_monitor_supervised treat it like any other crash and
+// reconnect with backoff.
+async fn register_match_rules(dbus_proxy: &fdo::DBusProxy<'_>) -> Result<()> {
     for (label, rule_result) in [
         ("battery", build_battery_match_rule()),
+        ("bluez PropertiesChanged", build_bluez_properties_match_rule()),
         ("bluez InterfacesAdded", build_bluez_object_manager_match_rule("InterfacesAdded")),
         ("bluez InterfacesRemoved", build_bluez_object_manager_match_rule("InterfacesRemoved")),
     ] {
-        match rule_result {
-            Err(e) => {
-                error!("❌ Failed to build {} match rule: {:#}", label, e);
-            }
-            Ok(rule) => {
-                if let Err(e) = dbus_proxy.add_match_rule(rule).await {
-                    error!("❌ Failed to register {} match rule: {}", label, e);
-                } else {
-                    debug!("🔌 Registered {} match rule", label);
-                }
-            }
-        }
+        let rule = rule_result
+            .with_context(|| format!("build {} match rule", label))?;
+        dbus_proxy.add_match_rule(rule).await
+            .with_context(|| format!("register {} match rule", label))?;
+        debug!("🔌 Registered {} match rule", label);
     }
+    Ok(())
 }
 
 // Supervised wrapper around monitor_dbus. The inner loop holds one D-Bus
@@ -856,6 +902,32 @@ pub async fn monitor_dbus(bus: &Bus) -> Result<()> {
             e
         })?;
 
+    // Subscribe FIRST, then take the initial snapshots. The reverse order
+    // (snapshot, then subscribe) loses any state change that lands between
+    // the two: the signal is discarded because no match rule exists yet, and
+    // the monitor keeps the stale snapshot until the next unrelated change.
+    // The supervisor re-runs this function on every reconnect, so that loss
+    // window would recur per outage. With rules registered and the stream
+    // created up front, signals arriving during the seeding below are queued
+    // in the stream and dispatched once the loop starts.
+    //
+    // Note: ObjectManagerProxy only reports interface additions/removals, not property changes.
+    // As per https://openrr.github.io/openrr/zbus/fdo/struct.ObjectManagerProxy.html:
+    // "Changes to properties on existing interfaces are not reported using this interface"
+    // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
+    let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
+    register_match_rules(&dbus_proxy).await?;
+
+    // from the connection, we get the dbus_proxy, we add the rules to the proxy
+    // which makes it so that when we make a stream from that connection
+    // we can think of the rules being *inside* that connection.
+    //
+    // Some code online seems to use select!, which merges multiple async sources
+    // into one. We should think if select! + multiple streams is better. The
+    // current approach is: one stream, multiple match rules, branch on event
+    // shape in the loop below.
+    let mut stream = zbus::MessageStream::from(&connection);
+
     initial_battery_query(&connection, bus).await;
 
     // TODO: Consider adding has_device1 field to BluetoothDevice struct for full symmetry
@@ -864,25 +936,6 @@ pub async fn monitor_dbus(bus: &Bus) -> Result<()> {
     let mut bluetooth_devices: HashMap<String, BluetoothDevice> = HashMap::new();
     initial_bluetooth_scan(&connection, &mut bluetooth_devices, bus).await;
 
-    // Subscribe to UPower property changes before creating MessageStream.
-    // Without this subscription, the MessageStream receives no messages because
-    // D-Bus requires explicit signal subscriptions via match rules.
-    // Note: ObjectManagerProxy only reports interface additions/removals, not property changes.
-    // As per https://openrr.github.io/openrr/zbus/fdo/struct.ObjectManagerProxy.html:
-    // "Changes to properties on existing interfaces are not reported using this interface"
-    // Therefore we must subscribe to org.freedesktop.DBus.Properties.PropertiesChanged.
-    let dbus_proxy = fdo::DBusProxy::new(&connection).await?;
-    register_match_rules(&dbus_proxy).await;
-
-    // from the connection, we get the dbus_proxy, we add the rules to the proxy
-    // which makes it so that when we do connection.into() to get a stream
-    // we can think of the rules being *inside* that connection.
-    //
-    // Some code online seems to use select!, which merges multiple async sources
-    // into one. We should think if select! + multiple streams is better. The
-    // current approach is: one stream, multiple match rules, branch on event
-    // shape in the loop below.
-    let mut stream: zbus::MessageStream = connection.into();
     info!("Dbus monitor: Starting to listen for D-Bus messages");
 
     while let Some(msg) = stream.next().await {

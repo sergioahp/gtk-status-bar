@@ -133,6 +133,37 @@ impl StatusNotifierWatcher {
     async fn status_notifier_host_unregistered(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
+impl StatusNotifierWatcher {
+    async fn remove_owner(&mut self, owner: &str, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        let removed_items: Vec<String> = self
+            .items
+            .iter()
+            .filter(|service| service_owner(service) == Some(owner))
+            .cloned()
+            .collect();
+        if !removed_items.is_empty() {
+            self.items
+                .retain(|service| service_owner(service) != Some(owner));
+            for service in removed_items {
+                Self::status_notifier_item_unregistered(emitter, &service).await?;
+                info!(item = service, "Status notifier item disappeared");
+            }
+            self.registered_status_notifier_items_changed(emitter)
+                .await?;
+        }
+
+        let had_hosts = !self.hosts.is_empty();
+        self.hosts
+            .retain(|service| service_owner(service) != Some(owner));
+        if had_hosts && self.hosts.is_empty() {
+            Self::status_notifier_host_unregistered(emitter).await?;
+            self.is_status_notifier_host_registered_changed(emitter)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 fn normalize_registration(service: &str, sender: &str) -> String {
     if service.starts_with('/') {
         format!("{sender}{service}")
@@ -150,6 +181,48 @@ pub fn split_service(service: &str) -> Result<(&str, &str)> {
     Ok((&service[..slash], &service[slash..]))
 }
 
+fn service_owner(service: &str) -> Option<&str> {
+    match service.find('/') {
+        Some(slash) => Some(&service[..slash]),
+        None => None,
+    }
+}
+
+async fn monitor_watcher_owners(connection: Connection) -> Result<()> {
+    let dbus = DBusProxy::new(&connection).await?;
+    let mut owner_changes = dbus.receive_name_owner_changed().await?;
+    while let Some(change) = owner_changes.next().await {
+        let args = match change.args() {
+            Ok(args) => args,
+            Err(error) => {
+                warn!(%error, "Could not decode D-Bus name owner change");
+                continue;
+            }
+        };
+        if args.new_owner.is_some() {
+            continue;
+        }
+
+        let interface = match connection
+            .object_server()
+            .interface::<_, StatusNotifierWatcher>(WATCHER_PATH)
+            .await
+        {
+            Ok(interface) => interface,
+            Err(error) => {
+                warn!(%error, "Could not access local StatusNotifierWatcher state");
+                return Ok(());
+            }
+        };
+        let emitter = interface.signal_emitter().clone();
+        let mut watcher = interface.get_mut().await;
+        if let Err(error) = watcher.remove_owner(args.name.as_str(), &emitter).await {
+            warn!(owner = %args.name, %error, "Could not remove vanished tray owner");
+        }
+    }
+    Ok(())
+}
+
 async fn ensure_watcher(connection: &Connection) -> Result<()> {
     let dbus = DBusProxy::new(connection).await?;
     if dbus.name_has_owner(WATCHER_NAME.try_into()?).await? {
@@ -163,7 +236,15 @@ async fn ensure_watcher(connection: &Connection) -> Result<()> {
         .await
         .context("export StatusNotifierWatcher")?;
     match connection.request_name(WATCHER_NAME).await {
-        Ok(()) => info!("Serving StatusNotifierWatcher for tray applications"),
+        Ok(()) => {
+            info!("Serving StatusNotifierWatcher for tray applications");
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                if let Err(error) = monitor_watcher_owners(connection).await {
+                    warn!(%error, "StatusNotifierWatcher owner monitor stopped");
+                }
+            });
+        }
         Err(zbus::Error::NameTaken) => info!("Another StatusNotifierWatcher won startup race"),
         Err(error) => return Err(error).context("request StatusNotifierWatcher bus name"),
     }
@@ -411,6 +492,16 @@ mod tests {
             (":1.42", "/StatusNotifierItem")
         );
         assert!(split_service(":1.42").is_err());
+    }
+
+    #[test]
+    fn service_owner_uses_destination_prefix() {
+        assert_eq!(service_owner(":1.42/StatusNotifierItem"), Some(":1.42"));
+        assert_eq!(
+            service_owner("org.example.App/Tray"),
+            Some("org.example.App")
+        );
+        assert_eq!(service_owner("org.example.App"), None);
     }
 
     #[test]

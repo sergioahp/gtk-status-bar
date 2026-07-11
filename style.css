@@ -64,6 +64,32 @@
   min-width: 3em;
 }
 
+.tray-widget {
+  background-color: rgba(36, 40, 59, 0.72);
+  border-radius: 1.25em;
+  margin: 0.3em 0.25em 0em;
+  padding: 0em 0.45em;
+}
+
+.tray-item {
+  border-radius: 0.5em;
+  min-height: 20px;
+  min-width: 20px;
+  padding: 0.1em;
+}
+
+.tray-item:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.tray-item.needs-attention {
+  background-color: rgba(247, 118, 142, 0.4);
+}
+
+.tray-item.passive {
+  opacity: 0.72;
+}
+
 /* Fixed-width containers for perfect centering */
 .left-container {
   min-width: 20em;

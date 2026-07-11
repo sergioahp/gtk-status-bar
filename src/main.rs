@@ -33,12 +33,21 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     widgets::load_css_styles(&window);
     widgets::configure_layer_shell(&window);
 
-    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) =
-        widgets::create_experimental_bar();
+    let (
+        bar,
+        tray_widget,
+        bt_widget,
+        volume_widget,
+        battery_widget,
+        time_widget,
+        workspace_widget,
+        title_widget,
+    ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
 
     widgets::update_time_widget(time_widget);
+    widgets::setup_tray_updates(tray_widget);
     widgets::setup_workspace_updates(workspace_widget, title_widget.clone())?;
     widgets::setup_title_updates(title_widget)?;
     widgets::setup_battery_updates(battery_widget)?;

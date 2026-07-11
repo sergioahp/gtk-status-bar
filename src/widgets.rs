@@ -5,16 +5,21 @@
 // (hypr, dbus, pw); this module never knows what's inside the channel, only
 // that strings/structs come out and labels go in.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use anyhow::Result;
 use chrono::Local;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bus::{BATTERY_SENDER, BLUETOOTH_SENDER, TITLE_SENDER, VolumeUpdate, WORKSPACE_SENDER};
-use crate::{dbus, hypr, pw};
+use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayUpdate};
+use crate::{dbus, hypr, pw, tray};
 
 // Widget constructors are infallible — gtk4::Label::new, add_css_class, and
 // set_halign all return (). The previous Result<…> signatures were speculative,
@@ -87,6 +92,14 @@ pub fn create_battery_widget() -> gtk4::Label {
     label
 }
 
+pub fn create_tray_widget() -> gtk4::Box {
+    debug!("Creating system tray widget");
+    let tray = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    tray.add_css_class("tray-widget");
+    tray.set_visible(false);
+    tray
+}
+
 pub fn create_left_group() -> (gtk4::Box, gtk4::Label) {
     debug!("Creating left group");
 
@@ -131,7 +144,7 @@ pub fn create_center_group() -> (gtk4::Box, gtk4::Label, gtk4::Box) {
     (center_spacer_start, title_widget, center_spacer_end)
 }
 
-pub fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
+pub fn create_right_group() -> (gtk4::Box, gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
     debug!("Creating right group");
 
     let right_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -145,6 +158,9 @@ pub fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label
     let right_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
+
+    let tray_widget = create_tray_widget();
+    right_group.append(&tray_widget);
 
     let bt_widget = create_bt_widget();
     right_group.append(&bt_widget);
@@ -161,10 +177,10 @@ pub fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label
     right_container.append(&right_spacer);
     right_container.append(&right_group);
 
-    (right_container, bt_widget, volume_widget, battery_widget, time_widget)
+    (right_container, tray_widget, bt_widget, volume_widget, battery_widget, time_widget)
 }
 
-pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
+pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
     debug!("Creating experimental bar");
 
     let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -173,7 +189,7 @@ pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::
 
     let (left_group, workspace_widget) = create_left_group();
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group();
-    let (right_group, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group();
+    let (right_group, tray_widget, bt_widget, volume_widget, battery_widget, time_widget) = create_right_group();
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -181,7 +197,172 @@ pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    (main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget)
+    (main_box, tray_widget, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget)
+}
+
+fn argb_to_rgba(width: i32, height: i32, argb: &[u8]) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        warn!(width, height, "Ignoring tray pixmap with invalid dimensions");
+        return None;
+    }
+
+    let expected_len = match (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    {
+        Some(expected_len) => expected_len,
+        None => {
+            warn!(width, height, "Tray pixmap dimensions overflowed");
+            return None;
+        }
+    };
+    if argb.len() != expected_len {
+        warn!(width, height, actual = argb.len(), expected_len, "Ignoring malformed tray pixmap");
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(argb.len());
+    for pixel in argb.chunks_exact(4) {
+        rgba.extend_from_slice(&[pixel[1], pixel[2], pixel[3], pixel[0]]);
+    }
+    Some(rgba)
+}
+
+fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
+    let display = image.display();
+    let icon_theme = gtk4::IconTheme::for_display(&display);
+
+    if !item.icon_name.is_empty() && Path::new(&item.icon_name).is_file() {
+        image.set_from_file(Some(&item.icon_name));
+        image.set_pixel_size(20);
+        return;
+    }
+    if !item.icon_name.is_empty() && icon_theme.has_icon(&item.icon_name) {
+        image.set_icon_name(Some(&item.icon_name));
+        image.set_pixel_size(20);
+        return;
+    }
+
+    match &item.icon_pixmap {
+        Some((width, height, argb)) => match argb_to_rgba(*width, *height, argb) {
+            Some(rgba) => {
+                let bytes = glib::Bytes::from_owned(rgba);
+                let texture = gdk::MemoryTexture::new(
+                    *width,
+                    *height,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &bytes,
+                    (*width as usize) * 4,
+                );
+                image.set_paintable(Some(&texture));
+                image.set_pixel_size(20);
+            }
+            None => image.set_icon_name(Some("image-missing")),
+        },
+        None => {
+            warn!(item = item.key, icon_name = item.icon_name, "Tray item has no usable icon");
+            image.set_icon_name(Some("image-missing"));
+            image.set_pixel_size(20);
+        }
+    }
+}
+
+fn update_tray_button(button: &gtk4::Button, image: &gtk4::Image, item: &TrayItem) {
+    for class in ["active", "passive", "needs-attention"] {
+        button.remove_css_class(class);
+    }
+    let status_class = match item.status.as_str() {
+        status if status.eq_ignore_ascii_case("NeedsAttention") => "needs-attention",
+        status if status.eq_ignore_ascii_case("Passive") => "passive",
+        _ => "active",
+    };
+    button.add_css_class(status_class);
+    button.set_tooltip_text(Some(if item.title.is_empty() {
+        &item.key
+    } else {
+        &item.title
+    }));
+    update_tray_image(image, item);
+}
+
+fn create_tray_button(
+    item: &TrayItem,
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+) -> (gtk4::Button, gtk4::Image) {
+    let button = gtk4::Button::new();
+    button.add_css_class("tray-item");
+    button.set_focusable(false);
+
+    let image = gtk4::Image::new();
+    button.set_child(Some(&image));
+    update_tray_button(&button, &image, item);
+
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(0);
+    let key = item.key.clone();
+    let commands = commands.clone();
+    gesture.connect_released(move |gesture, _press_count, x, y| {
+        let action = match gesture.current_button() {
+            1 => TrayAction::Activate,
+            2 => TrayAction::SecondaryActivate,
+            3 => TrayAction::ContextMenu,
+            button => {
+                debug!(button, item = key, "Ignoring unsupported tray mouse button");
+                return;
+            }
+        };
+        let command = TrayCommand {
+            key: key.clone(),
+            action,
+            x: x.round() as i32,
+            y: y.round() as i32,
+        };
+        if let Err(error) = commands.send(command) {
+            warn!(item = key, %error, "Could not send tray click to D-Bus backend");
+        }
+    });
+    button.add_controller(gesture);
+
+    (button, image)
+}
+
+pub fn setup_tray_updates(container: gtk4::Box) {
+    debug!("Setting up system tray updates");
+    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        if let Err(error) = tray::run_tray(update_tx, command_rx).await {
+            warn!(%error, "System tray backend stopped");
+        }
+    });
+
+    glib::spawn_future_local(async move {
+        let mut items: HashMap<String, (gtk4::Button, gtk4::Image)> = HashMap::new();
+        while let Some(update) = update_rx.recv().await {
+            match update {
+                TrayUpdate::Upsert(item) => match items.get(&item.key) {
+                    Some((button, image)) => update_tray_button(button, image, &item),
+                    None => {
+                        let (button, image) = create_tray_button(&item, &command_tx);
+                        container.append(&button);
+                        items.insert(item.key.clone(), (button, image));
+                        container.set_visible(true);
+                        info!(item = item.key, "Added system tray item");
+                    }
+                },
+                TrayUpdate::Remove(key) => match items.remove(&key) {
+                    Some((button, _image)) => {
+                        container.remove(&button);
+                        container.set_visible(!items.is_empty());
+                        info!(item = key, "Removed system tray item");
+                    }
+                    None => debug!(item = key, "Ignoring removal of unknown tray item"),
+                },
+            }
+        }
+        debug!("System tray UI update channel closed");
+    });
 }
 
 pub fn load_css_styles(window: &gtk4::ApplicationWindow) {
@@ -301,6 +482,20 @@ mod tests {
         let len_before = colors.len();
         colors.dedup();
         assert_eq!(colors.len(), len_before, "expected all distinct colors");
+    }
+
+    #[test]
+    fn tray_pixmap_argb_is_converted_to_rgba() {
+        assert_eq!(
+            argb_to_rgba(2, 1, &[255, 1, 2, 3, 128, 4, 5, 6]),
+            Some(vec![1, 2, 3, 255, 4, 5, 6, 128])
+        );
+    }
+
+    #[test]
+    fn tray_pixmap_rejects_invalid_dimensions_and_length() {
+        assert_eq!(argb_to_rgba(0, 1, &[]), None);
+        assert_eq!(argb_to_rgba(1, 1, &[0, 1, 2]), None);
     }
 }
 

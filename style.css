@@ -101,9 +101,20 @@
   background-color: rgba(122, 162, 247, 0.35);
 }
 
-/* The pre-selected tray icon at level 0 (which icon H/L navigation is on). */
+/* Warm means level zero: h/l move between tray icons. The cooler nav-focus
+ * color above means j/k and h/l are operating inside the open menu tree. */
+.tray-widget.nav-focus.nav-level-zero {
+  background-color: rgba(224, 175, 104, 0.42);
+  box-shadow: inset 0 -2px #e0af68;
+}
+
+/* Keep the active tray icon visible at either navigation depth. */
 .tray-item.nav-selected {
   background-color: rgba(122, 162, 247, 0.55);
+}
+
+.tray-widget.nav-level-zero .tray-item.nav-selected {
+  background-color: rgba(224, 175, 104, 0.68);
 }
 
 /* Fixed-width containers for perfect centering */

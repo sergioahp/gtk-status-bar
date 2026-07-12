@@ -72,9 +72,10 @@ above.
 
 `keyboard-menu` starts tray-wide keyboard navigation and opens the target
 item's native popover. A temporary layer-shell helper surface requests exclusive
-keyboard input; the tray and current icon are tinted while it is active. At the
-tray-icon level, `h`/Left and `l`/Right wrap across icons and automatically open
-the landed icon's menu. `gg`/Home and `G`/End jump to the first and last icons.
+keyboard input. The tray and current icon use a warm tint at the tray-icon level
+and a cool tint while navigating inside a menu. At the tray-icon level, `h`/Left
+and `l`/Right wrap across icons and automatically open the landed icon's menu.
+`gg`/Home and `G`/End jump to the first and last icons.
 `j`/Down or `k`/Up enters the open menu at its first or last entry. Within a
 menu, `j`/`k` move between entries, `l`/Right/Enter enters a submenu, and
 `h`/Left leaves it; leaving the top menu level returns to icon navigation.

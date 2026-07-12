@@ -1294,18 +1294,14 @@ pub fn setup_tray_updates(
                             if response.ok && ends_nav {
                                 end_nav(&mut nav, &container, &entries, &menu_requests);
                             } else if response.ok && targets_nav && enters_menu {
-                                if let Some(active) = nav.as_mut() {
-                                    active.in_menu = true;
-                                }
+                                set_nav_in_menu(&mut nav, &container, true);
                             } else if response.ok && targets_nav && activates_menu {
                                 let menu_still_open = nav
                                     .as_ref()
                                     .and_then(|active| entries.get(&active.key))
                                     .is_some_and(|entry| entry.open_menu.borrow().is_some());
                                 if menu_still_open {
-                                    if let Some(active) = nav.as_mut() {
-                                        active.in_menu = true;
-                                    }
+                                    set_nav_in_menu(&mut nav, &container, true);
                                 } else {
                                     end_nav(&mut nav, &container, &entries, &menu_requests);
                                 }
@@ -1389,6 +1385,18 @@ fn update_nav_highlight(entries: &HashMap<String, TrayEntry>, order: &[String], 
     }
     if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
         entry.button.add_css_class("nav-selected");
+    }
+}
+
+fn set_nav_in_menu(nav: &mut Option<NavActive>, container: &gtk4::Box, in_menu: bool) {
+    let Some(active) = nav.as_mut() else {
+        return;
+    };
+    active.in_menu = in_menu;
+    if in_menu {
+        container.remove_css_class("nav-level-zero");
+    } else {
+        container.add_css_class("nav-level-zero");
     }
 }
 
@@ -1480,7 +1488,6 @@ fn start_nav(
     match nav.as_mut() {
         Some(active) => {
             active.key = key.clone();
-            active.in_menu = false;
         }
         None => {
             let request_id = next_menu_request(menu_requests);
@@ -1496,6 +1503,7 @@ fn start_nav(
             });
         }
     }
+    set_nav_in_menu(nav, container, false);
     // Only one dropdown open at a time.
     for entry in entries.values() {
         close_tray_menu(&entry.open_menu);
@@ -1527,6 +1535,7 @@ fn end_nav(
         entry.button.remove_css_class("nav-selected");
     }
     container.remove_css_class("nav-focus");
+    container.remove_css_class("nav-level-zero");
     drop(active);
     debug!("Tray keyboard navigation ended");
 }
@@ -1603,9 +1612,7 @@ fn handle_nav(
                 if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
                     clear_menu_selection(&entry.open_menu);
                 }
-                if let Some(active) = nav.as_mut() {
-                    active.in_menu = false;
-                }
+                set_nav_in_menu(nav, container, false);
             } else {
                 end_nav(nav, container, entries, menu_requests);
             }
@@ -1656,9 +1663,7 @@ fn handle_nav(
                     let direction = if matches!(cmd, NavCmd::Up) { -1 } else { 1 };
                     match select_menu_entry(&entry.open_menu, direction) {
                         Ok(_) => {
-                            if let Some(active) = nav.as_mut() {
-                                active.in_menu = true;
-                            }
+                            set_nav_in_menu(nav, container, true);
                         }
                         Err(error) => debug!(%error, "Cannot descend into tray dropdown"),
                     }
@@ -1705,9 +1710,7 @@ fn handle_nav(
             Ok(false) => {
                 // Already at the dropdown's top level: return to level 0.
                 clear_menu_selection(open_menu);
-                if let Some(active) = nav.as_mut() {
-                    active.in_menu = false;
-                }
+                set_nav_in_menu(nav, container, false);
             }
             Err(error) => debug!(%error, "Could not leave tray submenu"),
         },
@@ -1771,6 +1774,16 @@ fn show_tray_menu(
     build_menu_box(&box_, &menu.items, &mut build, &[]);
     popover.set_child(Some(&box_));
 
+    // Each submenu is its own native popover and can receive keyboard focus.
+    // Install the controller on all of them so navigation does not fall back to
+    // GTK's default handling when a submenu opens.
+    let is_nav = menu.keyboard_grab;
+    if is_nav {
+        for menu_popover in &popovers {
+            menu_popover.add_controller(nav_key_controller(nav_tx, &menu.key));
+        }
+    }
+
     *entry.open_menu.borrow_mut() = Some(OpenTrayMenu {
         request_id: menu.request_id,
         popovers,
@@ -1780,11 +1793,6 @@ fn show_tray_menu(
 
     // `keyboard_grab` here means "this dropdown is part of a nav session" — the
     // grab itself is owned by the session, not the menu.
-    let is_nav = menu.keyboard_grab;
-    if is_nav {
-        popover.add_controller(nav_key_controller(nav_tx, &menu.key));
-    }
-
     let open_menu_weak = Rc::downgrade(&entry.open_menu);
     let nav_tx_closed = nav_tx.clone();
     popover.connect_closed(move |_popover| {

@@ -13,15 +13,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use pipewire as pw;
-use pw::spa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
 use pw::spa::param::ParamType;
+use pw::spa::pod::{Pod, Value as PodValue, ValueArray, deserialize::PodDeserializer};
 use pw::{
     device::Device,
+    metadata::Metadata,
     node::Node,
     proxy::{Listener, ProxyT},
     thread_loop::ThreadLoop,
     types::ObjectType,
-    metadata::Metadata,
 };
 
 use crate::bus::VolumeUpdate;
@@ -68,18 +68,22 @@ fn is_audio_node(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
     debug!("🔍 Checking node - media.class: {:?}", media_class);
 
     let result = media_class
-         // monitor only sinks for now
-         .map(|c| c.contains("Audio") && c.contains("Sink"))
-         .unwrap_or(false);
+        // monitor only sinks for now
+        .map(|c| c.contains("Audio") && c.contains("Sink"))
+        .unwrap_or(false);
 
-    debug!("🔍 Node filter result: {} for media.class: {:?}", result, media_class);
+    debug!(
+        "🔍 Node filter result: {} for media.class: {:?}",
+        result, media_class
+    );
     result
 }
 
 fn is_audio_device(props: &Option<&pw::spa::utils::dict::DictRef>) -> bool {
-    props.and_then(|p| p.get("device.api"))
-         .map(|api| api == "alsa" || api == "bluez5")
-         .unwrap_or(false)
+    props
+        .and_then(|p| p.get("device.api"))
+        .map(|api| api == "alsa" || api == "bluez5")
+        .unwrap_or(false)
 }
 
 fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<bool>)> {
@@ -97,25 +101,28 @@ fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<
                 if let Ok(vol) = value_pod.get_float() {
                     volume = Some(vol);
                 }
-            },
+            }
             pw::spa::sys::SPA_PROP_mute => {
                 if let Ok(m) = value_pod.get_bool() {
                     mute = Some(m);
                 }
-            },
+            }
             pw::spa::sys::SPA_PROP_channelVolumes => {
                 if let Ok((_, PodValue::ValueArray(ValueArray::Float(volumes)))) =
-                    PodDeserializer::deserialize_any_from(value_pod.as_bytes()) {
+                    PodDeserializer::deserialize_any_from(value_pod.as_bytes())
+                {
                     channel_volumes = volumes;
                 }
-            },
+            }
             _ => {}
         }
     }
 
     // Convert to structured data with cube root transformation (like wpctl)
-    let volume_percent = volume.map(|v| (v.powf(1.0/3.0) * 100.0).round() as u8);
-    let channel_percent = channel_volumes.first().map(|&v| (v.powf(1.0/3.0) * 100.0).round() as u8);
+    let volume_percent = volume.map(|v| (v.powf(1.0 / 3.0) * 100.0).round() as u8);
+    let channel_percent = channel_volumes
+        .first()
+        .map(|&v| (v.powf(1.0 / 3.0) * 100.0).round() as u8);
 
     // Return None only if we have no volume data at all
     if volume_percent.is_none() && channel_percent.is_none() && mute.is_none() {
@@ -134,8 +141,13 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
         let default_sink_name = Rc::new(RefCell::new(None::<String>));
 
         // Create HashMap to track device_id -> (node_name, description, volume_percent, channel_percent, is_muted)
-        let device_map = Rc::new(RefCell::new(HashMap::<u32, (String, String, Option<u8>, Option<u8>, Option<bool>)>::new()));
-        debug!("📋 Created device tracking HashMap for (node_name, description, volume, channel, mute)");
+        let device_map = Rc::new(RefCell::new(HashMap::<
+            u32,
+            (String, String, Option<u8>, Option<u8>, Option<bool>),
+        >::new()));
+        debug!(
+            "📋 Created device tracking HashMap for (node_name, description, volume, channel, mute)"
+        );
 
         // Initialize PipeWire on this thread
         pw::init();
@@ -181,7 +193,10 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                 debug!("📡 PipeWire connected: {}", info.name());
             })
             .error(|id, seq, res, message| {
-                error!("❌ PipeWire error id:{} seq:{} res:{}: {}", id, seq, res, message);
+                error!(
+                    "❌ PipeWire error id:{} seq:{} res:{}: {}",
+                    id, seq, res, message
+                );
             })
             .register();
 
@@ -199,7 +214,9 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
         let keep_alive = Rc::new(RefCell::new(PWKeepAlive::new()));
         let keep_alive_weak = Rc::downgrade(&keep_alive);
 
-        debug!("🎵 PipeWire ThreadLoop started - monitoring volume changes with default sink filtering");
+        debug!(
+            "🎵 PipeWire ThreadLoop started - monitoring volume changes with default sink filtering"
+        );
 
         // Set up metadata listener for default sink detection
         let registry_weak_metadata = Rc::downgrade(&registry);

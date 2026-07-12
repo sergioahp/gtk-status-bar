@@ -76,7 +76,7 @@ pub fn update_time_widget(label: gtk4::Label) {
 
 pub fn create_bt_widget() -> gtk4::Label {
     debug!("Creating bluetooth widget");
-    let label = gtk4::Label::new(None);  // Start with no text, will be hidden until devices found
+    let label = gtk4::Label::new(None); // Start with no text, will be hidden until devices found
     label.add_css_class("bt-widget");
     label.set_halign(gtk4::Align::End);
     label
@@ -134,7 +134,13 @@ pub fn create_center_group() -> (gtk4::Box, gtk4::Label, gtk4::Box) {
     (center_spacer_start, title_widget, center_spacer_end)
 }
 
-pub fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
+pub fn create_right_group() -> (
+    gtk4::Box,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+) {
     debug!("Creating right group");
 
     let right_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -164,10 +170,24 @@ pub fn create_right_group() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label
     right_container.append(&right_spacer);
     right_container.append(&right_group);
 
-    (right_container, bt_widget, volume_widget, battery_widget, time_widget)
+    (
+        right_container,
+        bt_widget,
+        volume_widget,
+        battery_widget,
+        time_widget,
+    )
 }
 
-pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label, gtk4::Label) {
+pub fn create_experimental_bar() -> (
+    gtk4::Box,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Label,
+) {
     debug!("Creating experimental bar");
 
     let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -184,7 +204,15 @@ pub fn create_experimental_bar() -> (gtk4::Box, gtk4::Label, gtk4::Label, gtk4::
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
-    (main_box, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget)
+    (
+        main_box,
+        bt_widget,
+        volume_widget,
+        battery_widget,
+        time_widget,
+        workspace_widget,
+        title_widget,
+    )
 }
 
 pub fn load_css_styles(window: &gtk4::ApplicationWindow) {
@@ -226,23 +254,26 @@ pub fn configure_layer_shell(window: &gtk4::ApplicationWindow) {
     info!("Layer shell configured successfully");
 }
 
-fn update_title_widget_workspace_color(title_widget: &gtk4::Label, workspace_id: hyprland::shared::WorkspaceId) {
+fn update_title_widget_workspace_color(
+    title_widget: &gtk4::Label,
+    workspace_id: hyprland::shared::WorkspaceId,
+) {
     // Get workspace color based on ID
     let color = get_workspace_color(workspace_id);
 
     // Apply color directly via CSS provider for immediate update
     let css_provider = gtk4::CssProvider::new();
-    let css = format!(
-        ".title-widget {{ background-color: {}; }}",
-        color
-    );
+    let css = format!(".title-widget {{ background-color: {}; }}", color);
 
     css_provider.load_from_data(&css);
 
     let style_context = title_widget.style_context();
     style_context.add_provider(&css_provider, gtk4::STYLE_PROVIDER_PRIORITY_USER + 1);
 
-    debug!("Updated title widget color to: {} for workspace: {}", color, workspace_id);
+    debug!(
+        "Updated title widget color to: {} for workspace: {}",
+        color, workspace_id
+    );
 }
 
 fn get_workspace_color(workspace_id: hyprland::shared::WorkspaceId) -> &'static str {
@@ -310,13 +341,20 @@ mod tests {
 // setup_*_updates are infallible now that there is no global sender to
 // double-initialize — they only move a receiver into a glib-local drain task.
 
-pub fn setup_workspace_updates(mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>, label: gtk4::Label, title_widget: gtk4::Label) {
+pub fn setup_workspace_updates(
+    mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>,
+    label: gtk4::Label,
+    title_widget: gtk4::Label,
+) {
     debug!("Setting up workspace updates");
 
     // Handle combined workspace updates (name + ID) in single frame
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
-            debug!("Updating workspace - label: '{}', color for workspace: {}", update.name, update.id);
+            debug!(
+                "Updating workspace - label: '{}', color for workspace: {}",
+                update.name, update.id
+            );
             // Update both workspace text and title color atomically
             label.set_text(&update.name);
             update_title_widget_workspace_color(&title_widget, update.id);
@@ -397,12 +435,12 @@ pub fn setup_volume_updates(label: gtk4::Label) -> Result<()> {
             // Use channel volume first (more accurate), fallback to main volume
             if let Some(volume_percent) = update.channel_percent.or(update.volume_percent) {
                 let first_char = update.name.chars().next().unwrap_or('A');
-                let emoji = if update.is_muted == Some(true) { "🔇" } else { "🔊" };
-                let display_text = format!("{}{}{}",
-                    emoji,
-                    first_char,
-                    volume_percent
-                );
+                let emoji = if update.is_muted == Some(true) {
+                    "🔇"
+                } else {
+                    "🔊"
+                };
+                let display_text = format!("{}{}{}", emoji, first_char, volume_percent);
                 label.set_text(&display_text);
                 debug!("📺 GTK UI updated via ASYNC: {}", display_text);
             } else {

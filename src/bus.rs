@@ -86,24 +86,28 @@ impl Bus {
     // point that does not exist.
 
     pub fn send_workspace_update(&self, update: WorkspaceUpdate) -> Result<()> {
-        self.workspace.send(update)
+        self.workspace
+            .send(update)
             .context("Failed to send workspace update")
     }
 
     pub fn send_title_update(&self, update: Option<String>) -> Result<()> {
         // TODO: maybe handle None variant as: remove the widget? maybe pass as optional and handle
         // that None case elsewere
-        self.title.send(update.unwrap_or_default())
+        self.title
+            .send(update.unwrap_or_default())
             .context("Failed to send title update")
     }
 
     pub fn send_battery_update(&self, update: String) -> Result<()> {
-        self.battery.send(update)
+        self.battery
+            .send(update)
             .context("Failed to send battery update")
     }
 
     pub fn send_bluetooth_update(&self, update: String) -> Result<()> {
-        self.bluetooth.send(update)
+        self.bluetooth
+            .send(update)
             .context("Failed to send bluetooth update")
     }
 }
@@ -120,8 +124,11 @@ mod tests {
     #[test]
     fn workspace_update_round_trips() {
         let (bus, mut rx) = Bus::new();
-        bus.send_workspace_update(WorkspaceUpdate { name: "ws".to_string(), id: 1 })
-            .expect("send_workspace_update should succeed");
+        bus.send_workspace_update(WorkspaceUpdate {
+            name: "ws".to_string(),
+            id: 1,
+        })
+        .expect("send_workspace_update should succeed");
         let ws = rx.workspace.try_recv().expect("workspace message in queue");
         assert_eq!(ws.name, "ws");
         assert_eq!(ws.id, 1);
@@ -160,10 +167,19 @@ mod tests {
     fn send_into_closed_channel_reports_layered_context() {
         let (bus, rx) = Bus::new();
         drop(rx);
-        let err = bus.send_title_update(Some("x".to_string()))
+        let err = bus
+            .send_title_update(Some("x".to_string()))
             .expect_err("send into closed channel must fail");
         let chain = format!("{:#}", err);
-        assert!(chain.contains("Failed to send title update"), "outer context missing: {}", chain);
-        assert!(chain.to_lowercase().contains("channel closed"), "root cause missing: {}", chain);
+        assert!(
+            chain.contains("Failed to send title update"),
+            "outer context missing: {}",
+            chain
+        );
+        assert!(
+            chain.to_lowercase().contains("channel closed"),
+            "root cause missing: {}",
+            chain
+        );
     }
 }

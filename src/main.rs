@@ -32,8 +32,15 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     widgets::load_css_styles(&window);
     widgets::configure_layer_shell(&window);
 
-    let (bar, bt_widget, volume_widget, battery_widget, time_widget, workspace_widget, title_widget) =
-        widgets::create_experimental_bar();
+    let (
+        bar,
+        bt_widget,
+        volume_widget,
+        battery_widget,
+        time_widget,
+        workspace_widget,
+        title_widget,
+    ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
 
@@ -58,8 +65,7 @@ fn activate(application: &gtk4::Application) -> Result<()> {
 }
 
 fn create_tokio_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Runtime::new()
-        .context("Failed to create Tokio runtime")
+    tokio::runtime::Runtime::new().context("Failed to create Tokio runtime")
 }
 
 fn main() -> Result<()> {
@@ -90,10 +96,6 @@ fn main() -> Result<()> {
 
     info!("Running GTK application");
     application.run();
-
-    // Maybe set up error recovery: exponentially backup retries, currently a failed task will not
-    // execute again during the duration of the program
-    // Monitor battery status
 
     Ok(())
 }

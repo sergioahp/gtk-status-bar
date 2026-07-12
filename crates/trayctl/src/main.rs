@@ -72,7 +72,18 @@ fn print_human(response: &IpcResponse) {
         } else {
             &item.title
         };
-        println!("{}\t{}\t{}\t{}", item.index, title, item.status, item.key);
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            item.index,
+            title,
+            item.status,
+            if item.item_is_menu {
+                "menu"
+            } else {
+                "activate"
+            },
+            item.key,
+        );
     }
 }
 

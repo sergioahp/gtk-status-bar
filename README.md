@@ -60,6 +60,10 @@ trayctl secondary-activate 1
 trayctl --json list
 ```
 
+Human list output labels each item as `menu` or `activate`; JSON exposes the
+same state as `item_is_menu`, allowing callers to apply menu-only behavior only
+to items that advertise it.
+
 Selection wraps at both ends. `menu-down` and `menu-up` are aliases for
 `menu-next` and `menu-previous`. The newline-delimited JSON protocol also
 supports persistent connections; its request verbs match the command names

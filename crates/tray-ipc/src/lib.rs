@@ -38,6 +38,7 @@ pub struct IpcTrayItem {
     pub key: String,
     pub title: String,
     pub status: String,
+    pub item_is_menu: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

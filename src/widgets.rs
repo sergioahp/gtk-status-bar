@@ -516,6 +516,7 @@ fn ipc_item(index: usize, item: &TrayItem) -> IpcTrayItem {
         key: item.key.clone(),
         title: item.title.clone(),
         status: item.status.clone(),
+        item_is_menu: item.item_is_menu,
     }
 }
 

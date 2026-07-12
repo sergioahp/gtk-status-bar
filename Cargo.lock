@@ -876,11 +876,11 @@ dependencies = [
  "gtk4-layer-shell",
  "hyprland",
  "pipewire",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tray-ipc",
  "zbus",
  "zbus_names",
  "zvariant",
@@ -1868,6 +1868,27 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tray-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "trayctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "tray-ipc",
 ]
 
 [[package]]

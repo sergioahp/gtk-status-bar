@@ -7,13 +7,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 pub const SOCKET_ENV: &str = "GTK_STATUS_BAR_SOCKET";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_CONNECTIONS: usize = 32;
+const MAX_LINE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -22,6 +25,11 @@ pub enum IpcRequest {
     Activate { target: String },
     SecondaryActivate { target: String },
     ContextMenu { target: String },
+    MenuNext { target: String },
+    MenuPrevious { target: String },
+    MenuActivate { target: String },
+    MenuClick { target: String, entry: i32 },
+    CloseMenus,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -132,21 +140,37 @@ async fn bind_socket(path: &Path) -> Result<UnixListener> {
 
 async fn handle_client(stream: UnixStream, ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return,
+        let mut line = String::new();
+        let bytes_read = match (&mut reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_line(&mut line)
+            .await
+        {
+            Ok(bytes_read) => bytes_read,
             Err(error) => {
                 debug!(%error, "Tray IPC client read failed");
                 return;
             }
         };
+        if bytes_read == 0 {
+            return;
+        }
+        if bytes_read as u64 > MAX_LINE_BYTES {
+            let response =
+                IpcResponse::error(format!("request exceeds the {MAX_LINE_BYTES}-byte limit"));
+            if let Err(error) = write_response(&mut writer, &response).await {
+                debug!(%error, "Could not report oversized tray IPC request");
+            }
+            return;
+        }
         let request = match serde_json::from_str::<IpcRequest>(&line) {
             Ok(request) => request,
             Err(error) => {
                 let response = IpcResponse::error(format!("invalid request: {error}"));
-                if write_response(&mut writer, &response).await.is_err() {
+                if let Err(write_error) = write_response(&mut writer, &response).await {
+                    debug!(%write_error, "Could not write invalid-request response");
                     return;
                 }
                 continue;
@@ -162,7 +186,9 @@ async fn handle_client(stream: UnixStream, ui_tx: mpsc::UnboundedSender<IpcUiReq
             .is_err()
         {
             let response = IpcResponse::error("tray UI is not available");
-            let _ = write_response(&mut writer, &response).await;
+            if let Err(error) = write_response(&mut writer, &response).await {
+                debug!(%error, "Could not report unavailable tray UI");
+            }
             return;
         }
         let response = match tokio::time::timeout(RESPONSE_TIMEOUT, response_rx).await {
@@ -170,7 +196,8 @@ async fn handle_client(stream: UnixStream, ui_tx: mpsc::UnboundedSender<IpcUiReq
             Ok(Err(_)) => IpcResponse::error("tray UI dropped the request"),
             Err(_) => IpcResponse::error("tray UI did not respond within 5 seconds"),
         };
-        if write_response(&mut writer, &response).await.is_err() {
+        if let Err(error) = write_response(&mut writer, &response).await {
+            debug!(%error, "Tray IPC client response write failed");
             return;
         }
     }
@@ -193,10 +220,29 @@ pub async fn run_server(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) -> Result<()
     let listener = bind_socket(&path).await?;
     let _cleanup = SocketCleanup(path.clone());
     info!(path = %path.display(), "Tray IPC server is listening");
+    let connection_slots = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
-        let (stream, _) = listener.accept().await.context("accept tray IPC client")?;
-        tokio::spawn(handle_client(stream, ui_tx.clone()));
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(%error, "Could not accept tray IPC client; retrying");
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            debug!(
+                limit = MAX_CONNECTIONS,
+                "Rejecting tray IPC client at connection limit"
+            );
+            continue;
+        };
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            handle_client(stream, ui_tx).await;
+        });
     }
 }
 
@@ -214,12 +260,16 @@ pub async fn send_request(request: &IpcRequest) -> Result<IpcResponse> {
         .context("write tray IPC request")?;
 
     let mut response = String::new();
-    BufReader::new(reader)
+    let bytes_read = BufReader::new(reader)
+        .take(MAX_LINE_BYTES + 1)
         .read_line(&mut response)
         .await
         .context("read tray IPC response")?;
-    if response.is_empty() {
+    if bytes_read == 0 {
         bail!("tray IPC server closed the connection without a response");
+    }
+    if bytes_read as u64 > MAX_LINE_BYTES {
+        bail!("tray IPC response exceeds the {MAX_LINE_BYTES}-byte limit");
     }
     serde_json::from_str(&response).context("decode tray IPC response")
 }
@@ -235,6 +285,23 @@ mod tests {
         };
         let encoded = serde_json::to_string(&request).expect("request should encode");
         assert_eq!(encoded, r#"{"command":"secondary-activate","target":"1"}"#);
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
+            request
+        );
+    }
+
+    #[test]
+    fn menu_protocol_round_trips() {
+        let request = IpcRequest::MenuClick {
+            target: "network".to_string(),
+            entry: 42,
+        };
+        let encoded = serde_json::to_string(&request).expect("request should encode");
+        assert_eq!(
+            encoded,
+            r#"{"command":"menu-click","target":"network","entry":42}"#
+        );
         assert_eq!(
             serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
             request

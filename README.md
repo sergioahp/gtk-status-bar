@@ -55,9 +55,19 @@ shown by `list`, an exact title, or an exact item key:
 cargo run --bin trayctl -- list
 cargo run --bin trayctl -- activate 0
 cargo run --bin trayctl -- context-menu "NetworkManager Applet"
+cargo run --bin trayctl -- menu-next "NetworkManager Applet"
+cargo run --bin trayctl -- menu-activate "NetworkManager Applet"
+cargo run --bin trayctl -- menu-click "NetworkManager Applet" 12
+cargo run --bin trayctl -- close-menus
 cargo run --bin trayctl -- secondary-activate 1
 cargo run --bin trayctl -- --json list
 ```
+
+After opening a menu with `context-menu`, use `menu-next` and `menu-previous`
+to move the highlighted selection, then `menu-activate` to click it. Selection
+wraps at both ends. `menu-down` and `menu-up` are CLI aliases. `menu-click`
+activates a known dbusmenu entry ID directly, and `close-menus` dismisses every
+open tray dropdown.
 
 Installed builds can call `trayctl` directly. A compositor binding can therefore
 run a command such as `trayctl activate 0`; no compositor-specific integration is
@@ -71,12 +81,19 @@ may be reused for multiple requests. These are the supported request shapes:
 {"command":"activate","target":"0"}
 {"command":"secondary-activate","target":"some exact title or key"}
 {"command":"context-menu","target":"some exact title or key"}
+{"command":"menu-next","target":"some exact title or key"}
+{"command":"menu-previous","target":"some exact title or key"}
+{"command":"menu-activate","target":"some exact title or key"}
+{"command":"menu-click","target":"some exact title or key","entry":12}
+{"command":"close-menus"}
 ```
 
 Responses contain `ok`, an optional `error`, and `items`. For `list`, `items`
 contains the current ordered tray inventory; successful action responses contain
 the selected item. Requests are resolved against the live GTK registry and then
-forwarded through the same command channel used by mouse clicks.
+forwarded through the same command channel used by mouse clicks. Exact keys and
+titles take precedence over numeric index parsing, so a tray item titled `2`
+can still be addressed by its title.
 
 ## 🛠️ Technology Stack
 

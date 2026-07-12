@@ -353,7 +353,19 @@ struct TrayEntry {
     button: gtk4::Button,
     image: gtk4::Image,
     state: Rc<RefCell<TrayItem>>,
-    open_menu: Rc<RefCell<Vec<gtk4::Popover>>>,
+    open_menu: Rc<RefCell<Option<OpenTrayMenu>>>,
+}
+
+struct OpenTrayMenu {
+    popovers: Vec<gtk4::Popover>,
+    entries: Vec<OpenTrayMenuEntry>,
+    selected: Option<usize>,
+}
+
+struct OpenTrayMenuEntry {
+    button: gtk4::Button,
+    id: i32,
+    ancestors: Vec<gtk4::Popover>,
 }
 
 fn ipc_item(index: usize, item: &TrayItem) -> IpcTrayItem {
@@ -374,17 +386,7 @@ fn resolve_ipc_target<'a>(
         let index = order
             .iter()
             .position(|key| key == target)
-            .unwrap_or_default();
-        return Ok((index, entry));
-    }
-
-    if let Ok(index) = target.parse::<usize>() {
-        let key = order
-            .get(index)
-            .ok_or_else(|| format!("tray item index {index} is out of range"))?;
-        let entry = entries
-            .get(key)
-            .ok_or_else(|| format!("tray item index {index} is no longer available"))?;
+            .ok_or_else(|| format!("tray item {target:?} is missing from the display order"))?;
         return Ok((index, entry));
     }
 
@@ -392,15 +394,87 @@ fn resolve_ipc_target<'a>(
         let entry = entries.get(key)?;
         (entry.state.borrow().title == target).then_some((index, entry))
     });
-    let Some(found) = matches.next() else {
-        return Err(format!("no tray item matches {target:?}"));
-    };
-    if matches.next().is_some() {
-        return Err(format!(
-            "more than one tray item is titled {target:?}; use its index or key"
-        ));
+    if let Some(found) = matches.next() {
+        if matches.next().is_some() {
+            return Err(format!(
+                "more than one tray item is titled {target:?}; use its index or key"
+            ));
+        }
+        return Ok(found);
     }
-    Ok(found)
+
+    let index = target
+        .parse::<usize>()
+        .map_err(|_| format!("no tray item matches {target:?}"))?;
+    let key = order
+        .get(index)
+        .ok_or_else(|| format!("tray item index {index} is out of range"))?;
+    let entry = entries
+        .get(key)
+        .ok_or_else(|| format!("tray item index {index} is no longer available"))?;
+    Ok((index, entry))
+}
+
+fn tray_button_coordinates(button: &gtk4::Button) -> (i32, i32) {
+    let x = f64::from(button.width()) / 2.0;
+    let y = f64::from(button.height()) / 2.0;
+    let Some(root) = button.root() else {
+        return (x.round() as i32, y.round() as i32);
+    };
+    let Ok(window) = root.downcast::<gtk4::Window>() else {
+        return (x.round() as i32, y.round() as i32);
+    };
+    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+    button
+        .compute_point(&window, &point)
+        .map(|point| (point.x().round() as i32, point.y().round() as i32))
+        .unwrap_or((x.round() as i32, y.round() as i32))
+}
+
+fn select_menu_entry(entry: &TrayEntry, direction: isize) -> std::result::Result<i32, String> {
+    let mut open_menu = entry.open_menu.borrow_mut();
+    let menu = open_menu
+        .as_mut()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    if menu.entries.is_empty() {
+        return Err("open tray menu has no enabled entries".to_string());
+    }
+    if let Some(selected) = menu.selected {
+        menu.entries[selected].button.remove_css_class("selected");
+    }
+    let len = menu.entries.len() as isize;
+    let selected = match menu.selected {
+        Some(selected) => (selected as isize + direction).rem_euclid(len) as usize,
+        None if direction < 0 => menu.entries.len() - 1,
+        None => 0,
+    };
+    let selected_entry = &menu.entries[selected];
+    for popover in menu.popovers.iter().skip(1) {
+        popover.popdown();
+    }
+    for popover in &selected_entry.ancestors {
+        popover.popup();
+    }
+    selected_entry.button.add_css_class("selected");
+    selected_entry.button.grab_focus();
+    let id = selected_entry.id;
+    menu.selected = Some(selected);
+    Ok(id)
+}
+
+fn menu_entry_id(entry: &TrayEntry, requested: Option<i32>) -> std::result::Result<i32, String> {
+    let open_menu = entry.open_menu.borrow();
+    let menu = open_menu
+        .as_ref()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    match requested {
+        Some(id) if menu.entries.iter().any(|entry| entry.id == id) => Ok(id),
+        Some(id) => Err(format!("open tray menu has no enabled entry {id}")),
+        None => menu
+            .selected
+            .map(|selected| menu.entries[selected].id)
+            .ok_or_else(|| "open tray menu has no selected entry".to_string()),
+    }
 }
 
 fn handle_ipc_request(
@@ -409,26 +483,38 @@ fn handle_ipc_request(
     entries: &HashMap<String, TrayEntry>,
     commands: &mpsc::UnboundedSender<TrayCommand>,
 ) -> IpcResponse {
-    if request == IpcRequest::List {
-        let items = order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, key)| {
-                entries
-                    .get(key)
-                    .map(|entry| ipc_item(index, &entry.state.borrow()))
-            })
-            .collect();
-        return IpcResponse::success(items);
-    }
-
-    let (target, action) = match request {
-        IpcRequest::Activate { target } => (target, TrayAction::Activate),
-        IpcRequest::SecondaryActivate { target } => {
-            (target, TrayAction::SecondaryActivate)
+    let (target, action) = match &request {
+        IpcRequest::List => {
+            let items = order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, key)| {
+                    entries
+                        .get(key)
+                        .map(|entry| ipc_item(index, &entry.state.borrow()))
+                })
+                .collect();
+            return IpcResponse::success(items);
         }
-        IpcRequest::ContextMenu { target } => (target, TrayAction::ContextMenu),
-        IpcRequest::List => unreachable!("list requests returned above"),
+        IpcRequest::CloseMenus => {
+            for entry in entries.values() {
+                close_tray_menu(&entry.open_menu);
+            }
+            return IpcResponse::success(Vec::new());
+        }
+        IpcRequest::Activate { target } => (target.clone(), None),
+        IpcRequest::SecondaryActivate { target } => {
+            (target.clone(), Some(TrayAction::SecondaryActivate))
+        }
+        IpcRequest::ContextMenu { target } => {
+            (target.clone(), Some(TrayAction::ContextMenu))
+        }
+        IpcRequest::MenuNext { target } => (target.clone(), None),
+        IpcRequest::MenuPrevious { target } => (target.clone(), None),
+        IpcRequest::MenuActivate { target } => (target.clone(), None),
+        IpcRequest::MenuClick { target, entry } => {
+            (target.clone(), Some(TrayAction::MenuEvent(*entry)))
+        }
     };
     let (index, entry) = match resolve_ipc_target(&target, order, entries) {
         Ok(found) => found,
@@ -436,15 +522,41 @@ fn handle_ipc_request(
     };
     let item = entry.state.borrow();
     let selected = ipc_item(index, &item);
+    let action = match request {
+        IpcRequest::Activate { .. } if item.item_is_menu => TrayAction::ContextMenu,
+        IpcRequest::Activate { .. } => TrayAction::Activate,
+        IpcRequest::MenuNext { .. } => match select_menu_entry(entry, 1) {
+            Ok(_id) => return IpcResponse::success(vec![selected]),
+            Err(error) => return IpcResponse::error(error),
+        },
+        IpcRequest::MenuPrevious { .. } => match select_menu_entry(entry, -1) {
+            Ok(_id) => return IpcResponse::success(vec![selected]),
+            Err(error) => return IpcResponse::error(error),
+        },
+        IpcRequest::MenuActivate { .. } => match menu_entry_id(entry, None) {
+            Ok(id) => TrayAction::MenuEvent(id),
+            Err(error) => return IpcResponse::error(error),
+        },
+        IpcRequest::MenuClick { entry: id, .. } => match menu_entry_id(entry, Some(id)) {
+            Ok(id) => TrayAction::MenuEvent(id),
+            Err(error) => return IpcResponse::error(error),
+        },
+        _ => action.expect("non-menu IPC actions have a tray action"),
+    };
+    let (x, y) = tray_button_coordinates(&entry.button);
     let command = TrayCommand {
         key: item.key.clone(),
         action,
-        x: 0,
-        y: 0,
+        x,
+        y,
         menu_path: item.menu_path.clone(),
     };
     if let Err(error) = commands.send(command) {
         return IpcResponse::error(format!("tray backend is not available: {error}"));
+    }
+    if matches!(action, TrayAction::MenuEvent(_)) {
+        drop(item);
+        close_tray_menu(&entry.open_menu);
     }
     IpcResponse::success(vec![selected])
 }
@@ -548,7 +660,7 @@ fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayComman
         button,
         image,
         state,
-        open_menu: Rc::new(RefCell::new(Vec::new())),
+        open_menu: Rc::new(RefCell::new(None)),
     }
 }
 
@@ -569,6 +681,7 @@ pub fn setup_tray_updates(container: gtk4::Box) {
     glib::spawn_future_local(async move {
         let mut entries: HashMap<String, TrayEntry> = HashMap::new();
         let mut order = Vec::new();
+        let mut ipc_available = true;
         loop {
             tokio::select! {
                 update = update_rx.recv() => {
@@ -615,8 +728,16 @@ pub fn setup_tray_updates(container: gtk4::Box) {
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
                 }
-                request = ipc_rx.recv() => {
-                    let Some(request) = request else { break };
+                request = ipc_rx.recv(), if ipc_available => {
+                    let Some(request) = request else {
+                        ipc_available = false;
+                        debug!("Tray IPC UI channel closed; tray updates remain active");
+                        continue;
+                    };
+                    if request.response.is_closed() {
+                        debug!("Skipping tray IPC request after its client timed out");
+                        continue;
+                    }
                     let response = handle_ipc_request(
                         request.request,
                         &order,
@@ -638,9 +759,11 @@ pub fn setup_tray_updates(container: gtk4::Box) {
 // explicit unparent leaks them (with a GTK warning) once the parent button is
 // finalized. Runs from the tray select loop, never from event dispatch, so the
 // widget tree can be mutated directly here.
-fn close_tray_menu(open_menu: &Rc<RefCell<Vec<gtk4::Popover>>>) {
-    let popovers: Vec<gtk4::Popover> = open_menu.borrow_mut().drain(..).collect();
-    for popover in popovers {
+fn close_tray_menu(open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>) {
+    let Some(menu) = open_menu.borrow_mut().take() else {
+        return;
+    };
+    for popover in menu.popovers {
         popover.popdown();
         popover.unparent();
     }
@@ -674,24 +797,37 @@ fn show_tray_menu(
     );
     let popover_weak = popover.downgrade();
     let mut popovers = vec![popover.clone()];
-    build_menu_box(&box_, &menu.items, command_tx, menu, &popover_weak, &mut popovers);
+    let mut menu_entries = Vec::new();
+    build_menu_box(
+        &box_,
+        &menu.items,
+        command_tx,
+        menu,
+        &popover_weak,
+        &mut popovers,
+        &mut menu_entries,
+        &[],
+    );
     popover.set_child(Some(&box_));
 
-    *entry.open_menu.borrow_mut() = popovers;
+    *entry.open_menu.borrow_mut() = Some(OpenTrayMenu {
+        popovers,
+        entries: menu_entries,
+        selected: None,
+    });
     let open_menu_weak = Rc::downgrade(&entry.open_menu);
     popover.connect_closed(move |_popover| {
         let Some(open_menu) = open_menu_weak.upgrade() else { return };
-        let closed: Vec<gtk4::Popover> = open_menu.borrow_mut().drain(..).collect();
-        if closed.is_empty() {
+        let Some(closed) = open_menu.borrow_mut().take() else {
             // close_tray_menu already tore this menu down (item removal or a
             // reopen); nothing left to do.
             return;
-        }
+        };
         // `closed` fires during event dispatch (e.g. the click-outside that
         // dismissed the menu), and unparenting mid-dispatch breaks GTK's
         // active-state accounting — defer the teardown to an idle callback.
         glib::idle_add_local_once(move || {
-            for popover in &closed {
+            for popover in &closed.popovers {
                 popover.unparent();
             }
         });
@@ -717,6 +853,8 @@ fn build_menu_box(
     menu: &TrayMenu,
     top_popover: &glib::object::WeakRef<gtk4::Popover>,
     popovers: &mut Vec<gtk4::Popover>,
+    menu_entries: &mut Vec<OpenTrayMenuEntry>,
+    ancestors: &[gtk4::Popover],
 ) {
     for item in items {
         if !item.visible {
@@ -764,6 +902,13 @@ fn build_menu_box(
         entry.set_child(Some(&content));
 
         if item.children.is_empty() {
+            if item.enabled {
+                menu_entries.push(OpenTrayMenuEntry {
+                    button: entry.clone(),
+                    id: item.id,
+                    ancestors: ancestors.to_vec(),
+                });
+            }
             let command_tx = command_tx.clone();
             let key = menu.key.clone();
             let menu_path = menu.menu_path.clone();
@@ -797,7 +942,18 @@ fn build_menu_box(
             sub_popover.set_position(gtk4::PositionType::Right);
             let sub_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             sub_box.add_css_class("tray-menu");
-            build_menu_box(&sub_box, &item.children, command_tx, menu, top_popover, popovers);
+            let mut child_ancestors = ancestors.to_vec();
+            child_ancestors.push(sub_popover.clone());
+            build_menu_box(
+                &sub_box,
+                &item.children,
+                command_tx,
+                menu,
+                top_popover,
+                popovers,
+                menu_entries,
+                &child_ancestors,
+            );
             sub_popover.set_child(Some(&sub_box));
             popovers.push(sub_popover.clone());
             // Weak for the same cycle reason as the tray button gesture: the

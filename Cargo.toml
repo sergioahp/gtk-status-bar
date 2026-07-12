@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 default-run = "gtk-status-bar"
 
+[workspace]
+members = ["crates/tray-ipc", "crates/trayctl"]
+resolver = "3"
+
 [dependencies]
 gtk4-layer-shell = "0.6.3"
 # GIO (GLib I/O) for Application and signal traits
@@ -24,4 +28,4 @@ futures = "0.3.31"
 pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", rev = "524bd67" }
 async-channel = "2.5.0"
 serde_json = "1.0.140"
-serde = { version = "1.0.219", features = ["derive"] }
+tray-ipc = { path = "crates/tray-ipc" }

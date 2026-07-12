@@ -276,7 +276,32 @@ fn argb_to_rgba(width: i32, height: i32, argb: &[u8]) -> Option<Vec<u8>> {
     Some(rgba)
 }
 
-const TRAY_ICON_SIZE: i32 = 20;
+// Fallback only used when the widget's font is not yet resolvable (e.g. before
+// the widget is realized). Once available we size the icon to a tall character
+// of the actual font so it tracks the text rather than a fixed pixel count —
+// that keeps it from forcing the bar taller than the text on any machine,
+// regardless of DPI or configured font size.
+const TRAY_ICON_SIZE_FALLBACK: i32 = 16;
+
+// Height of a tall character for the given image's font, in device pixels.
+// We measure the pixel height of a representative glyph ("0") so the icon
+// occupies about one character cell, matching the text widgets and scaling
+// across machines regardless of DPI or configured font size. This keeps the
+// icon from forcing the bar taller than the surrounding text.
+fn tray_icon_pixel_size(image: &gtk4::Image) -> i32 {
+    let ctx = image.pango_context();
+    let layout = gtk4::pango::Layout::new(&ctx);
+    if let Some(font) = ctx.font_description() {
+        layout.set_font_description(Some(&font));
+    }
+    layout.set_text("0");
+    let (_width, height) = layout.pixel_size();
+    if height > 0 {
+        height.clamp(1, 64)
+    } else {
+        TRAY_ICON_SIZE_FALLBACK
+    }
+}
 
 // A themed icon that has_icon() reports as present can still be impossible to
 // draw: when the matching file needs a gdk-pixbuf loader that is not installed
@@ -284,11 +309,16 @@ const TRAY_ICON_SIZE: i32 = 20;
 // silently paints "image-missing". Reproduce the decode here so the failure is
 // observable in the logs and callers can fall back instead of showing a broken
 // glyph. Returns None when the icon is drawable, or Some(reason) when it is not.
-fn named_icon_render_error(icon_theme: &gtk4::IconTheme, name: &str, scale: i32) -> Option<String> {
+fn named_icon_render_error(
+    icon_theme: &gtk4::IconTheme,
+    name: &str,
+    size: i32,
+    scale: i32,
+) -> Option<String> {
     let paintable = icon_theme.lookup_icon(
         name,
         &[],
-        TRAY_ICON_SIZE,
+        size,
         scale.max(1),
         gtk4::TextDirection::None,
         gtk4::IconLookupFlags::empty(),
@@ -303,6 +333,9 @@ fn named_icon_render_error(icon_theme: &gtk4::IconTheme, name: &str, scale: i32)
 }
 
 fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
+    let icon_size = tray_icon_pixel_size(image);
+    image.set_pixel_size(icon_size);
+
     let display = image.display();
     let icon_theme = gtk4::IconTheme::for_display(&display);
 
@@ -334,7 +367,7 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
     // the icon can actually be drawn first: has_icon() only checks the theme
     // index, so a missing pixbuf loader would otherwise fail silently.
     if !item.icon_name.is_empty() && icon_theme.has_icon(&item.icon_name) {
-        match named_icon_render_error(&icon_theme, &item.icon_name, image.scale_factor()) {
+        match named_icon_render_error(&icon_theme, &item.icon_name, icon_size, image.scale_factor()) {
             None => {
                 image.set_icon_name(Some(&item.icon_name));
                 return;
@@ -410,7 +443,6 @@ fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayComman
     button.set_focusable(false);
 
     let image = gtk4::Image::new();
-    image.set_pixel_size(TRAY_ICON_SIZE);
     button.set_child(Some(&image));
     update_tray_button(&button, &image, &item);
 

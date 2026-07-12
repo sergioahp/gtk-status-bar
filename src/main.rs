@@ -5,17 +5,11 @@
 // module). Producer crashes are logged but currently not retried — see TODO in
 // each subsystem's setup_*_event_listener.
 
-mod bus;
-mod dbus;
-mod hypr;
-mod pw;
-mod tray;
-mod widgets;
-
 use anyhow::{Context, Result};
 
 use gio::prelude::*;
 use gtk4::prelude::*;
+use gtk_status_bar::widgets;
 use tracing::{error, info};
 
 fn setup_logging() {

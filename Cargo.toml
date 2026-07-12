@@ -3,6 +3,7 @@ name = "gtk-status-bar"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+default-run = "gtk-status-bar"
 
 [dependencies]
 gtk4-layer-shell = "0.6.3"
@@ -23,3 +24,4 @@ futures = "0.3.31"
 pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", rev = "524bd67" }
 async-channel = "2.5.0"
 serde_json = "1.0.140"
+serde = { version = "1.0.219", features = ["derive"] }

@@ -21,8 +21,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::bus::{BATTERY_SENDER, BLUETOOTH_SENDER, TITLE_SENDER, VolumeUpdate, WORKSPACE_SENDER};
+use crate::ipc::{IpcRequest, IpcResponse, IpcTrayItem};
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUpdate};
-use crate::{dbus, hypr, pw, tray};
+use crate::{dbus, hypr, ipc, pw, tray};
 
 // Widget constructors are infallible — gtk4::Label::new, add_css_class, and
 // set_halign all return (). The previous Result<…> signatures were speculative,
@@ -355,6 +356,99 @@ struct TrayEntry {
     open_menu: Rc<RefCell<Vec<gtk4::Popover>>>,
 }
 
+fn ipc_item(index: usize, item: &TrayItem) -> IpcTrayItem {
+    IpcTrayItem {
+        index,
+        key: item.key.clone(),
+        title: item.title.clone(),
+        status: item.status.clone(),
+    }
+}
+
+fn resolve_ipc_target<'a>(
+    target: &str,
+    order: &'a [String],
+    entries: &'a HashMap<String, TrayEntry>,
+) -> std::result::Result<(usize, &'a TrayEntry), String> {
+    if let Some(entry) = entries.get(target) {
+        let index = order
+            .iter()
+            .position(|key| key == target)
+            .unwrap_or_default();
+        return Ok((index, entry));
+    }
+
+    if let Ok(index) = target.parse::<usize>() {
+        let key = order
+            .get(index)
+            .ok_or_else(|| format!("tray item index {index} is out of range"))?;
+        let entry = entries
+            .get(key)
+            .ok_or_else(|| format!("tray item index {index} is no longer available"))?;
+        return Ok((index, entry));
+    }
+
+    let mut matches = order.iter().enumerate().filter_map(|(index, key)| {
+        let entry = entries.get(key)?;
+        (entry.state.borrow().title == target).then_some((index, entry))
+    });
+    let Some(found) = matches.next() else {
+        return Err(format!("no tray item matches {target:?}"));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "more than one tray item is titled {target:?}; use its index or key"
+        ));
+    }
+    Ok(found)
+}
+
+fn handle_ipc_request(
+    request: IpcRequest,
+    order: &[String],
+    entries: &HashMap<String, TrayEntry>,
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+) -> IpcResponse {
+    if request == IpcRequest::List {
+        let items = order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                entries
+                    .get(key)
+                    .map(|entry| ipc_item(index, &entry.state.borrow()))
+            })
+            .collect();
+        return IpcResponse::success(items);
+    }
+
+    let (target, action) = match request {
+        IpcRequest::Activate { target } => (target, TrayAction::Activate),
+        IpcRequest::SecondaryActivate { target } => {
+            (target, TrayAction::SecondaryActivate)
+        }
+        IpcRequest::ContextMenu { target } => (target, TrayAction::ContextMenu),
+        IpcRequest::List => unreachable!("list requests returned above"),
+    };
+    let (index, entry) = match resolve_ipc_target(&target, order, entries) {
+        Ok(found) => found,
+        Err(error) => return IpcResponse::error(error),
+    };
+    let item = entry.state.borrow();
+    let selected = ipc_item(index, &item);
+    let command = TrayCommand {
+        key: item.key.clone(),
+        action,
+        x: 0,
+        y: 0,
+        menu_path: item.menu_path.clone(),
+    };
+    if let Err(error) = commands.send(command) {
+        return IpcResponse::error(format!("tray backend is not available: {error}"));
+    }
+    IpcResponse::success(vec![selected])
+}
+
 fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayCommand>) -> TrayEntry {
     let button = gtk4::Button::new();
     button.add_css_class("tray-item");
@@ -463,11 +557,18 @@ pub fn setup_tray_updates(container: gtk4::Box) {
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (menu_tx, mut menu_rx) = mpsc::unbounded_channel();
+    let (ipc_tx, mut ipc_rx) = mpsc::unbounded_channel();
 
     tokio::spawn(tray::run_tray_supervised(update_tx, command_rx, menu_tx));
+    tokio::spawn(async move {
+        if let Err(error) = ipc::run_server(ipc_tx).await {
+            warn!(%error, "Tray IPC server stopped");
+        }
+    });
 
     glib::spawn_future_local(async move {
         let mut entries: HashMap<String, TrayEntry> = HashMap::new();
+        let mut order = Vec::new();
         loop {
             tokio::select! {
                 update = update_rx.recv() => {
@@ -483,6 +584,7 @@ pub fn setup_tray_updates(container: gtk4::Box) {
                                 let entry = create_tray_entry(item, &command_tx);
                                 container.append(&entry.button);
                                 entries.insert(key.clone(), entry);
+                                order.push(key.clone());
                                 container.set_visible(true);
                                 info!(item = key, "Added system tray item");
                             }
@@ -495,6 +597,7 @@ pub fn setup_tray_updates(container: gtk4::Box) {
                                 // with one still attached.
                                 close_tray_menu(&entry.open_menu);
                                 container.remove(&entry.button);
+                                order.retain(|item_key| item_key != &key);
                                 container.set_visible(!entries.is_empty());
                                 info!(item = key, "Removed system tray item");
                             }
@@ -510,6 +613,18 @@ pub fn setup_tray_updates(container: gtk4::Box) {
                     match entries.get(&menu.key) {
                         Some(entry) => show_tray_menu(entry, &menu, &command_tx),
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
+                    }
+                }
+                request = ipc_rx.recv() => {
+                    let Some(request) = request else { break };
+                    let response = handle_ipc_request(
+                        request.request,
+                        &order,
+                        &entries,
+                        &command_tx,
+                    );
+                    if request.response.send(response).is_err() {
+                        debug!("Tray IPC client disconnected before receiving its response");
                     }
                 }
             }

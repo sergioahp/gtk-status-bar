@@ -876,6 +876,7 @@ dependencies = [
  "gtk4-layer-shell",
  "hyprland",
  "pipewire",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

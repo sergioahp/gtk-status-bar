@@ -51,6 +51,7 @@ pub fn create_title_widget() -> gtk4::Label {
     let label = gtk4::Label::new(Some("Application Title"));
     label.add_css_class("title-widget");
     label.set_halign(gtk4::Align::End);
+    label.set_valign(gtk4::Align::Start);
     label
 }
 
@@ -163,7 +164,7 @@ pub fn create_right_group() -> (
     let right_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     right_container.add_css_class("right-container");
     right_container.set_hexpand(false);
-    right_container.set_valign(gtk4::Align::End);
+    right_container.set_valign(gtk4::Align::Start);
 
     let right_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     right_spacer.set_hexpand(true);
@@ -227,6 +228,15 @@ pub fn create_experimental_bar() -> (
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
+    // Pin the height once the font is resolvable, so dynamic content (title
+    // length, tray removal) can't resize the bar and shift windows below it.
+    let bar_weak = main_box.downgrade();
+    glib::idle_add_local_once(move || {
+        if let Some(bar) = bar_weak.upgrade() {
+            pin_bar_height_to_font(&bar);
+        }
+    });
+
     (
         main_box,
         tray_widget,
@@ -237,6 +247,42 @@ pub fn create_experimental_bar() -> (
         workspace_widget,
         title_widget,
     )
+}
+
+// Multiplier applied to the measured tall-character height when pinning the bar
+// height. A single line box would hug the text too tightly, so we pad it out to
+// ~1.4 character cells for comfortable breathing room while still tracking the
+// font (and thus DPI / user font size) rather than a fixed pixel count.
+const BAR_HEIGHT_CHAR_MULTIPLIER: f64 = 1.4;
+
+// Pin the bar's height to a font-derived "tall character" measurement so the
+// surface never resizes when a widget's content changes (e.g. a title growing
+// or shrinking, or the tray being removed). Without this the layer-shell window
+// tracks its tallest child, so dropping/adding a widget or wrapping text would
+// move every window below the bar. We measure on the realized widget so the
+// font (and thus its metrics) is actually resolvable, mirroring how the tray
+// sizes its icon to a tall glyph rather than a fixed pixel count.
+fn pin_bar_height_to_font(bar: &gtk4::Box) {
+    let ctx = bar.pango_context();
+    let layout = gtk4::pango::Layout::new(&ctx);
+    if let Some(font) = ctx.font_description() {
+        layout.set_font_description(Some(&font));
+    }
+    // "Mgj0" carries ascenders, descenders and a digit so the measured height
+    // approximates the full text line box rather than just a cap-height glyph.
+    layout.set_text("Mgj0");
+    let (_width, height) = layout.pixel_size();
+    if height > 0 {
+        let pinned = (height as f64 * BAR_HEIGHT_CHAR_MULTIPLIER).round() as i32;
+        debug!(
+            char_height = height,
+            multiplier = BAR_HEIGHT_CHAR_MULTIPLIER,
+            pinned, "Pinning bar height to font-derived line height"
+        );
+        bar.set_size_request(-1, pinned);
+    } else {
+        warn!("Could not resolve font metrics to pin bar height; leaving it content-sized");
+    }
 }
 
 fn argb_to_rgba(width: i32, height: i32, argb: &[u8]) -> Option<Vec<u8>> {

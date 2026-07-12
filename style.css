@@ -77,8 +77,8 @@
 
 .tray-item {
   border-radius: 0.5em;
-  min-height: 20px;
-  min-width: 20px;
+  min-height: 1.25em;
+  min-width: 1.25em;
   padding: 0.1em;
   color: #c0caf5;
 }

@@ -33,7 +33,7 @@ A modern, transparent status bar for Wayland compositors built directly in Rust 
 - 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
 
-System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well.
+System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well. Context menus are read from the application's com.canonical.dbusmenu interface and rendered by the bar itself as native popovers, since applications cannot reliably draw their own menus over a layer-shell surface.
 
 ## 🛠️ Technology Stack
 

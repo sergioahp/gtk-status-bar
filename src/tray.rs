@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zbus::fdo::DBusProxy;
 use zbus::message::Header;
 use zbus::names::BusName;
@@ -53,6 +54,10 @@ pub struct TrayMenuItem {
 #[derive(Debug, Clone)]
 pub struct TrayMenu {
     pub key: String,
+    /// dbusmenu object path the layout was fetched from. Menu entry activations
+    /// carry it back in TrayCommand so the backend can deliver `Event` without
+    /// re-resolving the item's `Menu` property.
+    pub menu_path: String,
     pub items: Vec<TrayMenuItem>,
 }
 
@@ -68,8 +73,8 @@ pub enum TrayAction {
     SecondaryActivate,
     ContextMenu,
     /// Activate a specific entry of the item's `com.canonical.dbusmenu` layout.
-    /// `x` carries the dbusmenu entry id so we can forward it to the `Event`
-    /// method (the rest of TrayCommand is unused for this action).
+    /// The payload is the dbusmenu entry id, forwarded to the `Event` method;
+    /// the click coordinates of TrayCommand are unused for this action.
     MenuEvent(i32),
 }
 
@@ -79,9 +84,9 @@ pub struct TrayCommand {
     pub action: TrayAction,
     pub x: i32,
     pub y: i32,
-    /// Object path of the item's `com.canonical.dbusmenu`, captured when the
-    /// click happened so the backend does not have to re-fetch it to render the
-    /// menu locally.
+    /// Object path of the item's `com.canonical.dbusmenu`, captured from the
+    /// item's last known state when the click happened so the backend does not
+    /// have to re-fetch it to render the menu or deliver a menu event.
     pub menu_path: String,
 }
 
@@ -110,9 +115,15 @@ impl StatusNotifierWatcher {
 
         if !self.items.contains(&item) {
             self.items.push(item.clone());
-            Self::status_notifier_item_registered(&emitter, &item).await?;
-            self.registered_status_notifier_items_changed(&emitter)
-                .await?;
+            // The registration itself succeeded once the state is updated; a
+            // failed broadcast must not turn the app's Register call into an
+            // error, so signal emission is best-effort from here on.
+            if let Err(error) = Self::status_notifier_item_registered(&emitter, &item).await {
+                warn!(item, %error, "Could not broadcast tray item registration");
+            }
+            if let Err(error) = self.registered_status_notifier_items_changed(&emitter).await {
+                warn!(item, %error, "Could not broadcast tray item list change");
+            }
             info!(item, "Status notifier item registered");
         }
         Ok(())
@@ -136,9 +147,13 @@ impl StatusNotifierWatcher {
         if !self.hosts.contains(&host) {
             self.hosts.push(host);
             if first {
-                Self::status_notifier_host_registered(&emitter).await?;
-                self.is_status_notifier_host_registered_changed(&emitter)
-                    .await?;
+                if let Err(error) = Self::status_notifier_host_registered(&emitter).await {
+                    warn!(%error, "Could not broadcast tray host registration");
+                }
+                if let Err(error) = self.is_status_notifier_host_registered_changed(&emitter).await
+                {
+                    warn!(%error, "Could not broadcast tray host flag change");
+                }
             }
         }
         Ok(())
@@ -179,7 +194,10 @@ impl StatusNotifierWatcher {
 }
 
 impl StatusNotifierWatcher {
-    async fn remove_owner(&mut self, owner: &str, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+    // Drop every registration owned by a vanished bus connection. Signal
+    // emission is best-effort: the state change already happened, and a failed
+    // broadcast must not stop the remaining cleanup.
+    async fn remove_owner(&mut self, owner: &str, emitter: &SignalEmitter<'_>) {
         let removed_items: Vec<String> = self
             .items
             .iter()
@@ -190,22 +208,29 @@ impl StatusNotifierWatcher {
             self.items
                 .retain(|service| service_owner(service) != Some(owner));
             for service in removed_items {
-                Self::status_notifier_item_unregistered(emitter, &service).await?;
+                if let Err(error) =
+                    Self::status_notifier_item_unregistered(emitter, &service).await
+                {
+                    warn!(item = service, %error, "Could not broadcast tray item removal");
+                }
                 info!(item = service, "Status notifier item disappeared");
             }
-            self.registered_status_notifier_items_changed(emitter)
-                .await?;
+            if let Err(error) = self.registered_status_notifier_items_changed(emitter).await {
+                warn!(%error, "Could not broadcast tray item list change");
+            }
         }
 
         let had_hosts = !self.hosts.is_empty();
         self.hosts
             .retain(|service| service_owner(service) != Some(owner));
         if had_hosts && self.hosts.is_empty() {
-            Self::status_notifier_host_unregistered(emitter).await?;
-            self.is_status_notifier_host_registered_changed(emitter)
-                .await?;
+            if let Err(error) = Self::status_notifier_host_unregistered(emitter).await {
+                warn!(%error, "Could not broadcast tray host removal");
+            }
+            if let Err(error) = self.is_status_notifier_host_registered_changed(emitter).await {
+                warn!(%error, "Could not broadcast tray host flag change");
+            }
         }
-        Ok(())
     }
 }
 
@@ -282,8 +307,13 @@ fn service_owner(service: &str) -> Option<&str> {
 }
 
 async fn monitor_watcher_owners(connection: Connection) -> Result<()> {
-    let dbus = DBusProxy::new(&connection).await?;
-    let mut owner_changes = dbus.receive_name_owner_changed().await?;
+    let dbus = DBusProxy::new(&connection)
+        .await
+        .context("open D-Bus proxy for watcher owner monitoring")?;
+    let mut owner_changes = dbus
+        .receive_name_owner_changed()
+        .await
+        .context("subscribe to D-Bus name owner changes")?;
     while let Some(change) = owner_changes.next().await {
         let args = match change.args() {
             Ok(args) => args,
@@ -303,24 +333,35 @@ async fn monitor_watcher_owners(connection: Connection) -> Result<()> {
         {
             Ok(interface) => interface,
             Err(error) => {
-                warn!(%error, "Could not access local StatusNotifierWatcher state");
-                return Ok(());
+                // The watcher was exported before this task started, so losing
+                // the interface is structural, not transient — stop and let the
+                // spawn wrapper log it instead of looping on the same failure.
+                return Err(error).context("access local StatusNotifierWatcher state");
             }
         };
         let emitter = interface.signal_emitter().clone();
         let mut watcher = interface.get_mut().await;
-        if let Err(error) = watcher.remove_owner(args.name.as_str(), &emitter).await {
-            warn!(owner = %args.name, %error, "Could not remove vanished tray owner");
-        }
+        watcher.remove_owner(args.name.as_str(), &emitter).await;
     }
     Ok(())
 }
 
-async fn ensure_watcher(connection: &Connection) -> Result<()> {
-    let dbus = DBusProxy::new(connection).await?;
-    if dbus.name_has_owner(WATCHER_NAME.try_into()?).await? {
+// Make sure a StatusNotifierWatcher exists on the bus, serving one ourselves if
+// nobody else does. Returns the owner-monitor task when we won the name, so the
+// caller can abort it during teardown.
+async fn ensure_watcher(connection: &Connection) -> Result<Option<JoinHandle<()>>> {
+    let dbus = DBusProxy::new(connection)
+        .await
+        .context("open D-Bus proxy for watcher setup")?;
+    let watcher_name =
+        BusName::try_from(WATCHER_NAME).context("parse StatusNotifierWatcher bus name")?;
+    if dbus
+        .name_has_owner(watcher_name)
+        .await
+        .context("probe for an existing StatusNotifierWatcher")?
+    {
         info!("Using the existing StatusNotifierWatcher");
-        return Ok(());
+        return Ok(None);
     }
 
     connection
@@ -332,16 +373,19 @@ async fn ensure_watcher(connection: &Connection) -> Result<()> {
         Ok(()) => {
             info!("Serving StatusNotifierWatcher for tray applications");
             let connection = connection.clone();
-            tokio::spawn(async move {
+            let monitor = tokio::spawn(async move {
                 if let Err(error) = monitor_watcher_owners(connection).await {
                     warn!(%error, "StatusNotifierWatcher owner monitor stopped");
                 }
             });
+            Ok(Some(monitor))
         }
-        Err(zbus::Error::NameTaken) => info!("Another StatusNotifierWatcher won startup race"),
-        Err(error) => return Err(error).context("request StatusNotifierWatcher bus name"),
+        Err(zbus::Error::NameTaken) => {
+            info!("Another StatusNotifierWatcher won startup race");
+            Ok(None)
+        }
+        Err(error) => Err(error).context("request StatusNotifierWatcher bus name"),
     }
-    Ok(())
 }
 
 async fn watcher_proxy(connection: &Connection) -> Result<Proxy<'_>> {
@@ -380,20 +424,18 @@ fn largest_valid_pixmap(pixmaps: Vec<IconPixmap>) -> Option<IconPixmap> {
         .max_by_key(|(width, height, _)| width * height)
 }
 
+// Read a full snapshot of one status notifier item. Every property is optional
+// on the wire — items routinely omit half of them — so each falls back to a
+// neutral default instead of failing the whole item.
 async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
     let proxy = item_proxy(connection, key).await?;
-    let title = match optional_property(&proxy, "Title").await {
-        Some(title) => title,
-        None => String::new(),
-    };
-    let status: String = match optional_property(&proxy, "Status").await {
-        Some(status) => status,
-        None => "Active".to_string(),
-    };
-    let item_is_menu = match optional_property(&proxy, "ItemIsMenu").await {
-        Some(item_is_menu) => item_is_menu,
-        None => false,
-    };
+    let title: String = optional_property(&proxy, "Title").await.unwrap_or_default();
+    let status: String = optional_property(&proxy, "Status")
+        .await
+        .unwrap_or_else(|| "Active".to_string());
+    let item_is_menu: bool = optional_property(&proxy, "ItemIsMenu")
+        .await
+        .unwrap_or_default();
 
     let needs_attention = status.eq_ignore_ascii_case("NeedsAttention");
     let icon_name_property = if needs_attention {
@@ -406,22 +448,19 @@ async fn fetch_item(connection: &Connection, key: &str) -> Result<TrayItem> {
     } else {
         "IconPixmap"
     };
-    let icon_name = match optional_property(&proxy, icon_name_property).await {
-        Some(icon_name) => icon_name,
-        None => String::new(),
-    };
-    let pixmaps = match optional_property(&proxy, pixmap_property).await {
-        Some(pixmaps) => pixmaps,
-        None => Vec::new(),
-    };
-    let icon_theme_path = match optional_property(&proxy, "IconThemePath").await {
-        Some(icon_theme_path) => icon_theme_path,
-        None => String::new(),
-    };
-    let menu_path = match optional_property::<zvariant::OwnedObjectPath>(&proxy, "Menu").await {
-        Some(menu_path) => menu_path.as_str().to_string(),
-        None => String::new(),
-    };
+    let icon_name: String = optional_property(&proxy, icon_name_property)
+        .await
+        .unwrap_or_default();
+    let pixmaps: Vec<IconPixmap> = optional_property(&proxy, pixmap_property)
+        .await
+        .unwrap_or_default();
+    let icon_theme_path: String = optional_property(&proxy, "IconThemePath")
+        .await
+        .unwrap_or_default();
+    let menu_path = optional_property::<zvariant::OwnedObjectPath>(&proxy, "Menu")
+        .await
+        .map(|menu_path| menu_path.as_str().to_string())
+        .unwrap_or_default();
 
     Ok(TrayItem {
         key: key.to_string(),
@@ -526,36 +565,39 @@ async fn fetch_menu(connection: &Connection, key: &str, menu_path: &str) -> Resu
     let message = menu_proxy
         .call_method("GetLayout", &(0i32, -1i32, requested))
         .await
-        .map_err(|error| {
-            warn!(
-                item = key,
-                path = menu_path,
-                destination,
-                ?error,
-                "dbusmenu GetLayout call failed"
-            );
-            anyhow::anyhow!("fetch dbusmenu layout for {key}: {error}")
-        })?;
+        .with_context(|| format!("call dbusmenu GetLayout on {menu_path} of {key}"))?;
 
     // The reply is `(u revision, (i id, a{sv} properties, av children))`. We read
-    // it as a raw Structure and walk it by hand because the children are
-    // recursively nested structs, which zbus's derive machinery cannot name.
+    // it as a raw Structure and walk it by hand, one layer at a time, because the
+    // children are recursively nested structs, which zbus's derive machinery
+    // cannot name.
     let body = message.body();
-    let structure: zvariant::Structure<'_> = body
-        .deserialize()
-        .map_err(|error| anyhow::anyhow!("decode dbusmenu GetLayout reply for {key}: {error}"))?;
-    let outer = structure.fields();
-    let _revision = outer.first();
-    let inner = match outer.get(1) {
-        Some(zvariant::Value::Structure(structure)) => structure,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "dbusmenu layout for {key} has no inner node struct"
-            ));
+    let structure: zvariant::Structure<'_> = match body.deserialize() {
+        Ok(structure) => structure,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("decode dbusmenu GetLayout reply for {key}"));
         }
     };
-    let root = parse_menu_node(inner)
-        .ok_or_else(|| anyhow::anyhow!("parse dbusmenu layout for {key}"))?;
+    // Field 0 is the layout revision, which we do not track: every menu open
+    // fetches a fresh layout anyway.
+    let outer = structure.fields();
+    debug!(item = key, fields = outer.len(), "dbusmenu GetLayout reply decoded");
+    let root_node = match outer.get(1) {
+        Some(zvariant::Value::Structure(root_node)) => root_node,
+        Some(other) => {
+            return Err(anyhow!(
+                "dbusmenu layout for {key} has a non-struct root node: {:?}",
+                other.value_signature()
+            ));
+        }
+        None => {
+            return Err(anyhow!("dbusmenu layout reply for {key} is missing the root node"));
+        }
+    };
+    let Some(root) = parse_menu_node(root_node) else {
+        return Err(anyhow!("dbusmenu root node for {key} does not parse as a layout node"));
+    };
 
     debug!(
         item = key,
@@ -565,21 +607,25 @@ async fn fetch_menu(connection: &Connection, key: &str, menu_path: &str) -> Resu
 
     Ok(TrayMenu {
         key: key.to_string(),
+        menu_path: menu_path.to_string(),
         items: root.children,
     })
 }
 
 // Forward a menu entry activation back to the app through dbusmenu's `Event`
 // method. The visual menu is ours, but the app still owns the action.
-async fn dbusmenu_event(connection: &Connection, key: &str, id: i32) -> Result<()> {
+// `menu_path` normally arrives with the command (captured when the menu was
+// rendered); an empty one is re-resolved from the item as a fallback.
+async fn dbusmenu_event(connection: &Connection, key: &str, menu_path: &str, id: i32) -> Result<()> {
     let (destination, _) = split_service(key)?;
-    let item = item_proxy(connection, key).await?;
-    let menu_path: zvariant::OwnedObjectPath = match optional_property(&item, "Menu").await {
-        Some(path) => path,
-        None => {
-            warn!(item = key, "Tray item has no dbusmenu to deliver event to");
-            return Ok(());
+    let menu_path = if menu_path.is_empty() {
+        let item = item_proxy(connection, key).await?;
+        match optional_property::<zvariant::OwnedObjectPath>(&item, "Menu").await {
+            Some(path) => path.as_str().to_string(),
+            None => bail!("tray item {key} has no dbusmenu to deliver event {id} to"),
         }
+    } else {
+        menu_path.to_string()
     };
     let menu_proxy = Proxy::new(connection, destination, menu_path.as_str(), DBUSMENU_INTERFACE)
         .await
@@ -637,16 +683,33 @@ fn menu_prop_toggle_state(props: &zvariant::Dict<'_, '_>) -> Option<bool> {
     }
 }
 
-// dbusmenu uses `_` as a keyboard mnemonic marker; strip it so it does not show
-// up as a literal underscore in our native menu.
+// dbusmenu labels use `_` as the keyboard mnemonic marker and `__` as an
+// escaped literal underscore. We render no mnemonics, so drop the markers and
+// collapse the escapes.
 fn strip_mnemonic(label: String) -> String {
-    label.replace('_', "")
+    let mut stripped = String::with_capacity(label.len());
+    let mut chars = label.chars();
+    while let Some(current) = chars.next() {
+        if current != '_' {
+            stripped.push(current);
+            continue;
+        }
+        match chars.next() {
+            // "__" is an escaped literal underscore.
+            Some('_') => stripped.push('_'),
+            // A single "_" marks the next character as the access key; the
+            // character itself is still displayed.
+            Some(marked) => stripped.push(marked),
+            None => {}
+        }
+    }
+    stripped
 }
 
 fn as_structure<'a>(value: &'a zvariant::Value<'a>) -> Option<&'a zvariant::Structure<'a>> {
     match value {
         zvariant::Value::Structure(structure) => Some(structure),
-        zvariant::Value::Value(inner) => as_structure(&**inner),
+        zvariant::Value::Value(inner) => as_structure(inner),
         _ => None,
     }
 }
@@ -707,11 +770,27 @@ fn parse_menu_node(node: &zvariant::Structure<'_>) -> Option<TrayMenuItem> {
     })
 }
 
+// Fire-and-forget one of the SNI click methods (Activate, SecondaryActivate,
+// ContextMenu) — they all take the click coordinates. Failures are logged, not
+// propagated: a misbehaving tray app must not take the backend down.
+async fn call_item_noreply(connection: &Connection, key: &str, method: &str, x: i32, y: i32) {
+    let proxy = match item_proxy(connection, key).await {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            warn!(item = key, method, %error, "Could not reach tray item for click");
+            return;
+        }
+    };
+    if let Err(error) = proxy.call_noreply(method, &(x, y)).await {
+        warn!(item = key, method, %error, "Tray item click method failed");
+    }
+}
+
 async fn dispatch_command(
     connection: &Connection,
     command: TrayCommand,
     menu_tx: &mpsc::UnboundedSender<TrayMenu>,
-) -> Result<()> {
+) {
     debug!(
         item = command.key,
         action = ?command.action,
@@ -721,66 +800,80 @@ async fn dispatch_command(
     );
     match command.action {
         TrayAction::Activate => {
-            let proxy = item_proxy(connection, &command.key).await?;
-            proxy
-                .call_noreply("Activate", &(command.x, command.y))
-                .await
-                .with_context(|| format!("invoke Activate on {}", command.key))?;
+            call_item_noreply(connection, &command.key, "Activate", command.x, command.y).await;
         }
         TrayAction::SecondaryActivate => {
-            let proxy = item_proxy(connection, &command.key).await?;
-            proxy
-                .call_noreply("SecondaryActivate", &(command.x, command.y))
-                .await
-                .with_context(|| format!("invoke SecondaryActivate on {}", command.key))?;
+            call_item_noreply(
+                connection,
+                &command.key,
+                "SecondaryActivate",
+                command.x,
+                command.y,
+            )
+            .await;
         }
-            TrayAction::ContextMenu => {
-                // Mirror eww: paint the dbusmenu ourselves. Fall back to the SNI's
-                // own ContextMenu method for the rare item that draws its own menu.
-                let menu_path = if !command.menu_path.is_empty() {
-                    Some(command.menu_path.clone())
-                } else {
-                    let proxy = item_proxy(connection, &command.key).await?;
-                    optional_property::<zvariant::OwnedObjectPath>(&proxy, "Menu")
-                        .await
-                        .map(|path| path.as_str().to_string())
-                };
-                match menu_path {
-                Some(path) if !path.is_empty() => match fetch_menu(connection, &command.key, &path).await {
-                    Ok(menu) => {
-                        if let Err(error) = menu_tx.send(menu) {
-                            warn!(item = command.key, %error, "Could not deliver tray menu to UI");
-                        }
+        TrayAction::ContextMenu => {
+            // Mirror eww: paint the dbusmenu ourselves. Fall back to the SNI's
+            // own ContextMenu method for the rare item that draws its own menu.
+            let menu_path = if command.menu_path.is_empty() {
+                match item_proxy(connection, &command.key).await {
+                    Ok(proxy) => {
+                        optional_property::<zvariant::OwnedObjectPath>(&proxy, "Menu")
+                            .await
+                            .map(|path| path.as_str().to_string())
+                            .unwrap_or_default()
                     }
-                    Err(error) => warn!(item = command.key, error = ?error, "Could not read tray menu; app must draw it"),
-                },
-                _ => {
-                    let proxy = item_proxy(connection, &command.key).await?;
-                    proxy
-                        .call_noreply("ContextMenu", &(command.x, command.y))
-                        .await
-                        .with_context(|| format!("invoke ContextMenu on {}", command.key))?;
+                    Err(error) => {
+                        warn!(item = command.key, %error, "Could not reach tray item to resolve its menu");
+                        String::new()
+                    }
+                }
+            } else {
+                command.menu_path.clone()
+            };
+            if menu_path.is_empty() {
+                call_item_noreply(connection, &command.key, "ContextMenu", command.x, command.y)
+                    .await;
+                return;
+            }
+            match fetch_menu(connection, &command.key, &menu_path).await {
+                Ok(menu) => {
+                    if let Err(error) = menu_tx.send(menu) {
+                        warn!(item = command.key, %error, "Could not deliver tray menu to UI");
+                    }
+                }
+                Err(error) => {
+                    // The advertised menu path was unusable; give the app one
+                    // chance to draw its own menu instead.
+                    warn!(item = command.key, error = ?error, "Could not read tray menu; asking the app to draw it");
+                    call_item_noreply(connection, &command.key, "ContextMenu", command.x, command.y)
+                        .await;
                 }
             }
         }
         TrayAction::MenuEvent(id) => {
-            if let Err(error) = dbusmenu_event(connection, &command.key, id).await {
-                warn!(%error, "Tray menu event failed");
+            if let Err(error) =
+                dbusmenu_event(connection, &command.key, &command.menu_path, id).await
+            {
+                warn!(item = command.key, entry = id, %error, "Tray menu event failed");
             }
         }
     }
-    Ok(())
 }
 
-pub async fn run_tray(
-    updates: mpsc::UnboundedSender<TrayUpdate>,
-    mut commands: mpsc::UnboundedReceiver<TrayCommand>,
-    menu_tx: mpsc::UnboundedSender<TrayMenu>,
+// One tray backend session: connect, make sure a watcher exists, register as a
+// host, then relay item updates and click commands until a stream or channel
+// closes under us. The channel ends are borrowed so the supervisor can retry
+// with the same GTK-side wiring.
+async fn run_tray(
+    updates: &mpsc::UnboundedSender<TrayUpdate>,
+    commands: &mut mpsc::UnboundedReceiver<TrayCommand>,
+    menu_tx: &mpsc::UnboundedSender<TrayMenu>,
 ) -> Result<()> {
     let connection = Connection::session()
         .await
         .context("connect tray to session D-Bus")?;
-    ensure_watcher(&connection).await?;
+    let watcher_monitor = ensure_watcher(&connection).await?;
 
     let watcher = watcher_proxy(&connection).await?;
     watcher
@@ -790,10 +883,12 @@ pub async fn run_tray(
 
     let mut registered = watcher
         .receive_signal("StatusNotifierItemRegistered")
-        .await?;
+        .await
+        .context("subscribe to tray item registrations")?;
     let mut unregistered = watcher
         .receive_signal("StatusNotifierItemUnregistered")
-        .await?;
+        .await
+        .context("subscribe to tray item removals")?;
     let initial: Vec<String> = match watcher.get_property("RegisteredStatusNotifierItems").await {
         Ok(items) => items,
         Err(error) => {
@@ -804,19 +899,28 @@ pub async fn run_tray(
 
     let mut monitors = HashMap::new();
     for service in initial {
-        start_item_monitor(&connection, service, &updates, &mut monitors);
+        start_item_monitor(&connection, service, updates, &mut monitors);
     }
 
     loop {
         tokio::select! {
             message = registered.next() => {
                 let Some(message) = message else { break };
-                let service: String = message.body().deserialize()?;
-                start_item_monitor(&connection, service, &updates, &mut monitors);
+                // A malformed signal must not take the whole backend down; skip it.
+                match message.body().deserialize::<String>() {
+                    Ok(service) => start_item_monitor(&connection, service, updates, &mut monitors),
+                    Err(error) => warn!(%error, "Could not decode tray item registration signal"),
+                }
             }
             message = unregistered.next() => {
                 let Some(message) = message else { break };
-                let service: String = message.body().deserialize()?;
+                let service: String = match message.body().deserialize() {
+                    Ok(service) => service,
+                    Err(error) => {
+                        warn!(%error, "Could not decode tray item removal signal");
+                        continue;
+                    }
+                };
                 if let Some(handle) = monitors.remove(&service) {
                     handle.abort();
                 }
@@ -826,15 +930,63 @@ pub async fn run_tray(
             }
             command = commands.recv() => {
                 let Some(command) = command else { break };
-                if let Err(error) = dispatch_command(&connection, command, &menu_tx).await {
-                    warn!(%error, "Tray click failed");
-                }
+                dispatch_command(&connection, command, menu_tx).await;
             }
         }
     }
 
+    // The loop only breaks when a stream or channel closed under us; abort the
+    // spawned tasks so a supervised retry starts from a clean slate.
+    for handle in monitors.into_values() {
+        handle.abort();
+    }
+    if let Some(handle) = watcher_monitor {
+        handle.abort();
+    }
     debug!("Tray backend stopped");
     Ok(())
+}
+
+// Supervised wrapper around run_tray. The inner session only returns when the
+// watcher signal streams or the command channel close under it (session bus
+// restart, UI teardown). Same backoff policy as the Hyprland/D-Bus supervisors —
+// the failure modes are equivalent (IPC peer gone, transient setup error).
+// Spec-compliant SNI applications watch the watcher name and re-register when a
+// new one appears, so items repopulate after a reconnect on their own.
+//
+// This function never returns and is meant to be `tokio::spawn`ed from the
+// widget setup. It owns the channel ends across retries: the GTK side keeps
+// its receiver and senders wired to the same channels for the process lifetime.
+pub async fn run_tray_supervised(
+    updates: mpsc::UnboundedSender<TrayUpdate>,
+    mut commands: mpsc::UnboundedReceiver<TrayCommand>,
+    menu_tx: mpsc::UnboundedSender<TrayMenu>,
+) {
+    let max_delay = Duration::from_secs(60);
+    let reset_threshold = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        let started = Instant::now();
+        info!("🔌 Starting system tray backend");
+        match run_tray(&updates, &mut commands, &menu_tx).await {
+            Ok(()) => {
+                warn!("⚠️ Tray backend returned cleanly (stream closed)");
+            }
+            Err(e) => {
+                error!("❌ Tray backend crashed: {:#}", e);
+            }
+        }
+
+        if started.elapsed() >= reset_threshold {
+            debug!("🔄 Tray backend ran for {:?}, resetting backoff", started.elapsed());
+            delay = Duration::from_secs(1);
+        }
+
+        warn!("🔄 Restarting tray backend in {:?}", delay);
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, max_delay);
+    }
 }
 
 #[cfg(test)]
@@ -870,5 +1022,77 @@ mod tests {
             largest_valid_pixmap(vec![small, large.clone(), malformed]),
             Some(large)
         );
+    }
+
+    #[test]
+    fn mnemonic_markers_are_dropped_and_escapes_collapsed() {
+        assert_eq!(strip_mnemonic("_File".to_string()), "File");
+        assert_eq!(strip_mnemonic("Save _As".to_string()), "Save As");
+        assert_eq!(strip_mnemonic("snake__case".to_string()), "snake_case");
+        assert_eq!(strip_mnemonic("plain".to_string()), "plain");
+        assert_eq!(strip_mnemonic("trailing_".to_string()), "trailing");
+    }
+
+    // Build a layout node the same shape GetLayout returns: `(i id, a{sv}
+    // properties, av children)`. The HashMap conversion wraps every property
+    // value in a variant, which is also how zbus hands back `a{sv}` entries on
+    // the wire — so these nodes exercise menu_prop's variant-unwrapping layer.
+    fn layout_node<'a>(
+        id: i32,
+        props: Vec<(&'a str, zvariant::Value<'a>)>,
+        children: Vec<zvariant::Value<'a>>,
+    ) -> zvariant::Structure<'a> {
+        let props: std::collections::HashMap<&str, zvariant::Value> =
+            props.into_iter().collect();
+        zvariant::StructureBuilder::new()
+            .add_field(id)
+            .add_field(props)
+            .add_field(children)
+            .build()
+            .expect("test layout node is a valid structure")
+    }
+
+    #[test]
+    fn parses_menu_node_with_variant_wrapped_properties() {
+        let child = layout_node(
+            7,
+            vec![
+                ("label", zvariant::Value::from("_Quit")),
+                ("enabled", zvariant::Value::from(false)),
+                ("toggle-type", zvariant::Value::from("checkmark")),
+                ("toggle-state", zvariant::Value::from(1i32)),
+            ],
+            Vec::new(),
+        );
+        let root = layout_node(
+            0,
+            vec![("children-display", zvariant::Value::from("submenu"))],
+            vec![zvariant::Value::Structure(child)],
+        );
+
+        let parsed = parse_menu_node(&root).expect("root node parses");
+        assert_eq!(parsed.id, 0);
+        assert_eq!(parsed.children.len(), 1);
+
+        let entry = &parsed.children[0];
+        assert_eq!(entry.id, 7);
+        assert_eq!(entry.label.as_deref(), Some("Quit"));
+        assert!(!entry.enabled);
+        assert!(entry.visible, "visible defaults to true when omitted");
+        assert!(!entry.is_separator);
+        assert_eq!(entry.toggle_type.as_deref(), Some("checkmark"));
+        assert_eq!(entry.toggle_state, Some(true));
+    }
+
+    #[test]
+    fn parses_separator_node() {
+        let separator = layout_node(
+            3,
+            vec![("type", zvariant::Value::from("separator"))],
+            Vec::new(),
+        );
+        let parsed = parse_menu_node(&separator).expect("separator parses");
+        assert!(parsed.is_separator);
+        assert_eq!(parsed.label, None);
     }
 }

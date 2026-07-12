@@ -5,8 +5,10 @@
 // (hypr, dbus, pw); this module never knows what's inside the channel, only
 // that strings/structs come out and labels go in.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::Result;
 use chrono::Local;
@@ -229,6 +231,8 @@ fn argb_to_rgba(width: i32, height: i32, argb: &[u8]) -> Option<Vec<u8>> {
     Some(rgba)
 }
 
+const TRAY_ICON_SIZE: i32 = 20;
+
 // A themed icon that has_icon() reports as present can still be impossible to
 // draw: when the matching file needs a gdk-pixbuf loader that is not installed
 // (e.g. an SVG-only icon with no librsvg loader) GTK resolves it to nothing and
@@ -239,7 +243,7 @@ fn named_icon_render_error(icon_theme: &gtk4::IconTheme, name: &str, scale: i32)
     let paintable = icon_theme.lookup_icon(
         name,
         &[],
-        20,
+        TRAY_ICON_SIZE,
         scale.max(1),
         gtk4::TextDirection::None,
         gtk4::IconLookupFlags::empty(),
@@ -274,12 +278,9 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
     }
 
     // An absolute path points straight at an icon file on disk.
-    if !item.icon_name.is_empty()
-        && Path::new(&item.icon_name).is_absolute()
-        && Path::new(&item.icon_name).is_file()
-    {
-        image.set_from_file(Some(&item.icon_name));
-        image.set_pixel_size(20);
+    let icon_path = Path::new(&item.icon_name);
+    if !item.icon_name.is_empty() && icon_path.is_absolute() && icon_path.is_file() {
+        image.set_from_file(Some(icon_path));
         return;
     }
     // A named icon is resolved through the theme. set_icon_name (rather than
@@ -291,7 +292,6 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
         match named_icon_render_error(&icon_theme, &item.icon_name, image.scale_factor()) {
             None => {
                 image.set_icon_name(Some(&item.icon_name));
-                image.set_pixel_size(20);
                 return;
             }
             Some(reason) => warn!(
@@ -315,14 +315,12 @@ fn update_tray_image(image: &gtk4::Image, item: &TrayItem) {
                     (*width as usize) * 4,
                 );
                 image.set_paintable(Some(&texture));
-                image.set_pixel_size(20);
             }
             None => image.set_icon_name(Some("image-missing")),
         },
         None => {
             warn!(item = item.key, icon_name = item.icon_name, "Tray item has no usable icon");
             image.set_icon_name(Some("image-missing"));
-            image.set_pixel_size(20);
         }
     }
 }
@@ -345,17 +343,29 @@ fn update_tray_button(button: &gtk4::Button, image: &gtk4::Image, item: &TrayIte
     update_tray_image(image, item);
 }
 
-fn create_tray_button(
-    item: &TrayItem,
-    commands: &mpsc::UnboundedSender<TrayCommand>,
-) -> (gtk4::Button, gtk4::Image) {
+// One live tray icon: the button in the bar, the image inside it, the latest
+// item state shared with the click handler (so upserts retarget clicks without
+// rebuilding the widget — apps commonly set Menu/ItemIsMenu only after they
+// register), and the popovers of the currently open dropdown menu (tracked so
+// they can be unparented when the menu closes or the item goes away).
+struct TrayEntry {
+    button: gtk4::Button,
+    image: gtk4::Image,
+    state: Rc<RefCell<TrayItem>>,
+    open_menu: Rc<RefCell<Vec<gtk4::Popover>>>,
+}
+
+fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayCommand>) -> TrayEntry {
     let button = gtk4::Button::new();
     button.add_css_class("tray-item");
     button.set_focusable(false);
 
     let image = gtk4::Image::new();
+    image.set_pixel_size(TRAY_ICON_SIZE);
     button.set_child(Some(&image));
-    update_tray_button(&button, &image, item);
+    update_tray_button(&button, &image, &item);
+
+    let state = Rc::new(RefCell::new(item));
 
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(0);
@@ -363,27 +373,33 @@ fn create_tray_button(
     // internal GestureClick does not swallow the release — without this our
     // `released` handler never fires and clicks do nothing.
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let key = item.key.clone();
-    let item_is_menu = item.item_is_menu;
-    let menu_path = item.menu_path.clone();
-    let commands = commands.clone();
-    let button_for_click = button.clone();
-    let key_pressed = key.clone();
+    let state_for_press = state.clone();
     gesture.connect_pressed(move |gesture_pressed, _press_count, x, y| {
+        let item = state_for_press.borrow();
         debug!(
-            item = key_pressed,
+            item = item.key,
             button = gesture_pressed.current_button(),
             x, y,
             "Tray button pressed"
         );
         gesture_pressed.set_state(gtk4::EventSequenceState::Claimed);
     });
+    let commands = commands.clone();
+    let state_for_release = state.clone();
+    // Weak: the gesture lives on the button, so capturing the button strongly
+    // here would cycle (button -> gesture -> closure -> button) and leak it
+    // once the item is removed from the bar.
+    let button_weak = button.downgrade();
     gesture.connect_released(move |gesture, _press_count, x, y| {
+        let (key, item_is_menu, menu_path) = {
+            let item = state_for_release.borrow();
+            (item.key.clone(), item.item_is_menu, item.menu_path.clone())
+        };
         debug!(
             item = key,
             button = gesture.current_button(),
-            x, y,
-            "Tray button released (item_is_menu={})", item_is_menu
+            x, y, item_is_menu,
+            "Tray button released"
         );
         let action = match gesture.current_button() {
             1 if item_is_menu => TrayAction::ContextMenu,
@@ -395,11 +411,15 @@ fn create_tray_button(
                 return;
             }
         };
-        let (x, y) = match button_for_click.root() {
+        let Some(button) = button_weak.upgrade() else {
+            debug!(item = key, "Tray button was dropped before click handling");
+            return;
+        };
+        let (x, y) = match button.root() {
             Some(root) => match root.downcast::<gtk4::Window>() {
                 Ok(root_window) => {
                     let point = gtk4::graphene::Point::new(x as f32, y as f32);
-                    match button_for_click.compute_point(&root_window, &point) {
+                    match button.compute_point(&root_window, &point) {
                         Some(point) => (point.x().round() as i32, point.y().round() as i32),
                         None => {
                             debug!(item = key, "Could not translate tray click to bar coordinates");
@@ -422,7 +442,7 @@ fn create_tray_button(
             action,
             x,
             y,
-            menu_path: menu_path.clone(),
+            menu_path,
         };
         if let Err(error) = commands.send(command) {
             warn!(item = key, %error, "Could not send tray click to D-Bus backend");
@@ -430,7 +450,12 @@ fn create_tray_button(
     });
     button.add_controller(gesture);
 
-    (button, image)
+    TrayEntry {
+        button,
+        image,
+        state,
+        open_menu: Rc::new(RefCell::new(Vec::new())),
+    }
 }
 
 pub fn setup_tray_updates(container: gtk4::Box) {
@@ -439,33 +464,38 @@ pub fn setup_tray_updates(container: gtk4::Box) {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (menu_tx, mut menu_rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(async move {
-        if let Err(error) = tray::run_tray(update_tx, command_rx, menu_tx).await {
-            warn!(%error, "System tray backend stopped");
-        }
-    });
+    tokio::spawn(tray::run_tray_supervised(update_tx, command_rx, menu_tx));
 
     glib::spawn_future_local(async move {
-        let mut items: HashMap<String, (gtk4::Button, gtk4::Image)> = HashMap::new();
+        let mut entries: HashMap<String, TrayEntry> = HashMap::new();
         loop {
             tokio::select! {
                 update = update_rx.recv() => {
                     let Some(update) = update else { break };
                     match update {
-                        TrayUpdate::Upsert(item) => match items.get(&item.key) {
-                            Some((button, image)) => update_tray_button(button, image, &item),
+                        TrayUpdate::Upsert(item) => match entries.get(&item.key) {
+                            Some(entry) => {
+                                update_tray_button(&entry.button, &entry.image, &item);
+                                *entry.state.borrow_mut() = item;
+                            }
                             None => {
-                                let (button, image) = create_tray_button(&item, &command_tx);
-                                container.append(&button);
-                                items.insert(item.key.clone(), (button, image));
+                                let key = item.key.clone();
+                                let entry = create_tray_entry(item, &command_tx);
+                                container.append(&entry.button);
+                                entries.insert(key.clone(), entry);
                                 container.set_visible(true);
-                                info!(item = item.key, "Added system tray item");
+                                info!(item = key, "Added system tray item");
                             }
                         },
-                        TrayUpdate::Remove(key) => match items.remove(&key) {
-                            Some((button, _image)) => {
-                                container.remove(&button);
-                                container.set_visible(!items.is_empty());
+                        TrayUpdate::Remove(key) => match entries.remove(&key) {
+                            Some(entry) => {
+                                // Unparent any open menu first: popovers are only
+                                // attached to the button, not laid-out children,
+                                // and GTK complains when a widget is finalized
+                                // with one still attached.
+                                close_tray_menu(&entry.open_menu);
+                                container.remove(&entry.button);
+                                container.set_visible(!entries.is_empty());
                                 info!(item = key, "Removed system tray item");
                             }
                             None => debug!(item = key, "Ignoring removal of unknown tray item"),
@@ -473,9 +503,12 @@ pub fn setup_tray_updates(container: gtk4::Box) {
                     }
                 }
                 menu = menu_rx.recv() => {
-                    let Some(menu) = menu else { continue };
-                    match items.get(&menu.key) {
-                        Some((button, _image)) => show_tray_menu(button, &menu, &command_tx),
+                    // The supervised backend holds menu_tx for the process
+                    // lifetime, so None means teardown, same as the update arm
+                    // (a `continue` here would busy-spin the select loop).
+                    let Some(menu) = menu else { break };
+                    match entries.get(&menu.key) {
+                        Some(entry) => show_tray_menu(entry, &menu, &command_tx),
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
                 }
@@ -485,6 +518,19 @@ pub fn setup_tray_updates(container: gtk4::Box) {
     });
 }
 
+// Unparent every popover of an entry's open menu, if any. GTK4 popovers are
+// not laid-out children: set_parent only attaches them, and skipping the
+// explicit unparent leaks them (with a GTK warning) once the parent button is
+// finalized. Runs from the tray select loop, never from event dispatch, so the
+// widget tree can be mutated directly here.
+fn close_tray_menu(open_menu: &Rc<RefCell<Vec<gtk4::Popover>>>) {
+    let popovers: Vec<gtk4::Popover> = open_menu.borrow_mut().drain(..).collect();
+    for popover in popovers {
+        popover.popdown();
+        popover.unparent();
+    }
+}
+
 // Render a tray item's dbusmenu as a native GTK popover. We build the menu from
 // concrete `Button` widgets (instead of `PopoverMenu::from_model`) because the
 // model-based popover constructs its widgets lazily and cannot measure its size
@@ -492,12 +538,15 @@ pub fn setup_tray_updates(container: gtk4::Box) {
 // layer-shell surface. Concrete widgets measure immediately. Activating an entry
 // forwards the entry id back to the backend, which calls dbusmenu's `Event`.
 fn show_tray_menu(
-    button: &gtk4::Button,
+    entry: &TrayEntry,
     menu: &TrayMenu,
     command_tx: &mpsc::UnboundedSender<TrayCommand>,
 ) {
-    let popover = gtk4::Popover::builder().build();
-    popover.set_parent(button);
+    // A previous menu may still be attached (or even open) — replace it.
+    close_tray_menu(&entry.open_menu);
+
+    let popover = gtk4::Popover::new();
+    popover.set_parent(&entry.button);
     popover.set_position(gtk4::PositionType::Bottom);
     popover.set_has_arrow(false);
 
@@ -508,11 +557,31 @@ fn show_tray_menu(
         labels = ?menu.items.iter().map(|i| &i.label).collect::<Vec<_>>(),
         "Tray menu entry labels"
     );
-    let popover_weak = gtk4::glib::object::WeakRef::new();
-    popover_weak.set(Some(&popover));
-    build_menu_box(&box_, &menu.items, command_tx, &menu.key, &popover_weak);
-
+    let popover_weak = popover.downgrade();
+    let mut popovers = vec![popover.clone()];
+    build_menu_box(&box_, &menu.items, command_tx, menu, &popover_weak, &mut popovers);
     popover.set_child(Some(&box_));
+
+    *entry.open_menu.borrow_mut() = popovers;
+    let open_menu_weak = Rc::downgrade(&entry.open_menu);
+    popover.connect_closed(move |_popover| {
+        let Some(open_menu) = open_menu_weak.upgrade() else { return };
+        let closed: Vec<gtk4::Popover> = open_menu.borrow_mut().drain(..).collect();
+        if closed.is_empty() {
+            // close_tray_menu already tore this menu down (item removal or a
+            // reopen); nothing left to do.
+            return;
+        }
+        // `closed` fires during event dispatch (e.g. the click-outside that
+        // dismissed the menu), and unparenting mid-dispatch breaks GTK's
+        // active-state accounting — defer the teardown to an idle callback.
+        glib::idle_add_local_once(move || {
+            for popover in &closed {
+                popover.unparent();
+            }
+        });
+    });
+
     debug!(
         item = menu.key,
         entries = menu.items.len(),
@@ -521,15 +590,18 @@ fn show_tray_menu(
     popover.popup();
 }
 
-// Recursively fill `box_` with the dbusmenu entries. `popover_weak` is the top
+// Recursively fill `box_` with the dbusmenu entries. `top_popover` is the top
 // popover so any leaf entry activation can close the whole menu, including
-// submenus (whose own activation bubbles up to the same popover).
+// submenus (whose own activation bubbles up to the same popover). Every popover
+// built here is also pushed into `popovers` so the caller can unparent the full
+// set when the menu goes away.
 fn build_menu_box(
     box_: &gtk4::Box,
     items: &[TrayMenuItem],
     command_tx: &mpsc::UnboundedSender<TrayCommand>,
-    key: &str,
-    popover_weak: &gtk4::glib::object::WeakRef<gtk4::Popover>,
+    menu: &TrayMenu,
+    top_popover: &glib::object::WeakRef<gtk4::Popover>,
+    popovers: &mut Vec<gtk4::Popover>,
 ) {
     for item in items {
         if !item.visible {
@@ -578,34 +650,52 @@ fn build_menu_box(
 
         if item.children.is_empty() {
             let command_tx = command_tx.clone();
-            let key = key.to_string();
-            let popover_weak = popover_weak.clone();
+            let key = menu.key.clone();
+            let menu_path = menu.menu_path.clone();
+            let top_popover = top_popover.clone();
             let id = item.id;
             entry.connect_clicked(move |_button| {
-                if let Some(popover) = popover_weak.upgrade() {
-                    popover.popdown();
-                }
+                // `clicked` fires mid release-event dispatch; popping the menu
+                // down right here unmaps the widgets under the pointer and
+                // breaks GTK's active-state accounting ("Broken accounting of
+                // active state" warnings on the entry icons). Defer it.
+                let top_popover = top_popover.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(popover) = top_popover.upgrade() {
+                        popover.popdown();
+                    }
+                });
                 let command = TrayCommand {
                     key: key.clone(),
                     action: TrayAction::MenuEvent(id),
                     x: 0,
                     y: 0,
-                    menu_path: String::new(),
+                    menu_path: menu_path.clone(),
                 };
                 if let Err(error) = command_tx.send(command) {
                     warn!(item = key, %error, "Could not send tray menu event to backend");
                 }
             });
         } else {
-            let sub_popover = gtk4::Popover::builder().build();
+            let sub_popover = gtk4::Popover::new();
             sub_popover.set_parent(&entry);
             sub_popover.set_position(gtk4::PositionType::Right);
             let sub_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             sub_box.add_css_class("tray-menu");
-            build_menu_box(&sub_box, &item.children, command_tx, key, popover_weak);
+            build_menu_box(&sub_box, &item.children, command_tx, menu, top_popover, popovers);
             sub_popover.set_child(Some(&sub_box));
+            popovers.push(sub_popover.clone());
+            // Weak for the same cycle reason as the tray button gesture: the
+            // closure lives on `entry`, which the popover is attached to.
+            let sub_popover_weak = sub_popover.downgrade();
             entry.connect_clicked(move |_button| {
-                sub_popover.popup();
+                // Same deferral as leaf entries, for the same accounting reason.
+                let sub_popover_weak = sub_popover_weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(popover) = sub_popover_weak.upgrade() {
+                        popover.popup();
+                    }
+                });
             });
         }
 

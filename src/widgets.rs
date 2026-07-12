@@ -572,17 +572,19 @@ impl Drop for KeyboardGrabLease {
 // key controllers stay dumb: they translate a keypress into one of these and
 // send it to the tray task, which owns the whole navigation state machine (so
 // socket verbs and native keys can never disagree about where we are).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum NavCmd {
-    Left,       // h / Left
-    Right,      // l / Right
-    Down,       // j / Down
-    Up,         // k / Up
-    First,      // gg / Home
-    Last,       // G / End
-    Activate,   // Enter
-    Escape,     // q / Esc (two-step: deeper -> level 0, level 0 -> release)
-    UserClosed, // the popover was dismissed by a click outside it
+    Left,     // h / Left
+    Right,    // l / Right
+    Down,     // j / Down
+    Up,       // k / Up
+    First,    // gg / Home
+    Last,     // G / End
+    Activate, // Enter
+    Escape,   // q / Esc (two-step: deeper -> level 0, level 0 -> release)
+    UserClosed { request_id: u64 },
+    MenuTimeout { request_id: u64 },
+    MouseAction(TrayCommand),
 }
 
 // The live keyboard-navigation session. Present only while the grab is held.
@@ -595,6 +597,7 @@ struct NavActive {
     #[allow(dead_code)]
     lease: KeyboardGrabLease,
     key: String,
+    menu_request_id: u64,
     in_menu: bool,
 }
 
@@ -939,10 +942,34 @@ fn handle_ipc_request(
     IpcResponse::success(vec![selected])
 }
 
+fn ipc_request_targets_nav(
+    request: &IpcRequest,
+    nav: &Option<NavActive>,
+    order: &[String],
+    entries: &HashMap<String, TrayEntry>,
+) -> bool {
+    let Some(active) = nav.as_ref() else {
+        return false;
+    };
+    let target = match request {
+        IpcRequest::Activate { target }
+        | IpcRequest::SecondaryActivate { target }
+        | IpcRequest::ContextMenu { target }
+        | IpcRequest::KeyboardMenu { target }
+        | IpcRequest::MenuNext { target }
+        | IpcRequest::MenuPrevious { target }
+        | IpcRequest::MenuActivate { target }
+        | IpcRequest::MenuClick { target, .. } => target,
+        IpcRequest::List | IpcRequest::CloseMenus => return false,
+    };
+    resolve_ipc_target(target, order, entries)
+        .is_ok_and(|(_, entry)| entry.state.borrow().key == active.key)
+}
+
 fn create_tray_entry(
     item: TrayItem,
-    commands: &mpsc::UnboundedSender<TrayCommand>,
     menu_requests: &Rc<Cell<u64>>,
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
 ) -> TrayEntry {
     let button = gtk4::Button::new();
     button.add_css_class("tray-item");
@@ -972,7 +999,7 @@ fn create_tray_entry(
         );
         gesture_pressed.set_state(gtk4::EventSequenceState::Claimed);
     });
-    let commands = commands.clone();
+    let nav_tx = nav_tx.clone();
     let menu_requests = menu_requests.clone();
     let state_for_release = state.clone();
     // Weak: the gesture lives on the button, so capturing the button strongly
@@ -1044,8 +1071,8 @@ fn create_tray_entry(
             y,
             menu_path,
         };
-        if let Err(error) = commands.send(command) {
-            warn!(item = key, %error, "Could not send tray click to D-Bus backend");
+        if let Err(error) = nav_tx.send(NavCmd::MouseAction(command)) {
+            warn!(item = key, %error, "Could not queue tray click for D-Bus backend");
         }
     });
     button.add_controller(gesture);
@@ -1099,7 +1126,11 @@ pub fn setup_tray_updates(
                             }
                             None => {
                                 let key = item.key.clone();
-                                let entry = create_tray_entry(item, &commands, &menu_requests);
+                                let entry = create_tray_entry(
+                                    item,
+                                    &menu_requests,
+                                    &nav_tx,
+                                );
                                 container.append(&entry.button);
                                 entries.insert(key.clone(), entry);
                                 order.push(key.clone());
@@ -1128,7 +1159,7 @@ pub fn setup_tray_updates(
                                         .map(|index| index.min(order.len().saturating_sub(1)))
                                         .filter(|_| !order.is_empty())
                                     else {
-                                        end_nav(&mut nav, &container, &entries);
+                                        end_nav(&mut nav, &container, &entries, &menu_requests);
                                         continue;
                                     };
                                     if let Err(error) = start_nav(
@@ -1143,7 +1174,7 @@ pub fn setup_tray_updates(
                                         &menu_requests,
                                     ) {
                                         warn!(%error, "Ending tray navigation after item removal");
-                                        end_nav(&mut nav, &container, &entries);
+                                        end_nav(&mut nav, &container, &entries, &menu_requests);
                                     }
                                 }
                             }
@@ -1177,6 +1208,7 @@ pub fn setup_tray_updates(
                     handle_nav(
                         nav_cmd,
                         &mut nav,
+                        &nav_tx,
                         &order,
                         &entries,
                         &container,
@@ -1223,7 +1255,7 @@ pub fn setup_tray_updates(
                         // close-menus also releases the grab, so it is a
                         // reliable kill-switch for a stuck nav session.
                         IpcRequest::CloseMenus => {
-                            end_nav(&mut nav, &container, &entries);
+                            end_nav(&mut nav, &container, &entries, &menu_requests);
                             handle_ipc_request(
                                 IpcRequest::CloseMenus,
                                 &order,
@@ -1232,13 +1264,54 @@ pub fn setup_tray_updates(
                                 &menu_requests,
                             )
                         }
-                        other => handle_ipc_request(
-                            other,
-                            &order,
-                            &entries,
-                            &commands,
-                            &menu_requests,
-                        ),
+                        other => {
+                            let targets_nav = ipc_request_targets_nav(
+                                &other,
+                                &nav,
+                                &order,
+                                &entries,
+                            );
+                            let ends_nav = matches!(
+                                &other,
+                                IpcRequest::Activate { .. }
+                                    | IpcRequest::SecondaryActivate { .. }
+                                    | IpcRequest::ContextMenu { .. }
+                                    | IpcRequest::MenuClick { .. }
+                            );
+                            let activates_menu =
+                                matches!(&other, IpcRequest::MenuActivate { .. });
+                            let enters_menu = matches!(
+                                &other,
+                                IpcRequest::MenuNext { .. } | IpcRequest::MenuPrevious { .. }
+                            );
+                            let response = handle_ipc_request(
+                                other,
+                                &order,
+                                &entries,
+                                &commands,
+                                &menu_requests,
+                            );
+                            if response.ok && ends_nav {
+                                end_nav(&mut nav, &container, &entries, &menu_requests);
+                            } else if response.ok && targets_nav && enters_menu {
+                                if let Some(active) = nav.as_mut() {
+                                    active.in_menu = true;
+                                }
+                            } else if response.ok && targets_nav && activates_menu {
+                                let menu_still_open = nav
+                                    .as_ref()
+                                    .and_then(|active| entries.get(&active.key))
+                                    .is_some_and(|entry| entry.open_menu.borrow().is_some());
+                                if menu_still_open {
+                                    if let Some(active) = nav.as_mut() {
+                                        active.in_menu = true;
+                                    }
+                                } else {
+                                    end_nav(&mut nav, &container, &entries, &menu_requests);
+                                }
+                            }
+                            response
+                        }
                     };
                     if request.response.send(response).is_err() {
                         debug!("Tray IPC client disconnected before receiving its response");
@@ -1319,7 +1392,7 @@ fn update_nav_highlight(entries: &HashMap<String, TrayEntry>, order: &[String], 
     }
 }
 
-fn move_tray_index(index: usize, len: usize, cmd: NavCmd) -> Option<usize> {
+fn move_tray_index(index: usize, len: usize, cmd: &NavCmd) -> Option<usize> {
     if len == 0 {
         return None;
     }
@@ -1356,13 +1429,15 @@ fn open_icon_menu(
     entry: &TrayEntry,
     commands: &mpsc::UnboundedSender<TrayCommand>,
     menu_requests: &Rc<Cell<u64>>,
-) -> std::result::Result<(), String> {
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
+) -> std::result::Result<u64, String> {
     let (x, y) = tray_button_coordinates(&entry.button);
     let item = entry.state.borrow();
+    let request_id = next_menu_request(menu_requests);
     let command = TrayCommand {
         key: item.key.clone(),
         action: TrayAction::ContextMenu {
-            request_id: next_menu_request(menu_requests),
+            request_id,
             keyboard_grab: true,
         },
         x,
@@ -1371,7 +1446,12 @@ fn open_icon_menu(
     };
     commands
         .send(command)
-        .map_err(|error| format!("could not open tray menu for keyboard nav: {error}"))
+        .map_err(|error| format!("could not open tray menu for keyboard nav: {error}"))?;
+    let nav_tx = nav_tx.clone();
+    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+        let _ = nav_tx.send(NavCmd::MenuTimeout { request_id });
+    });
+    Ok(request_id)
 }
 
 // Start (or retarget) a keyboard-navigation session at `index`, entering at
@@ -1411,6 +1491,7 @@ fn start_nav(
             *nav = Some(NavActive {
                 lease,
                 key: key.clone(),
+                menu_request_id: request_id,
                 in_menu: false,
             });
         }
@@ -1420,7 +1501,11 @@ fn start_nav(
         close_tray_menu(&entry.open_menu);
     }
     update_nav_highlight(entries, order, index);
-    open_icon_menu(entry, commands, menu_requests)
+    let request_id = open_icon_menu(entry, commands, menu_requests, nav_tx)?;
+    if let Some(active) = nav.as_mut() {
+        active.menu_request_id = request_id;
+    }
+    Ok(())
 }
 
 // Tear the session down: release the grab (dropping the lease restores focus to
@@ -1429,10 +1514,14 @@ fn end_nav(
     nav: &mut Option<NavActive>,
     container: &gtk4::Box,
     entries: &HashMap<String, TrayEntry>,
+    menu_requests: &Cell<u64>,
 ) {
     let Some(active) = nav.take() else {
         return;
     };
+    if menu_requests.get() == active.menu_request_id {
+        next_menu_request(menu_requests);
+    }
     for entry in entries.values() {
         close_tray_menu(&entry.open_menu);
         entry.button.remove_css_class("nav-selected");
@@ -1450,15 +1539,27 @@ fn end_nav(
 fn handle_nav(
     cmd: NavCmd,
     nav: &mut Option<NavActive>,
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
     order: &[String],
     entries: &HashMap<String, TrayEntry>,
     container: &gtk4::Box,
     commands: &mpsc::UnboundedSender<TrayCommand>,
     menu_requests: &Rc<Cell<u64>>,
 ) {
+    let cmd = match cmd {
+        NavCmd::MouseAction(command) => {
+            end_nav(nav, container, entries, menu_requests);
+            if let Err(error) = commands.send(command) {
+                warn!(%error, "Could not send tray click to D-Bus backend");
+            }
+            return;
+        }
+        other => other,
+    };
+
     // Snapshot the session; a late key after release finds nothing to drive.
-    let (key, in_menu) = match nav.as_ref() {
-        Some(active) => (active.key.clone(), active.in_menu),
+    let (key, in_menu, menu_request_id) = match nav.as_ref() {
+        Some(active) => (active.key.clone(), active.in_menu, active.menu_request_id),
         None => return,
     };
     let Some(index) = order.iter().position(|candidate| candidate == &key) else {
@@ -1466,15 +1567,37 @@ fn handle_nav(
             item = key,
             "Ending tray navigation after its selected item disappeared"
         );
-        end_nav(nav, container, entries);
+        end_nav(nav, container, entries, menu_requests);
         return;
     };
 
-    match cmd {
-        NavCmd::UserClosed => {
-            end_nav(nav, container, entries);
+    match &cmd {
+        NavCmd::UserClosed { request_id } if *request_id == menu_request_id => {
+            end_nav(nav, container, entries, menu_requests);
             return;
         }
+        NavCmd::UserClosed { request_id } => {
+            debug!(
+                request_id,
+                current_request_id = menu_request_id,
+                "Ignoring stale tray menu close"
+            );
+            return;
+        }
+        NavCmd::MenuTimeout { request_id } if *request_id == menu_request_id => {
+            let menu_loaded = entries
+                .get(&key)
+                .is_some_and(|entry| entry.open_menu.borrow().is_some());
+            if !menu_loaded {
+                warn!(
+                    item = key,
+                    request_id, "Tray menu did not load before timeout"
+                );
+                end_nav(nav, container, entries, menu_requests);
+            }
+            return;
+        }
+        NavCmd::MenuTimeout { .. } => return,
         NavCmd::Escape => {
             if in_menu {
                 if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
@@ -1484,7 +1607,7 @@ fn handle_nav(
                     active.in_menu = false;
                 }
             } else {
-                end_nav(nav, container, entries);
+                end_nav(nav, container, entries, menu_requests);
             }
             return;
         }
@@ -1499,7 +1622,7 @@ fn handle_nav(
         }
         match cmd {
             NavCmd::Left | NavCmd::Right | NavCmd::First | NavCmd::Last => {
-                let Some(new_index) = move_tray_index(index, len, cmd) else {
+                let Some(new_index) = move_tray_index(index, len, &cmd) else {
                     return;
                 };
                 if new_index == index {
@@ -1513,9 +1636,16 @@ fn handle_nav(
                 }
                 update_nav_highlight(entries, order, new_index);
                 if let Some(entry) = order.get(new_index).and_then(|key| entries.get(key)) {
-                    if let Err(error) = open_icon_menu(entry, commands, menu_requests) {
-                        warn!(%error, "Ending tray navigation after icon switch failed");
-                        end_nav(nav, container, entries);
+                    match open_icon_menu(entry, commands, menu_requests, nav_tx) {
+                        Ok(request_id) => {
+                            if let Some(active) = nav.as_mut() {
+                                active.menu_request_id = request_id;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "Ending tray navigation after icon switch failed");
+                            end_nav(nav, container, entries, menu_requests);
+                        }
                     }
                 }
             }
@@ -1523,7 +1653,7 @@ fn handle_nav(
                 // Either vertical direction enters the dropdown. Down/Enter
                 // select its first entry; Up selects its last entry.
                 if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
-                    let direction = if cmd == NavCmd::Up { -1 } else { 1 };
+                    let direction = if matches!(cmd, NavCmd::Up) { -1 } else { 1 };
                     match select_menu_entry(&entry.open_menu, direction) {
                         Ok(_) => {
                             if let Some(active) = nav.as_mut() {
@@ -1670,7 +1800,9 @@ fn show_tray_menu(
         if is_nav {
             // We took a live menu here, so the user dismissed it (a click
             // outside the popover): end the whole nav session.
-            let _ = nav_tx_closed.send(NavCmd::UserClosed);
+            let _ = nav_tx_closed.send(NavCmd::UserClosed {
+                request_id: closed.request_id,
+            });
         }
         // `closed` fires during event dispatch; unparenting mid-dispatch breaks
         // GTK's active-state accounting, so defer it to an idle callback.
@@ -1986,20 +2118,20 @@ mod tests {
 
     #[test]
     fn tray_level_zero_navigation_wraps() {
-        assert_eq!(move_tray_index(0, 3, NavCmd::Left), Some(2));
-        assert_eq!(move_tray_index(2, 3, NavCmd::Right), Some(0));
+        assert_eq!(move_tray_index(0, 3, &NavCmd::Left), Some(2));
+        assert_eq!(move_tray_index(2, 3, &NavCmd::Right), Some(0));
     }
 
     #[test]
     fn tray_level_zero_navigation_jumps_to_ends() {
-        assert_eq!(move_tray_index(1, 3, NavCmd::First), Some(0));
-        assert_eq!(move_tray_index(1, 3, NavCmd::Last), Some(2));
+        assert_eq!(move_tray_index(1, 3, &NavCmd::First), Some(0));
+        assert_eq!(move_tray_index(1, 3, &NavCmd::Last), Some(2));
     }
 
     #[test]
     fn tray_level_zero_navigation_rejects_non_horizontal_commands() {
-        assert_eq!(move_tray_index(0, 3, NavCmd::Down), None);
-        assert_eq!(move_tray_index(0, 0, NavCmd::Right), None);
+        assert_eq!(move_tray_index(0, 3, &NavCmd::Down), None);
+        assert_eq!(move_tray_index(0, 0, &NavCmd::Right), None);
     }
 }
 

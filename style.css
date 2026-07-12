@@ -95,6 +95,17 @@
   opacity: 0.72;
 }
 
+/* The tray holds the keyboard grab (a nav session is active): tint the whole
+ * tray strip so it is obvious the bar is capturing input. */
+.tray-widget.nav-focus {
+  background-color: rgba(122, 162, 247, 0.35);
+}
+
+/* The pre-selected tray icon at level 0 (which icon H/L navigation is on). */
+.tray-item.nav-selected {
+  background-color: rgba(122, 162, 247, 0.55);
+}
+
 /* Fixed-width containers for perfect centering */
 .left-container {
   min-width: 20em;

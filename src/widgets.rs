@@ -496,7 +496,6 @@ struct OpenTrayMenu {
     popovers: Vec<gtk4::Popover>,
     entries: Vec<OpenTrayMenuEntry>,
     selected: Option<usize>,
-    grab: Option<KeyboardGrabLease>,
 }
 
 struct OpenTrayMenuEntry {
@@ -518,7 +517,11 @@ struct KeyboardGrabLease {
 }
 
 impl KeyboardGrab {
-    fn acquire(self: &Rc<Self>, request_id: u64) -> Option<KeyboardGrabLease> {
+    fn acquire(
+        self: &Rc<Self>,
+        request_id: u64,
+        nav_tx: &mpsc::UnboundedSender<NavCmd>,
+    ) -> Option<KeyboardGrabLease> {
         let Some(application) = self.application.upgrade() else {
             warn!(
                 request_id,
@@ -537,6 +540,7 @@ impl KeyboardGrab {
         window.set_anchor(Edge::Right, true);
         window.set_exclusive_zone(0);
         window.set_keyboard_mode(KeyboardMode::Exclusive);
+        window.add_controller(nav_key_controller(nav_tx, "keyboard-grab"));
         window.present();
         self.active_request.set(Some(request_id));
         info!(request_id, "Tray menu acquired exclusive keyboard focus");
@@ -562,6 +566,36 @@ impl Drop for KeyboardGrabLease {
         self.window.close();
         self.state.release(self.request_id);
     }
+}
+
+// One directional intent from the keyboard while the tray grab is active. The
+// key controllers stay dumb: they translate a keypress into one of these and
+// send it to the tray task, which owns the whole navigation state machine (so
+// socket verbs and native keys can never disagree about where we are).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavCmd {
+    Left,       // h / Left
+    Right,      // l / Right
+    Down,       // j / Down
+    Up,         // k / Up
+    First,      // gg / Home
+    Last,       // G / End
+    Activate,   // Enter
+    Escape,     // q / Esc (two-step: deeper -> level 0, level 0 -> release)
+    UserClosed, // the popover was dismissed by a click outside it
+}
+
+// The live keyboard-navigation session. Present only while the grab is held.
+// `key` identifies the pre-selected tray icon (level 0); `in_menu` is false at
+// level 0 (scrolling icons, dropdown open but no entry selected) and true once
+// we have descended into the open dropdown. Dropping `lease` releases the
+// keyboard.
+struct NavActive {
+    // Held only for its Drop, which releases the grab; never read directly.
+    #[allow(dead_code)]
+    lease: KeyboardGrabLease,
+    key: String,
+    in_menu: bool,
 }
 
 struct MenuBuildContext<'a> {
@@ -1044,10 +1078,14 @@ pub fn setup_tray_updates(
         application: application.downgrade(),
         active_request: Cell::new(None),
     });
+    // Key controllers on the open dropdowns forward NavCmd here; the task owns
+    // the navigation state so socket verbs and native keys share one truth.
+    let (nav_tx, mut nav_rx) = mpsc::unbounded_channel::<NavCmd>();
 
     glib::spawn_future_local(async move {
         let mut entries: HashMap<String, TrayEntry> = HashMap::new();
         let mut order = Vec::new();
+        let mut nav: Option<NavActive> = None;
         let mut ipc_available = true;
         loop {
             tokio::select! {
@@ -1071,6 +1109,10 @@ pub fn setup_tray_updates(
                         },
                         TrayUpdate::Remove(key) => match entries.remove(&key) {
                             Some(entry) => {
+                                let removed_index = order.iter().position(|item_key| item_key == &key);
+                                let removed_active_item = nav
+                                    .as_ref()
+                                    .is_some_and(|active| active.key == key);
                                 // Unparent any open menu first: popovers are only
                                 // attached to the button, not laid-out children,
                                 // and GTK complains when a widget is finalized
@@ -1080,6 +1122,30 @@ pub fn setup_tray_updates(
                                 order.retain(|item_key| item_key != &key);
                                 container.set_visible(!entries.is_empty());
                                 info!(item = key, "Removed system tray item");
+
+                                if removed_active_item {
+                                    let Some(index) = removed_index
+                                        .map(|index| index.min(order.len().saturating_sub(1)))
+                                        .filter(|_| !order.is_empty())
+                                    else {
+                                        end_nav(&mut nav, &container, &entries);
+                                        continue;
+                                    };
+                                    if let Err(error) = start_nav(
+                                        &mut nav,
+                                        index,
+                                        &keyboard_grab,
+                                        &nav_tx,
+                                        &container,
+                                        &entries,
+                                        &order,
+                                        &commands,
+                                        &menu_requests,
+                                    ) {
+                                        warn!(%error, "Ending tray navigation after item removal");
+                                        end_nav(&mut nav, &container, &entries);
+                                    }
+                                }
                             }
                             None => debug!(item = key, "Ignoring removal of unknown tray item"),
                         },
@@ -1100,9 +1166,23 @@ pub fn setup_tray_updates(
                         continue;
                     }
                     match entries.get(&menu.key) {
-                        Some(entry) => show_tray_menu(entry, &menu, &commands, &keyboard_grab),
+                        Some(entry) => show_tray_menu(entry, &menu, &commands, &nav_tx),
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
+                }
+                nav_cmd = nav_rx.recv() => {
+                    // nav_tx lives for the whole task, so recv() only ends at
+                    // teardown (same semantics as the arms above).
+                    let Some(nav_cmd) = nav_cmd else { break };
+                    handle_nav(
+                        nav_cmd,
+                        &mut nav,
+                        &order,
+                        &entries,
+                        &container,
+                        &commands,
+                        &menu_requests,
+                    );
                 }
                 request = ipc_requests.recv(), if ipc_available => {
                     let Some(request) = request else {
@@ -1114,13 +1194,52 @@ pub fn setup_tray_updates(
                         debug!("Skipping tray IPC request after its client timed out");
                         continue;
                     }
-                    let response = handle_ipc_request(
-                        request.request,
-                        &order,
-                        &entries,
-                        &commands,
-                        &menu_requests,
-                    );
+                    let response = match request.request {
+                        // keyboard-menu starts (or retargets) a nav session at
+                        // level 0 rather than opening one throwaway grab menu.
+                        IpcRequest::KeyboardMenu { target } => {
+                            match resolve_ipc_target(&target, &order, &entries) {
+                                Ok((index, entry)) => {
+                                    let selected = ipc_item(index, &entry.state.borrow());
+                                    start_nav(
+                                        &mut nav,
+                                        index,
+                                        &keyboard_grab,
+                                        &nav_tx,
+                                        &container,
+                                        &entries,
+                                        &order,
+                                        &commands,
+                                        &menu_requests,
+                                    )
+                                    .map_or_else(
+                                        IpcResponse::error,
+                                        |()| IpcResponse::success(vec![selected]),
+                                    )
+                                }
+                                Err(error) => IpcResponse::error(error),
+                            }
+                        }
+                        // close-menus also releases the grab, so it is a
+                        // reliable kill-switch for a stuck nav session.
+                        IpcRequest::CloseMenus => {
+                            end_nav(&mut nav, &container, &entries);
+                            handle_ipc_request(
+                                IpcRequest::CloseMenus,
+                                &order,
+                                &entries,
+                                &commands,
+                                &menu_requests,
+                            )
+                        }
+                        other => handle_ipc_request(
+                            other,
+                            &order,
+                            &entries,
+                            &commands,
+                            &menu_requests,
+                        ),
+                    };
                     if request.response.send(response).is_err() {
                         debug!("Tray IPC client disconnected before receiving its response");
                     }
@@ -1146,80 +1265,340 @@ fn close_tray_menu(open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>) {
     }
 }
 
-fn add_menu_key_controller(
-    popover: &gtk4::Popover,
-    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+// Translate keys into NavCmd and forward them to the tray task. The controller
+// holds no navigation state of its own (the task owns it); it only knows the
+// `gg` two-key jump, which needs to remember a lone `g` between presses.
+fn nav_key_controller(
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
     item_key: &str,
-) {
+) -> gtk4::EventControllerKey {
     let controller = gtk4::EventControllerKey::new();
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let popover_weak = popover.downgrade();
-    let open_menu_weak = Rc::downgrade(open_menu);
+    let nav_tx = nav_tx.clone();
     let item_key = item_key.to_string();
     let pending_g = Cell::new(false);
     controller.connect_key_pressed(move |_controller, key, _code, _modifiers| {
-        let Some(open_menu) = open_menu_weak.upgrade() else {
-            return glib::Propagation::Proceed;
-        };
-        debug!(item = item_key, key = ?key, "Tray menu received key");
-
         if key == gdk::Key::g {
+            // First `g` arms the jump; the second fires it.
             if pending_g.replace(true) {
                 pending_g.set(false);
-                if let Err(error) = jump_menu_entry(&open_menu, false) {
-                    debug!(item = item_key, %error, "Could not jump to first tray menu entry");
-                }
+                let _ = nav_tx.send(NavCmd::First);
             }
             return glib::Propagation::Stop;
         }
         pending_g.set(false);
 
-        let result = if matches!(key, gdk::Key::j | gdk::Key::Down) {
-            select_menu_entry(&open_menu, 1).map(|_| ())
-        } else if matches!(key, gdk::Key::k | gdk::Key::Up) {
-            select_menu_entry(&open_menu, -1).map(|_| ())
-        } else if matches!(key, gdk::Key::G | gdk::Key::End) {
-            jump_menu_entry(&open_menu, true).map(|_| ())
-        } else if key == gdk::Key::Home {
-            jump_menu_entry(&open_menu, false).map(|_| ())
-        } else if matches!(key, gdk::Key::l | gdk::Key::Right) {
-            enter_submenu(&open_menu).map(|_| ())
-        } else if matches!(key, gdk::Key::h | gdk::Key::Left) {
-            leave_submenu(&open_menu).map(|_| ())
-        } else if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
-            match enter_submenu(&open_menu) {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    let selected = open_menu.borrow().as_ref().and_then(|menu| {
-                        menu.selected
-                            .map(|index| menu.entries[index].button.clone())
-                    });
-                    match selected {
-                        Some(button) => {
-                            button.emit_clicked();
-                            Ok(())
-                        }
-                        None => Err("open tray menu has no selected entry".to_string()),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else if matches!(key, gdk::Key::Escape | gdk::Key::q) {
-            info!(item = item_key, key = ?key, "Closing tray menu from keyboard");
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
-            }
-            return glib::Propagation::Stop;
-        } else {
-            return glib::Propagation::Proceed;
+        let cmd = match key {
+            gdk::Key::h | gdk::Key::Left => NavCmd::Left,
+            gdk::Key::l | gdk::Key::Right => NavCmd::Right,
+            gdk::Key::j | gdk::Key::Down => NavCmd::Down,
+            gdk::Key::k | gdk::Key::Up => NavCmd::Up,
+            gdk::Key::G | gdk::Key::End => NavCmd::Last,
+            gdk::Key::Home => NavCmd::First,
+            gdk::Key::Return | gdk::Key::KP_Enter => NavCmd::Activate,
+            gdk::Key::Escape | gdk::Key::q => NavCmd::Escape,
+            _ => return glib::Propagation::Proceed,
         };
-
-        if let Err(error) = result {
-            debug!(item = item_key, %error, key = ?key, "Tray menu key could not be handled");
+        debug!(item = item_key, ?cmd, "Tray nav key");
+        if nav_tx.send(cmd).is_err() {
+            debug!(item = item_key, "Tray nav channel closed; dropping key");
         }
         glib::Propagation::Stop
     });
-    popover.add_controller(controller);
+    controller
+}
+
+// Highlight exactly one tray icon as the level-0 pre-selection. Clearing first
+// keeps the "at most one" invariant even as items are added or removed.
+fn update_nav_highlight(entries: &HashMap<String, TrayEntry>, order: &[String], index: usize) {
+    for entry in entries.values() {
+        entry.button.remove_css_class("nav-selected");
+    }
+    if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
+        entry.button.add_css_class("nav-selected");
+    }
+}
+
+fn move_tray_index(index: usize, len: usize, cmd: NavCmd) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match cmd {
+        NavCmd::Left => Some((index + len - 1) % len),
+        NavCmd::Right => Some((index + 1) % len),
+        NavCmd::First => Some(0),
+        NavCmd::Last => Some(len - 1),
+        _ => None,
+    }
+}
+
+// Drop back to level 0 within an open dropdown: forget the selected entry (and
+// its highlight) and collapse any open submenus so only the top level shows.
+fn clear_menu_selection(open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>) {
+    let mut open_menu = open_menu.borrow_mut();
+    let Some(menu) = open_menu.as_mut() else {
+        return;
+    };
+    if let Some(selected) = menu.selected.take() {
+        if let Some(entry) = menu.entries.get(selected) {
+            entry.button.remove_css_class("selected");
+        }
+    }
+    for popover in menu.popovers.iter().skip(1) {
+        popover.popdown();
+    }
+}
+
+// Ask the backend to (re)open one icon's dropdown as a keyboard-grab menu. The
+// grab itself belongs to the nav session; this only flags the menu so
+// show_tray_menu wires up the nav controller and pops up focused.
+fn open_icon_menu(
+    entry: &TrayEntry,
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+    menu_requests: &Rc<Cell<u64>>,
+) -> std::result::Result<(), String> {
+    let (x, y) = tray_button_coordinates(&entry.button);
+    let item = entry.state.borrow();
+    let command = TrayCommand {
+        key: item.key.clone(),
+        action: TrayAction::ContextMenu {
+            request_id: next_menu_request(menu_requests),
+            keyboard_grab: true,
+        },
+        x,
+        y,
+        menu_path: item.menu_path.clone(),
+    };
+    commands
+        .send(command)
+        .map_err(|error| format!("could not open tray menu for keyboard nav: {error}"))
+}
+
+// Start (or retarget) a keyboard-navigation session at `index`, entering at
+// level 0 with that icon's dropdown auto-opened. The first call acquires the
+// grab; later calls just move the pre-selection.
+#[allow(clippy::too_many_arguments)]
+fn start_nav(
+    nav: &mut Option<NavActive>,
+    index: usize,
+    keyboard_grab: &Rc<KeyboardGrab>,
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
+    container: &gtk4::Box,
+    entries: &HashMap<String, TrayEntry>,
+    order: &[String],
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+    menu_requests: &Rc<Cell<u64>>,
+) -> std::result::Result<(), String> {
+    let key = order
+        .get(index)
+        .ok_or_else(|| format!("tray item index {index} is no longer available"))?
+        .clone();
+    let entry = entries
+        .get(&key)
+        .ok_or_else(|| format!("tray item {key:?} is no longer available"))?;
+
+    match nav.as_mut() {
+        Some(active) => {
+            active.key = key.clone();
+            active.in_menu = false;
+        }
+        None => {
+            let request_id = next_menu_request(menu_requests);
+            let Some(lease) = keyboard_grab.acquire(request_id, nav_tx) else {
+                return Err("could not acquire the keyboard grab for tray navigation".to_string());
+            };
+            container.add_css_class("nav-focus");
+            *nav = Some(NavActive {
+                lease,
+                key: key.clone(),
+                in_menu: false,
+            });
+        }
+    }
+    // Only one dropdown open at a time.
+    for entry in entries.values() {
+        close_tray_menu(&entry.open_menu);
+    }
+    update_nav_highlight(entries, order, index);
+    open_icon_menu(entry, commands, menu_requests)
+}
+
+// Tear the session down: release the grab (dropping the lease restores focus to
+// whatever held it before), close the dropdown, and clear all focus visuals.
+fn end_nav(
+    nav: &mut Option<NavActive>,
+    container: &gtk4::Box,
+    entries: &HashMap<String, TrayEntry>,
+) {
+    let Some(active) = nav.take() else {
+        return;
+    };
+    for entry in entries.values() {
+        close_tray_menu(&entry.open_menu);
+        entry.button.remove_css_class("nav-selected");
+    }
+    container.remove_css_class("nav-focus");
+    drop(active);
+    debug!("Tray keyboard navigation ended");
+}
+
+// The navigation state machine, driven by one NavCmd at a time. Level 0 scrolls
+// across tray icons (auto-opening dropdowns); deeper levels move within the open
+// dropdown. Escape is two-step: a deeper level drops to level 0, level 0
+// releases the grab.
+#[allow(clippy::too_many_arguments)]
+fn handle_nav(
+    cmd: NavCmd,
+    nav: &mut Option<NavActive>,
+    order: &[String],
+    entries: &HashMap<String, TrayEntry>,
+    container: &gtk4::Box,
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+    menu_requests: &Rc<Cell<u64>>,
+) {
+    // Snapshot the session; a late key after release finds nothing to drive.
+    let (key, in_menu) = match nav.as_ref() {
+        Some(active) => (active.key.clone(), active.in_menu),
+        None => return,
+    };
+    let Some(index) = order.iter().position(|candidate| candidate == &key) else {
+        warn!(
+            item = key,
+            "Ending tray navigation after its selected item disappeared"
+        );
+        end_nav(nav, container, entries);
+        return;
+    };
+
+    match cmd {
+        NavCmd::UserClosed => {
+            end_nav(nav, container, entries);
+            return;
+        }
+        NavCmd::Escape => {
+            if in_menu {
+                if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
+                    clear_menu_selection(&entry.open_menu);
+                }
+                if let Some(active) = nav.as_mut() {
+                    active.in_menu = false;
+                }
+            } else {
+                end_nav(nav, container, entries);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if !in_menu {
+        // LEVEL 0: scroll across icons; the landed icon auto-opens.
+        let len = order.len();
+        if len == 0 {
+            return;
+        }
+        match cmd {
+            NavCmd::Left | NavCmd::Right | NavCmd::First | NavCmd::Last => {
+                let Some(new_index) = move_tray_index(index, len, cmd) else {
+                    return;
+                };
+                if new_index == index {
+                    return;
+                }
+                if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
+                    close_tray_menu(&entry.open_menu);
+                }
+                if let Some(active) = nav.as_mut() {
+                    active.key = order[new_index].clone();
+                }
+                update_nav_highlight(entries, order, new_index);
+                if let Some(entry) = order.get(new_index).and_then(|key| entries.get(key)) {
+                    if let Err(error) = open_icon_menu(entry, commands, menu_requests) {
+                        warn!(%error, "Ending tray navigation after icon switch failed");
+                        end_nav(nav, container, entries);
+                    }
+                }
+            }
+            NavCmd::Down | NavCmd::Up | NavCmd::Activate => {
+                // Either vertical direction enters the dropdown. Down/Enter
+                // select its first entry; Up selects its last entry.
+                if let Some(entry) = order.get(index).and_then(|key| entries.get(key)) {
+                    let direction = if cmd == NavCmd::Up { -1 } else { 1 };
+                    match select_menu_entry(&entry.open_menu, direction) {
+                        Ok(_) => {
+                            if let Some(active) = nav.as_mut() {
+                                active.in_menu = true;
+                            }
+                        }
+                        Err(error) => debug!(%error, "Cannot descend into tray dropdown"),
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // IN A DROPDOWN (level >= 1).
+    let Some(entry) = order.get(index).and_then(|key| entries.get(key)) else {
+        return;
+    };
+    let open_menu = &entry.open_menu;
+    match cmd {
+        NavCmd::Down => {
+            if let Err(error) = select_menu_entry(open_menu, 1) {
+                debug!(%error, "Could not move down in tray dropdown");
+            }
+        }
+        NavCmd::Up => {
+            if let Err(error) = select_menu_entry(open_menu, -1) {
+                debug!(%error, "Could not move up in tray dropdown");
+            }
+        }
+        NavCmd::First => {
+            if let Err(error) = jump_menu_entry(open_menu, false) {
+                debug!(%error, "Could not jump to first tray dropdown entry");
+            }
+        }
+        NavCmd::Last => {
+            if let Err(error) = jump_menu_entry(open_menu, true) {
+                debug!(%error, "Could not jump to last tray dropdown entry");
+            }
+        }
+        NavCmd::Right => {
+            if let Err(error) = enter_submenu(open_menu) {
+                debug!(%error, "Could not enter tray submenu");
+            }
+        }
+        NavCmd::Left => match leave_submenu(open_menu) {
+            Ok(true) => {} // stepped up one submenu level
+            Ok(false) => {
+                // Already at the dropdown's top level: return to level 0.
+                clear_menu_selection(open_menu);
+                if let Some(active) = nav.as_mut() {
+                    active.in_menu = false;
+                }
+            }
+            Err(error) => debug!(%error, "Could not leave tray submenu"),
+        },
+        NavCmd::Activate => match enter_submenu(open_menu) {
+            Ok(true) => {}
+            Ok(false) => {
+                let button = open_menu
+                    .borrow()
+                    .as_ref()
+                    .and_then(|menu| menu.selected.map(|i| menu.entries[i].button.clone()));
+                match button {
+                    // Fires MenuEvent and closes the menu; the resulting
+                    // UserClosed then ends the session.
+                    Some(button) => button.emit_clicked(),
+                    None => debug!("Tray dropdown has no selected entry to activate"),
+                }
+            }
+            Err(error) => debug!(%error, "Could not activate tray dropdown entry"),
+        },
+        _ => {}
+    }
 }
 
 // Render a tray item's dbusmenu as a native GTK popover. We build the menu from
@@ -1232,7 +1611,7 @@ fn show_tray_menu(
     entry: &TrayEntry,
     menu: &TrayMenu,
     command_tx: &mpsc::UnboundedSender<TrayCommand>,
-    keyboard_grab: &Rc<KeyboardGrab>,
+    nav_tx: &mpsc::UnboundedSender<NavCmd>,
 ) {
     // A previous menu may still be attached (or even open) — replace it.
     close_tray_menu(&entry.open_menu);
@@ -1267,24 +1646,34 @@ fn show_tray_menu(
         popovers,
         entries: menu_entries,
         selected: None,
-        grab: None,
     });
-    add_menu_key_controller(&popover, &entry.open_menu, &menu.key);
+
+    // `keyboard_grab` here means "this dropdown is part of a nav session" — the
+    // grab itself is owned by the session, not the menu.
+    let is_nav = menu.keyboard_grab;
+    if is_nav {
+        popover.add_controller(nav_key_controller(nav_tx, &menu.key));
+    }
+
     let open_menu_weak = Rc::downgrade(&entry.open_menu);
+    let nav_tx_closed = nav_tx.clone();
     popover.connect_closed(move |_popover| {
         let Some(open_menu) = open_menu_weak.upgrade() else {
             return;
         };
         let Some(closed) = open_menu.borrow_mut().take() else {
-            // close_tray_menu already tore this menu down (item removal or a
-            // reopen); nothing left to do.
+            // close_tray_menu already tore this menu down (item removal, reopen,
+            // or a nav icon-switch): a programmatic close, not a user dismissal,
+            // so there is nothing to unparent and no session to end.
             return;
         };
-        // `closed` fires during event dispatch (e.g. the click-outside that
-        // dismissed the menu), and unparenting mid-dispatch breaks GTK's
-        // active-state accounting. Keep the keyboard lease until after that
-        // teardown too, so compositor focus restoration cannot race GTK's
-        // still-active modal popup grab.
+        if is_nav {
+            // We took a live menu here, so the user dismissed it (a click
+            // outside the popover): end the whole nav session.
+            let _ = nav_tx_closed.send(NavCmd::UserClosed);
+        }
+        // `closed` fires during event dispatch; unparenting mid-dispatch breaks
+        // GTK's active-state accounting, so defer it to an idle callback.
         glib::idle_add_local_once(move || {
             for popover in &closed.popovers {
                 popover.unparent();
@@ -1299,15 +1688,12 @@ fn show_tray_menu(
         keyboard_grab = menu.keyboard_grab,
         "Presenting tray menu"
     );
-    if menu.keyboard_grab {
-        let lease = keyboard_grab.acquire(menu.request_id);
-        if let Some(open) = entry.open_menu.borrow_mut().as_mut() {
-            open.grab = lease;
-        }
-    }
-    if menu.keyboard_grab {
-        let request_id = menu.request_id;
+    if is_nav {
+        // Defer the popup so the exclusive helper surface (grabbed by the nav
+        // session) has settled keyboard focus before the popover maps. We land
+        // at level 0: the dropdown is open but no entry is selected yet.
         let item_key = menu.key.clone();
+        let request_id = menu.request_id;
         let popover_weak = popover.downgrade();
         let box_weak = box_.downgrade();
         let open_menu_weak = Rc::downgrade(&entry.open_menu);
@@ -1327,10 +1713,7 @@ fn show_tray_menu(
             };
             popover.popup();
             box_.grab_focus();
-            if let Err(error) = select_menu_entry(&open_menu, 1) {
-                warn!(item = item_key, %error, "Could not select the first keyboard menu entry");
-                popover.popdown();
-            }
+            debug!(item = item_key, "Tray dropdown opened at level 0");
         });
     } else {
         popover.popup();
@@ -1599,6 +1982,24 @@ mod tests {
     fn tray_pixmap_rejects_invalid_dimensions_and_length() {
         assert_eq!(argb_to_rgba(0, 1, &[]), None);
         assert_eq!(argb_to_rgba(1, 1, &[0, 1, 2]), None);
+    }
+
+    #[test]
+    fn tray_level_zero_navigation_wraps() {
+        assert_eq!(move_tray_index(0, 3, NavCmd::Left), Some(2));
+        assert_eq!(move_tray_index(2, 3, NavCmd::Right), Some(0));
+    }
+
+    #[test]
+    fn tray_level_zero_navigation_jumps_to_ends() {
+        assert_eq!(move_tray_index(1, 3, NavCmd::First), Some(0));
+        assert_eq!(move_tray_index(1, 3, NavCmd::Last), Some(2));
+    }
+
+    #[test]
+    fn tray_level_zero_navigation_rejects_non_horizontal_commands() {
+        assert_eq!(move_tray_index(0, 3, NavCmd::Down), None);
+        assert_eq!(move_tray_index(0, 0, NavCmd::Right), None);
     }
 }
 

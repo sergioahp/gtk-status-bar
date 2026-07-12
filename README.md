@@ -70,15 +70,19 @@ Selection wraps at both ends. `menu-down` and `menu-up` are aliases for
 supports persistent connections; its request verbs match the command names
 above.
 
-`keyboard-menu` opens the same native popover as `context-menu`, plus a
-temporary layer-shell helper surface that requests exclusive keyboard input.
-The long-lived bar stays on its normal bottom layer with keyboard interactivity
-disabled. Arrow keys and `j`/`k` move within the current menu, `l`/Right/Enter
-enters a submenu, `h`/Left leaves it, `gg` and Home jump to the first entry, and
-`G` and End jump to the last. Enter activates a leaf entry; Escape or `q` closes
-the menu. The helper surface is destroyed whenever the popover closes,
-including click-away dismissal, so input returns to the previously focused
-window. Mouse-opened and ordinary socket-opened menus never request keyboard
+`keyboard-menu` starts tray-wide keyboard navigation and opens the target
+item's native popover. A temporary layer-shell helper surface requests exclusive
+keyboard input; the tray and current icon are tinted while it is active. At the
+tray-icon level, `h`/Left and `l`/Right wrap across icons and automatically open
+the landed icon's menu. `gg`/Home and `G`/End jump to the first and last icons.
+`j`/Down or `k`/Up enters the open menu at its first or last entry. Within a
+menu, `j`/`k` move between entries, `l`/Right/Enter enters a submenu, and
+`h`/Left leaves it; leaving the top menu level returns to icon navigation.
+Escape or `q` also returns from menu navigation to the icon level, then closes
+and releases the grab when pressed again. Enter activates a leaf entry and
+releases the grab. Click-away dismissal and `trayctl close-menus` also release
+it, so input returns to the previously focused window. The long-lived bar,
+mouse-opened menus, and ordinary socket-opened menus never request keyboard
 input.
 
 ## 🛠️ Technology Stack

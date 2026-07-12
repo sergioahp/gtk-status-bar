@@ -25,6 +25,7 @@ pub enum IpcRequest {
     Activate { target: String },
     SecondaryActivate { target: String },
     ContextMenu { target: String },
+    KeyboardMenu { target: String },
     MenuNext { target: String },
     MenuPrevious { target: String },
     MenuActivate { target: String },
@@ -303,6 +304,19 @@ mod tests {
             encoded,
             r#"{"command":"menu-click","target":"network","entry":42}"#
         );
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
+            request
+        );
+    }
+
+    #[test]
+    fn keyboard_menu_protocol_round_trips() {
+        let request = IpcRequest::KeyboardMenu {
+            target: "network".to_string(),
+        };
+        let encoded = serde_json::to_string(&request).expect("request should encode");
+        assert_eq!(encoded, r#"{"command":"keyboard-menu","target":"network"}"#);
         assert_eq!(
             serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
             request

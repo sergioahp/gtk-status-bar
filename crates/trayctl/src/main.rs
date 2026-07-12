@@ -10,6 +10,7 @@ const USAGE: &str = "Usage:
   trayctl [--json] activate TARGET
   trayctl [--json] secondary-activate TARGET
   trayctl [--json] context-menu TARGET
+  trayctl [--json] keyboard-menu TARGET
   trayctl [--json] menu-next TARGET
   trayctl [--json] menu-previous TARGET
   trayctl [--json] menu-activate TARGET
@@ -33,6 +34,9 @@ fn parse_request(arguments: &[String]) -> Result<Option<IpcRequest>> {
             target: target(arguments, command)?,
         },
         "context-menu" => IpcRequest::ContextMenu {
+            target: target(arguments, command)?,
+        },
+        "keyboard-menu" => IpcRequest::KeyboardMenu {
             target: target(arguments, command)?,
         },
         "menu-next" | "menu-down" => IpcRequest::MenuNext {
@@ -126,4 +130,37 @@ async fn main() -> Result<ExitCode> {
     } else {
         ExitCode::from(2)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_keyboard_menu_as_an_explicit_opt_in() {
+        let parsed = parse_request(&arguments(&["keyboard-menu", "Bluetooth"]))
+            .expect("keyboard-menu should parse");
+        assert_eq!(
+            parsed,
+            Some(IpcRequest::KeyboardMenu {
+                target: "Bluetooth".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn context_menu_remains_a_non_grabbing_request() {
+        let parsed = parse_request(&arguments(&["context-menu", "Bluetooth"]))
+            .expect("context-menu should parse");
+        assert_eq!(
+            parsed,
+            Some(IpcRequest::ContextMenu {
+                target: "Bluetooth".to_string()
+            })
+        );
+    }
 }

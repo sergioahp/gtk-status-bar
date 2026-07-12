@@ -8,10 +8,11 @@
 // exception: pw's producer is a std::thread, so setup_volume_updates still
 // owns both the channel and the thread spawn.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
@@ -19,7 +20,7 @@ use gtk4::gdk;
 use gtk4::gio::prelude::*;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
@@ -491,15 +492,76 @@ struct TrayEntry {
 }
 
 struct OpenTrayMenu {
+    request_id: u64,
     popovers: Vec<gtk4::Popover>,
     entries: Vec<OpenTrayMenuEntry>,
     selected: Option<usize>,
+    grab: Option<KeyboardGrabLease>,
 }
 
 struct OpenTrayMenuEntry {
     button: gtk4::Button,
     id: i32,
     ancestors: Vec<gtk4::Popover>,
+    submenu: Option<gtk4::Popover>,
+}
+
+struct KeyboardGrab {
+    application: glib::object::WeakRef<gtk4::Application>,
+    active_request: Cell<Option<u64>>,
+}
+
+struct KeyboardGrabLease {
+    state: Rc<KeyboardGrab>,
+    request_id: u64,
+    window: gtk4::ApplicationWindow,
+}
+
+impl KeyboardGrab {
+    fn acquire(self: &Rc<Self>, request_id: u64) -> Option<KeyboardGrabLease> {
+        let Some(application) = self.application.upgrade() else {
+            warn!(
+                request_id,
+                "Cannot grab the keyboard after the GTK application was dropped"
+            );
+            return None;
+        };
+        let window = gtk4::ApplicationWindow::builder()
+            .application(&application)
+            .default_width(1)
+            .default_height(1)
+            .build();
+        window.init_layer_shell();
+        window.set_layer(Layer::Bottom);
+        window.set_anchor(Edge::Top, true);
+        window.set_anchor(Edge::Right, true);
+        window.set_exclusive_zone(0);
+        window.set_keyboard_mode(KeyboardMode::Exclusive);
+        window.present();
+        self.active_request.set(Some(request_id));
+        info!(request_id, "Tray menu acquired exclusive keyboard focus");
+        Some(KeyboardGrabLease {
+            state: self.clone(),
+            request_id,
+            window,
+        })
+    }
+
+    fn release(&self, request_id: u64) {
+        if self.active_request.get() != Some(request_id) {
+            return;
+        }
+        self.active_request.set(None);
+        info!(request_id, "Tray menu released keyboard focus");
+    }
+}
+
+impl Drop for KeyboardGrabLease {
+    fn drop(&mut self) {
+        self.window.set_keyboard_mode(KeyboardMode::None);
+        self.window.close();
+        self.state.release(self.request_id);
+    }
 }
 
 struct MenuBuildContext<'a> {
@@ -574,26 +636,25 @@ fn tray_button_coordinates(button: &gtk4::Button) -> (i32, i32) {
         .unwrap_or((x.round() as i32, y.round() as i32))
 }
 
-fn select_menu_entry(entry: &TrayEntry, direction: isize) -> std::result::Result<i32, String> {
-    let mut open_menu = entry.open_menu.borrow_mut();
-    let menu = open_menu
-        .as_mut()
-        .ok_or_else(|| "tray item has no open menu".to_string())?;
-    if menu.entries.is_empty() {
-        return Err("open tray menu has no enabled entries".to_string());
+fn next_menu_request(sequence: &Cell<u64>) -> u64 {
+    let next = sequence.get().wrapping_add(1);
+    sequence.set(next);
+    next
+}
+
+fn select_menu_index(menu: &mut OpenTrayMenu, selected: usize) -> i32 {
+    if let Some(previous) = menu.selected {
+        menu.entries[previous].button.remove_css_class("selected");
     }
-    if let Some(selected) = menu.selected {
-        menu.entries[selected].button.remove_css_class("selected");
-    }
-    let len = menu.entries.len() as isize;
-    let selected = match menu.selected {
-        Some(selected) => (selected as isize + direction).rem_euclid(len) as usize,
-        None if direction < 0 => menu.entries.len() - 1,
-        None => 0,
-    };
     let selected_entry = &menu.entries[selected];
     for popover in menu.popovers.iter().skip(1) {
-        popover.popdown();
+        if !selected_entry
+            .ancestors
+            .iter()
+            .any(|ancestor| ancestor == popover)
+        {
+            popover.popdown();
+        }
     }
     for popover in &selected_entry.ancestors {
         popover.popup();
@@ -602,11 +663,115 @@ fn select_menu_entry(entry: &TrayEntry, direction: isize) -> std::result::Result
     selected_entry.button.grab_focus();
     let id = selected_entry.id;
     menu.selected = Some(selected);
-    Ok(id)
+    id
 }
 
-fn menu_entry_id(entry: &TrayEntry, requested: Option<i32>) -> std::result::Result<i32, String> {
-    let open_menu = entry.open_menu.borrow();
+fn entries_in_scope(menu: &OpenTrayMenu) -> Vec<usize> {
+    let scope = menu
+        .selected
+        .map(|selected| menu.entries[selected].ancestors.as_slice())
+        .unwrap_or_default();
+    menu.entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.ancestors.as_slice() == scope).then_some(index))
+        .collect()
+}
+
+fn select_menu_entry(
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+    direction: isize,
+) -> std::result::Result<i32, String> {
+    let mut open_menu = open_menu.borrow_mut();
+    let menu = open_menu
+        .as_mut()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    if menu.entries.is_empty() {
+        return Err("open tray menu has no enabled entries".to_string());
+    }
+    let candidates = entries_in_scope(menu);
+    let len = candidates.len() as isize;
+    let candidate = match menu.selected.and_then(|selected| {
+        candidates
+            .iter()
+            .position(|candidate| *candidate == selected)
+    }) {
+        Some(selected) => (selected as isize + direction).rem_euclid(len) as usize,
+        None if direction < 0 => candidates.len() - 1,
+        None => 0,
+    };
+    Ok(select_menu_index(menu, candidates[candidate]))
+}
+
+fn jump_menu_entry(
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+    last: bool,
+) -> std::result::Result<i32, String> {
+    let mut open_menu = open_menu.borrow_mut();
+    let menu = open_menu
+        .as_mut()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    let candidates = entries_in_scope(menu);
+    let selected = if last {
+        candidates.last().copied()
+    } else {
+        candidates.first().copied()
+    }
+    .ok_or_else(|| "open tray menu has no enabled entries".to_string())?;
+    Ok(select_menu_index(menu, selected))
+}
+
+fn enter_submenu(
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+) -> std::result::Result<bool, String> {
+    let mut open_menu = open_menu.borrow_mut();
+    let menu = open_menu
+        .as_mut()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    let Some(selected) = menu.selected else {
+        return Ok(false);
+    };
+    let Some(submenu) = menu.entries[selected].submenu.clone() else {
+        return Ok(false);
+    };
+    let child = menu
+        .entries
+        .iter()
+        .position(|candidate| candidate.ancestors.last() == Some(&submenu))
+        .ok_or_else(|| "open tray submenu has no enabled entries".to_string())?;
+    submenu.popup();
+    select_menu_index(menu, child);
+    Ok(true)
+}
+
+fn leave_submenu(
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+) -> std::result::Result<bool, String> {
+    let mut open_menu = open_menu.borrow_mut();
+    let menu = open_menu
+        .as_mut()
+        .ok_or_else(|| "tray item has no open menu".to_string())?;
+    let Some(selected) = menu.selected else {
+        return Ok(false);
+    };
+    let Some(submenu) = menu.entries[selected].ancestors.last().cloned() else {
+        return Ok(false);
+    };
+    let parent = menu
+        .entries
+        .iter()
+        .position(|candidate| candidate.submenu.as_ref() == Some(&submenu))
+        .ok_or_else(|| "open tray submenu has no parent entry".to_string())?;
+    submenu.popdown();
+    select_menu_index(menu, parent);
+    Ok(true)
+}
+
+fn menu_entry_id(
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+    requested: Option<i32>,
+) -> std::result::Result<i32, String> {
+    let open_menu = open_menu.borrow();
     let menu = open_menu
         .as_ref()
         .ok_or_else(|| "tray item has no open menu".to_string())?;
@@ -625,6 +790,7 @@ fn handle_ipc_request(
     order: &[String],
     entries: &HashMap<String, TrayEntry>,
     commands: &mpsc::UnboundedSender<TrayCommand>,
+    menu_requests: &Cell<u64>,
 ) -> IpcResponse {
     let (target, action) = match &request {
         IpcRequest::List => {
@@ -640,6 +806,7 @@ fn handle_ipc_request(
             return IpcResponse::success(items);
         }
         IpcRequest::CloseMenus => {
+            next_menu_request(menu_requests);
             for entry in entries.values() {
                 close_tray_menu(&entry.open_menu);
             }
@@ -649,7 +816,9 @@ fn handle_ipc_request(
         IpcRequest::SecondaryActivate { target } => {
             (target.clone(), Some(TrayAction::SecondaryActivate))
         }
-        IpcRequest::ContextMenu { target } => (target.clone(), Some(TrayAction::ContextMenu)),
+        IpcRequest::ContextMenu { target } | IpcRequest::KeyboardMenu { target } => {
+            (target.clone(), None)
+        }
         IpcRequest::MenuNext { target } => (target.clone(), None),
         IpcRequest::MenuPrevious { target } => (target.clone(), None),
         IpcRequest::MenuActivate { target } => (target.clone(), None),
@@ -664,25 +833,45 @@ fn handle_ipc_request(
     let item = entry.state.borrow();
     let selected = ipc_item(index, &item);
     let action = match request {
-        IpcRequest::Activate { .. } if item.item_is_menu => TrayAction::ContextMenu,
+        IpcRequest::Activate { .. } if item.item_is_menu => TrayAction::ContextMenu {
+            request_id: next_menu_request(menu_requests),
+            keyboard_grab: false,
+        },
         IpcRequest::Activate { .. } => TrayAction::Activate,
-        IpcRequest::MenuNext { .. } => match select_menu_entry(entry, 1) {
+        IpcRequest::MenuNext { .. } => match select_menu_entry(&entry.open_menu, 1) {
             Ok(_id) => return IpcResponse::success(vec![selected]),
             Err(error) => return IpcResponse::error(error),
         },
-        IpcRequest::MenuPrevious { .. } => match select_menu_entry(entry, -1) {
+        IpcRequest::MenuPrevious { .. } => match select_menu_entry(&entry.open_menu, -1) {
             Ok(_id) => return IpcResponse::success(vec![selected]),
             Err(error) => return IpcResponse::error(error),
         },
-        IpcRequest::MenuActivate { .. } => match menu_entry_id(entry, None) {
-            Ok(id) => TrayAction::MenuEvent(id),
-            Err(error) => return IpcResponse::error(error),
+        IpcRequest::MenuActivate { .. } => {
+            match enter_submenu(&entry.open_menu) {
+                Ok(true) => return IpcResponse::success(vec![selected]),
+                Ok(false) => {}
+                Err(error) => return IpcResponse::error(error),
+            }
+            match menu_entry_id(&entry.open_menu, None) {
+                Ok(id) => TrayAction::MenuEvent(id),
+                Err(error) => return IpcResponse::error(error),
+            }
+        }
+        IpcRequest::MenuClick { entry: id, .. } => {
+            match menu_entry_id(&entry.open_menu, Some(id)) {
+                Ok(id) => TrayAction::MenuEvent(id),
+                Err(error) => return IpcResponse::error(error),
+            }
+        }
+        IpcRequest::ContextMenu { .. } => TrayAction::ContextMenu {
+            request_id: next_menu_request(menu_requests),
+            keyboard_grab: false,
         },
-        IpcRequest::MenuClick { entry: id, .. } => match menu_entry_id(entry, Some(id)) {
-            Ok(id) => TrayAction::MenuEvent(id),
-            Err(error) => return IpcResponse::error(error),
+        IpcRequest::KeyboardMenu { .. } => TrayAction::ContextMenu {
+            request_id: next_menu_request(menu_requests),
+            keyboard_grab: true,
         },
-        IpcRequest::SecondaryActivate { .. } | IpcRequest::ContextMenu { .. } => {
+        IpcRequest::SecondaryActivate { .. } => {
             let Some(action) = action else {
                 return IpcResponse::error("tray action was not resolved");
             };
@@ -710,7 +899,11 @@ fn handle_ipc_request(
     IpcResponse::success(vec![selected])
 }
 
-fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayCommand>) -> TrayEntry {
+fn create_tray_entry(
+    item: TrayItem,
+    commands: &mpsc::UnboundedSender<TrayCommand>,
+    menu_requests: &Rc<Cell<u64>>,
+) -> TrayEntry {
     let button = gtk4::Button::new();
     button.add_css_class("tray-item");
     button.set_focusable(false);
@@ -740,6 +933,7 @@ fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayComman
         gesture_pressed.set_state(gtk4::EventSequenceState::Claimed);
     });
     let commands = commands.clone();
+    let menu_requests = menu_requests.clone();
     let state_for_release = state.clone();
     // Weak: the gesture lives on the button, so capturing the button strongly
     // here would cycle (button -> gesture -> closure -> button) and leak it
@@ -759,10 +953,16 @@ fn create_tray_entry(item: TrayItem, commands: &mpsc::UnboundedSender<TrayComman
             "Tray button released"
         );
         let action = match gesture.current_button() {
-            1 if item_is_menu => TrayAction::ContextMenu,
+            1 if item_is_menu => TrayAction::ContextMenu {
+                request_id: next_menu_request(&menu_requests),
+                keyboard_grab: false,
+            },
             1 => TrayAction::Activate,
             2 => TrayAction::SecondaryActivate,
-            3 => TrayAction::ContextMenu,
+            3 => TrayAction::ContextMenu {
+                request_id: next_menu_request(&menu_requests),
+                keyboard_grab: false,
+            },
             button => {
                 debug!(button, item = key, "Ignoring unsupported tray mouse button");
                 return;
@@ -826,8 +1026,18 @@ pub fn setup_tray_updates(
     }: TrayUi,
     mut ipc_requests: mpsc::UnboundedReceiver<IpcUiRequest>,
     container: gtk4::Box,
+    window: &gtk4::ApplicationWindow,
 ) {
     debug!("Setting up system tray updates");
+
+    let menu_requests = Rc::new(Cell::new(0));
+    let application = window
+        .application()
+        .expect("the status bar window must belong to its GTK application");
+    let keyboard_grab = Rc::new(KeyboardGrab {
+        application: application.downgrade(),
+        active_request: Cell::new(None),
+    });
 
     glib::spawn_future_local(async move {
         let mut entries: HashMap<String, TrayEntry> = HashMap::new();
@@ -845,7 +1055,7 @@ pub fn setup_tray_updates(
                             }
                             None => {
                                 let key = item.key.clone();
-                                let entry = create_tray_entry(item, &commands);
+                                let entry = create_tray_entry(item, &commands, &menu_requests);
                                 container.append(&entry.button);
                                 entries.insert(key.clone(), entry);
                                 order.push(key.clone());
@@ -874,8 +1084,17 @@ pub fn setup_tray_updates(
                     // lifetime, so None means teardown, same as the update arm
                     // (a `continue` here would busy-spin the select loop).
                     let Some(menu) = menu else { break };
+                    if menu.request_id != menu_requests.get() {
+                        debug!(
+                            item = menu.key,
+                            request_id = menu.request_id,
+                            current_request_id = menu_requests.get(),
+                            "Ignoring canceled or superseded tray menu"
+                        );
+                        continue;
+                    }
                     match entries.get(&menu.key) {
-                        Some(entry) => show_tray_menu(entry, &menu, &commands),
+                        Some(entry) => show_tray_menu(entry, &menu, &commands, &keyboard_grab),
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
                 }
@@ -894,6 +1113,7 @@ pub fn setup_tray_updates(
                         &order,
                         &entries,
                         &commands,
+                        &menu_requests,
                     );
                     if request.response.send(response).is_err() {
                         debug!("Tray IPC client disconnected before receiving its response");
@@ -920,6 +1140,82 @@ fn close_tray_menu(open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>) {
     }
 }
 
+fn add_menu_key_controller(
+    popover: &gtk4::Popover,
+    open_menu: &Rc<RefCell<Option<OpenTrayMenu>>>,
+    item_key: &str,
+) {
+    let controller = gtk4::EventControllerKey::new();
+    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let popover_weak = popover.downgrade();
+    let open_menu_weak = Rc::downgrade(open_menu);
+    let item_key = item_key.to_string();
+    let pending_g = Cell::new(false);
+    controller.connect_key_pressed(move |_controller, key, _code, _modifiers| {
+        let Some(open_menu) = open_menu_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        debug!(item = item_key, key = ?key, "Tray menu received key");
+
+        if key == gdk::Key::g {
+            if pending_g.replace(true) {
+                pending_g.set(false);
+                if let Err(error) = jump_menu_entry(&open_menu, false) {
+                    debug!(item = item_key, %error, "Could not jump to first tray menu entry");
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+        pending_g.set(false);
+
+        let result = if matches!(key, gdk::Key::j | gdk::Key::Down) {
+            select_menu_entry(&open_menu, 1).map(|_| ())
+        } else if matches!(key, gdk::Key::k | gdk::Key::Up) {
+            select_menu_entry(&open_menu, -1).map(|_| ())
+        } else if matches!(key, gdk::Key::G | gdk::Key::End) {
+            jump_menu_entry(&open_menu, true).map(|_| ())
+        } else if key == gdk::Key::Home {
+            jump_menu_entry(&open_menu, false).map(|_| ())
+        } else if matches!(key, gdk::Key::l | gdk::Key::Right) {
+            enter_submenu(&open_menu).map(|_| ())
+        } else if matches!(key, gdk::Key::h | gdk::Key::Left) {
+            leave_submenu(&open_menu).map(|_| ())
+        } else if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+            match enter_submenu(&open_menu) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let selected = open_menu.borrow().as_ref().and_then(|menu| {
+                        menu.selected
+                            .map(|index| menu.entries[index].button.clone())
+                    });
+                    match selected {
+                        Some(button) => {
+                            button.emit_clicked();
+                            Ok(())
+                        }
+                        None => Err("open tray menu has no selected entry".to_string()),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else if matches!(key, gdk::Key::Escape | gdk::Key::q) {
+            info!(item = item_key, key = ?key, "Closing tray menu from keyboard");
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
+            return glib::Propagation::Stop;
+        } else {
+            return glib::Propagation::Proceed;
+        };
+
+        if let Err(error) = result {
+            debug!(item = item_key, %error, key = ?key, "Tray menu key could not be handled");
+        }
+        glib::Propagation::Stop
+    });
+    popover.add_controller(controller);
+}
+
 // Render a tray item's dbusmenu as a native GTK popover. We build the menu from
 // concrete `Button` widgets (instead of `PopoverMenu::from_model`) because the
 // model-based popover constructs its widgets lazily and cannot measure its size
@@ -930,6 +1226,7 @@ fn show_tray_menu(
     entry: &TrayEntry,
     menu: &TrayMenu,
     command_tx: &mpsc::UnboundedSender<TrayCommand>,
+    keyboard_grab: &Rc<KeyboardGrab>,
 ) {
     // A previous menu may still be attached (or even open) — replace it.
     close_tray_menu(&entry.open_menu);
@@ -938,9 +1235,9 @@ fn show_tray_menu(
     popover.set_parent(&entry.button);
     popover.set_position(gtk4::PositionType::Bottom);
     popover.set_has_arrow(false);
-
     let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     box_.add_css_class("tray-menu");
+    box_.set_focusable(true);
     debug!(
         item = menu.key,
         labels = ?menu.items.iter().map(|i| &i.label).collect::<Vec<_>>(),
@@ -960,10 +1257,13 @@ fn show_tray_menu(
     popover.set_child(Some(&box_));
 
     *entry.open_menu.borrow_mut() = Some(OpenTrayMenu {
+        request_id: menu.request_id,
         popovers,
         entries: menu_entries,
         selected: None,
+        grab: None,
     });
+    add_menu_key_controller(&popover, &entry.open_menu, &menu.key);
     let open_menu_weak = Rc::downgrade(&entry.open_menu);
     popover.connect_closed(move |_popover| {
         let Some(open_menu) = open_menu_weak.upgrade() else {
@@ -976,20 +1276,60 @@ fn show_tray_menu(
         };
         // `closed` fires during event dispatch (e.g. the click-outside that
         // dismissed the menu), and unparenting mid-dispatch breaks GTK's
-        // active-state accounting — defer the teardown to an idle callback.
+        // active-state accounting. Keep the keyboard lease until after that
+        // teardown too, so compositor focus restoration cannot race GTK's
+        // still-active modal popup grab.
         glib::idle_add_local_once(move || {
             for popover in &closed.popovers {
                 popover.unparent();
             }
+            drop(closed);
         });
     });
 
     debug!(
         item = menu.key,
         entries = menu.items.len(),
+        keyboard_grab = menu.keyboard_grab,
         "Presenting tray menu"
     );
-    popover.popup();
+    if menu.keyboard_grab {
+        let lease = keyboard_grab.acquire(menu.request_id);
+        if let Some(open) = entry.open_menu.borrow_mut().as_mut() {
+            open.grab = lease;
+        }
+    }
+    if menu.keyboard_grab {
+        let request_id = menu.request_id;
+        let item_key = menu.key.clone();
+        let popover_weak = popover.downgrade();
+        let box_weak = box_.downgrade();
+        let open_menu_weak = Rc::downgrade(&entry.open_menu);
+        glib::timeout_add_local_once(Duration::from_millis(100), move || {
+            let Some(open_menu) = open_menu_weak.upgrade() else {
+                return;
+            };
+            let still_current = open_menu
+                .borrow()
+                .as_ref()
+                .is_some_and(|menu| menu.request_id == request_id);
+            if !still_current {
+                return;
+            }
+            let (Some(popover), Some(box_)) = (popover_weak.upgrade(), box_weak.upgrade()) else {
+                return;
+            };
+            popover.popup();
+            box_.grab_focus();
+            if let Err(error) = select_menu_entry(&open_menu, 1) {
+                warn!(item = item_key, %error, "Could not select the first keyboard menu entry");
+                popover.popdown();
+            }
+        });
+    } else {
+        popover.popup();
+        box_.grab_focus();
+    }
 }
 
 // Recursively fill `box_` with the dbusmenu entries. `top_popover` is the top
@@ -1054,6 +1394,7 @@ fn build_menu_box(
                     button: entry.clone(),
                     id: item.id,
                     ancestors: ancestors.to_vec(),
+                    submenu: None,
                 });
             }
             let command_tx = build.command_tx.clone();
@@ -1091,6 +1432,14 @@ fn build_menu_box(
             sub_box.add_css_class("tray-menu");
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(sub_popover.clone());
+            if item.enabled {
+                build.entries.push(OpenTrayMenuEntry {
+                    button: entry.clone(),
+                    id: item.id,
+                    ancestors: ancestors.to_vec(),
+                    submenu: Some(sub_popover.clone()),
+                });
+            }
             build_menu_box(&sub_box, &item.children, build, &child_ancestors);
             sub_popover.set_child(Some(&sub_box));
             build.popovers.push(sub_popover.clone());

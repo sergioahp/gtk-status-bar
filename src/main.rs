@@ -81,7 +81,7 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     let (tray_ipc_tx, tray_ipc_rx) = mpsc::unbounded_channel();
 
     widgets::update_time_widget(time_widget);
-    widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget);
+    widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget, &window);
     widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
     widgets::setup_title_updates(receivers.title, title_widget);
     widgets::setup_battery_updates(receivers.battery, battery_widget);

@@ -50,6 +50,7 @@ title, or a zero-based index from `list`, in that priority order:
 ```bash
 trayctl list
 trayctl context-menu "Bluetooth"
+trayctl keyboard-menu "Bluetooth"
 trayctl menu-next "Bluetooth"
 trayctl menu-previous "Bluetooth"
 trayctl menu-activate "Bluetooth"
@@ -68,6 +69,17 @@ Selection wraps at both ends. `menu-down` and `menu-up` are aliases for
 `menu-next` and `menu-previous`. The newline-delimited JSON protocol also
 supports persistent connections; its request verbs match the command names
 above.
+
+`keyboard-menu` opens the same native popover as `context-menu`, plus a
+temporary layer-shell helper surface that requests exclusive keyboard input.
+The long-lived bar stays on its normal bottom layer with keyboard interactivity
+disabled. Arrow keys and `j`/`k` move within the current menu, `l`/Right/Enter
+enters a submenu, `h`/Left leaves it, `gg` and Home jump to the first entry, and
+`G` and End jump to the last. Enter activates a leaf entry; Escape or `q` closes
+the menu. The helper surface is destroyed whenever the popover closes,
+including click-away dismissal, so input returns to the previously focused
+window. Mouse-opened and ordinary socket-opened menus never request keyboard
+input.
 
 ## 🛠️ Technology Stack
 

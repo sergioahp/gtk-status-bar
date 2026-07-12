@@ -59,6 +59,8 @@ pub struct TrayMenu {
     /// re-resolving the item's `Menu` property.
     pub menu_path: String,
     pub items: Vec<TrayMenuItem>,
+    pub request_id: u64,
+    pub keyboard_grab: bool,
 }
 
 #[derive(Debug)]
@@ -71,7 +73,10 @@ pub enum TrayUpdate {
 pub enum TrayAction {
     Activate,
     SecondaryActivate,
-    ContextMenu,
+    ContextMenu {
+        request_id: u64,
+        keyboard_grab: bool,
+    },
     /// Activate a specific entry of the item's `com.canonical.dbusmenu` layout.
     /// The payload is the dbusmenu entry id, forwarded to the `Event` method;
     /// the click coordinates of TrayCommand are unused for this action.
@@ -659,6 +664,8 @@ async fn fetch_menu(connection: &Connection, key: &str, menu_path: &str) -> Resu
         key: key.to_string(),
         menu_path: menu_path.to_string(),
         items: root.children,
+        request_id: 0,
+        keyboard_grab: false,
     })
 }
 
@@ -872,7 +879,10 @@ async fn dispatch_command(
             )
             .await;
         }
-        TrayAction::ContextMenu => {
+        TrayAction::ContextMenu {
+            request_id,
+            keyboard_grab,
+        } => {
             // Mirror eww: paint the dbusmenu ourselves. Fall back to the SNI's
             // own ContextMenu method for the rare item that draws its own menu.
             let menu_path = if command.menu_path.is_empty() {
@@ -901,7 +911,9 @@ async fn dispatch_command(
                 return;
             }
             match fetch_menu(connection, &command.key, &menu_path).await {
-                Ok(menu) => {
+                Ok(mut menu) => {
+                    menu.request_id = request_id;
+                    menu.keyboard_grab = keyboard_grab;
                     if let Err(error) = menu_tx.send(menu) {
                         warn!(item = command.key, %error, "Could not deliver tray menu to UI");
                     }

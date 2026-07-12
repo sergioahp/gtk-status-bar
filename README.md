@@ -35,6 +35,36 @@ A modern, transparent status bar for Wayland compositors built directly in Rust 
 
 System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well. Context menus are read from the application's com.canonical.dbusmenu interface and rendered by the bar itself as native popovers, since applications cannot reliably draw their own menus over a layer-shell surface.
 
+### External tray control
+
+The bar listens on a per-user Unix socket so keyboard daemons, compositor
+bindings, and other local programs can control the tray without reproducing its
+D-Bus logic. The default socket is
+`$XDG_RUNTIME_DIR/gtk-status-bar/tray.sock`; set
+`GTK_STATUS_BAR_SOCKET` in both processes to override it. The directory and
+socket use modes `0700` and `0600`.
+
+`trayctl` is the reference client. A target is an exact item key, an exact
+title, or a zero-based index from `list`, in that priority order:
+
+```bash
+trayctl list
+trayctl context-menu "Bluetooth"
+trayctl menu-next "Bluetooth"
+trayctl menu-previous "Bluetooth"
+trayctl menu-activate "Bluetooth"
+trayctl menu-click "Bluetooth" 12
+trayctl close-menus
+trayctl activate 0
+trayctl secondary-activate 1
+trayctl --json list
+```
+
+Selection wraps at both ends. `menu-down` and `menu-up` are aliases for
+`menu-next` and `menu-previous`. The newline-delimited JSON protocol also
+supports persistent connections; its request verbs match the command names
+above.
+
 ## 🛠️ Technology Stack
 
 - **🦀 Rust** - Memory-safe systems programming with anyhow error handling

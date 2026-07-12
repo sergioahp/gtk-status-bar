@@ -45,6 +45,7 @@
             commonArgs
             // {
               inherit cargoArtifacts;
+              cargoExtraArgs = "--workspace";
 
               # Tray icons like fcitx's `input-keyboard-symbolic` and KDE Connect's
               # `kdeconnectindicatordark` ship only as SVG. GTK renders themed SVGs

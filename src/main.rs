@@ -12,16 +12,46 @@ mod pw;
 mod tray;
 mod widgets;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 
 use gio::prelude::*;
 use gtk4::prelude::*;
-use tracing::{error, info};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+use tray_ipc::IpcUiRequest;
 
 fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+}
+
+async fn run_tray_ipc_supervised(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
+    let max_delay = Duration::from_secs(60);
+    let reset_threshold = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        let started = Instant::now();
+        info!("Starting tray IPC server");
+        if let Err(error) = tray_ipc::run_server(ui_tx.clone()).await {
+            warn!(%error, "Tray IPC server stopped");
+        }
+
+        if started.elapsed() >= reset_threshold {
+            debug!(
+                elapsed = ?started.elapsed(),
+                "Tray IPC server was stable; resetting restart backoff"
+            );
+            delay = Duration::from_secs(1);
+        }
+
+        warn!(restart_delay = ?delay, "Restarting tray IPC server");
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, max_delay);
+    }
 }
 
 fn activate(application: &gtk4::Application) -> Result<()> {
@@ -48,9 +78,10 @@ fn activate(application: &gtk4::Application) -> Result<()> {
 
     let (bus, receivers) = bus::Bus::new();
     let (tray_backend, tray_ui) = tray::channels();
+    let (tray_ipc_tx, tray_ipc_rx) = mpsc::unbounded_channel();
 
     widgets::update_time_widget(time_widget);
-    widgets::setup_tray_updates(tray_ui, tray_widget);
+    widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget);
     widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
     widgets::setup_title_updates(receivers.title, title_widget);
     widgets::setup_battery_updates(receivers.battery, battery_widget);
@@ -64,6 +95,7 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     tokio::spawn(hypr::run_title_listener_supervised(bus.clone()));
     tokio::spawn(dbus::run_dbus_monitor_supervised(bus));
     tokio::spawn(tray::run_tray_supervised(tray_backend));
+    tokio::spawn(run_tray_ipc_supervised(tray_ipc_tx));
 
     info!("Application activated successfully");
     Ok(())

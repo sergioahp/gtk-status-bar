@@ -45,6 +45,22 @@
             commonArgs
             // {
               inherit cargoArtifacts;
+
+              # Tray icons like fcitx's `input-keyboard-symbolic` and KDE Connect's
+              # `kdeconnectindicatordark` ship only as SVG. GTK renders themed SVGs
+              # through the gdk-pixbuf librsvg loader, which the bare Cargo binary
+              # has no way to find at runtime. wrapGAppsHook4 builds a loaders.cache
+              # (via GDK_PIXBUF_MODULE_FILE) and wires up XDG_DATA_DIRS/schemas, so
+              # SVG-only icons stop falling back to the "image-missing" glyph.
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+                pkgs.wrapGAppsHook4
+              ];
+              buildInputs = commonArgs.buildInputs ++ [
+                pkgs.librsvg
+                pkgs.gdk-pixbuf
+                pkgs.glib
+                pkgs.gsettings-desktop-schemas
+              ];
             }
           );
 
@@ -65,6 +81,13 @@
           };
 
           # `nix develop` drops you into a shell with Rust + rust-src.
+          #
+          # The released binary is wrapped by wrapGAppsHook4, which points
+          # GDK_PIXBUF_MODULE_FILE at a loaders cache that includes the librsvg
+          # SVG decoder. In the dev shell the librsvg setup hook does the same
+          # job: nixpkgs ships librsvg with a merged loaders.cache (all
+          # gdk-pixbuf loaders + SVG) and the hook exports it, so `cargo run`
+          # decodes SVG tray icons exactly like `nix run`.
           devShells.default = pkgs.mkShell {
             name = "rust-dev-shell";
             # Include Rust toolchain and required C libraries for GTK4
@@ -80,13 +103,16 @@
               pkgs.pipewire
               # Clang for bindgen (required for PipeWire Rust bindings)
               pkgs.clang
+              # SVG gdk-pixbuf loader for tray icons; see the comment above.
+              pkgs.librsvg
             ];
 
-            # Explicit for completeness; rust-analyzer finds it even without this.
-            RUST_SRC_PATH = rustLibSrc;
-            # Set LIBCLANG_PATH for bindgen
-            LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
-
+            env = {
+              # Explicit for completeness; rust-analyzer finds it even without this.
+              RUST_SRC_PATH = rustLibSrc;
+              # For bindgen (PipeWire Rust bindings).
+              LIBCLANG_PATH = "${pkgs.clang.cc.lib}/lib";
+            };
           };
 
           apps.default = flake-utils.lib.mkApp {

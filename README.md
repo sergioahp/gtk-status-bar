@@ -19,6 +19,7 @@ A modern, transparent status bar for Wayland compositors built directly in Rust 
 - **🔒 Thread-safe architecture** - Proper async/sync bridge between system events and GTK main thread
 - **🎨 CSS customization** - External CSS file support for complete visual customization
 - **📡 D-Bus integration** - Direct system service communication for real-time updates
+- **🧰 System tray host** - StatusNotifierItem support for Electron, OBS, Fcitx, and other tray applications
 - **🔧 Resilient error handling** - Uses anyhow for graceful degradation and continuous operation
 - **📝 Extensive logging** - Comprehensive tracing throughout the application for debugging
 
@@ -29,7 +30,10 @@ A modern, transparent status bar for Wayland compositors built directly in Rust 
 - 🎵 PipeWire volume monitoring with compact display format
 - 📱 Bluetooth device status with battery levels
 - 🔋 System battery status with automatic hiding
+- 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
+
+System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well. Context menus are read from the application's com.canonical.dbusmenu interface and rendered by the bar itself as native popovers, since applications cannot reliably draw their own menus over a layer-shell surface.
 
 ## 🛠️ Technology Stack
 

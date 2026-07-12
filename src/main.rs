@@ -1,14 +1,15 @@
 // Entry point: bring up tracing, the tokio runtime, the GTK application, and
-// wire each subsystem's GUI fan-out to its widget. activate() creates one Bus,
-// hands each receiver to its widget drain (setup_*_updates), and only then
-// spawns the supervised producer tasks with Bus clones — so every consumer is
-// wired before the first producer can send. Producers that crash are restarted
-// with exponential backoff by their run_*_supervised wrappers.
+// wire each subsystem's GUI fan-out to its widget. activate() creates one Bus
+// plus the bidirectional tray endpoints, hands every UI half to its widget
+// drain, and only then spawns the supervised producers. Every consumer is
+// therefore wired before the first producer can send. Producers that crash are
+// restarted with exponential backoff by their run_*_supervised wrappers.
 
 mod bus;
 mod dbus;
 mod hypr;
 mod pw;
+mod tray;
 mod widgets;
 
 use anyhow::{Context, Result};
@@ -34,6 +35,7 @@ fn activate(application: &gtk4::Application) -> Result<()> {
 
     let (
         bar,
+        tray_widget,
         bt_widget,
         volume_widget,
         battery_widget,
@@ -45,20 +47,23 @@ fn activate(application: &gtk4::Application) -> Result<()> {
     window.show();
 
     let (bus, receivers) = bus::Bus::new();
+    let (tray_backend, tray_ui) = tray::channels();
 
     widgets::update_time_widget(time_widget);
+    widgets::setup_tray_updates(tray_ui, tray_widget);
     widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
     widgets::setup_title_updates(receivers.title, title_widget);
     widgets::setup_battery_updates(receivers.battery, battery_widget);
     widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
     widgets::setup_volume_updates(volume_widget)?;
 
-    // Every consumer above is wired before any producer below spawns; the
-    // D-Bus monitor serves both the battery and bluetooth channels, so this
-    // ordering is what makes its first sends race-free.
+    // Every consumer above is wired before any producer below spawns. The
+    // D-Bus monitor serves both battery and bluetooth, while the tray also has
+    // a UI-to-backend command channel; both still obey the same ordering.
     tokio::spawn(hypr::run_workspace_listener_supervised(bus.clone()));
     tokio::spawn(hypr::run_title_listener_supervised(bus.clone()));
     tokio::spawn(dbus::run_dbus_monitor_supervised(bus));
+    tokio::spawn(tray::run_tray_supervised(tray_backend));
 
     info!("Application activated successfully");
     Ok(())

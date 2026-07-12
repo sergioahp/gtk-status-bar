@@ -64,6 +64,37 @@
   min-width: 3em;
 }
 
+.tray-widget {
+  background-color: rgba(36, 40, 59, 0.72);
+  border-radius: 1.25em;
+  margin: 0.3em 0.25em 0em;
+  padding: 0em 0.45em;
+  /* Symbolic tray icons are recolored to this `color`; without it the earlier
+   * `* { all: unset; }` reset leaves them dark-on-dark and effectively invisible
+   * (e.g. fcitx's input-keyboard-symbolic). */
+  color: #c0caf5;
+}
+
+.tray-item {
+  border-radius: 0.5em;
+  min-height: 20px;
+  min-width: 20px;
+  padding: 0.1em;
+  color: #c0caf5;
+}
+
+.tray-item:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.tray-item.needs-attention {
+  background-color: rgba(247, 118, 142, 0.4);
+}
+
+.tray-item.passive {
+  opacity: 0.72;
+}
+
 /* Fixed-width containers for perfect centering */
 .left-container {
   min-width: 20em;
@@ -89,4 +120,35 @@ window.layer-bar {
 
 * {
   background-color: transparent;
+}
+
+/* Tray dropdown menus (native GTK popovers rendering com.canonical.dbusmenu).
+ * These must override the global `* { background-color: transparent }` reset so
+ * the menu is legible against the transparent bar. */
+.tray-menu {
+  background-color: rgba(30, 34, 50, 0.96);
+  color: #c0caf5;
+  border-radius: 0.5em;
+  padding: 0.25em;
+}
+
+.tray-menu label {
+  color: #c0caf5;
+}
+
+.tray-menu-item {
+  background-color: transparent;
+  color: #c0caf5;
+  border-radius: 0.35em;
+  padding: 0.1em 0.3em;
+}
+
+.tray-menu-item:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+
+.tray-menu separator {
+  background-color: rgba(192, 202, 245, 0.25);
+  min-height: 1px;
+  margin: 0.2em 0.4em;
 }

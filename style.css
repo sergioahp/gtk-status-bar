@@ -9,8 +9,8 @@
   background-color: rgba(102, 126, 234, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
   min-width: 3em;
 }
@@ -19,8 +19,8 @@
   background-color: rgba(240, 147, 251, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
   min-width: 7em;
 }
@@ -29,8 +29,8 @@
   background-color: rgba(67, 233, 123, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
   min-width: 10em;
 }
@@ -39,8 +39,8 @@
   background-color: rgba(250, 112, 154, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
 }
 
@@ -48,8 +48,8 @@
   background-color: rgba(255, 193, 7, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
   min-width: 3em;
 }
@@ -58,16 +58,16 @@
   background-color: rgba(76, 175, 80, 0.5);
   color: white;
   padding: 0em 1em;
-  border-radius: 1.25em;
-  margin: 0.3em 0.5em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
   font-weight: bold;
   min-width: 3em;
 }
 
 .tray-widget {
   background-color: rgba(36, 40, 59, 0.72);
-  border-radius: 1.25em;
-  margin: 0.3em 0.25em 0em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.25em 0em;
   padding: 0em 0.45em;
   /* Symbolic tray icons are recolored to this `color`; without it the earlier
    * `* { all: unset; }` reset leaves them dark-on-dark and effectively invisible

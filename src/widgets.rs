@@ -214,7 +214,7 @@ pub fn create_experimental_bar() -> (
 
     let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
-    main_box.set_valign(gtk4::Align::Center);
+    main_box.set_valign(gtk4::Align::Start);
 
     let (left_group, workspace_widget) = create_left_group();
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group();
@@ -841,8 +841,6 @@ pub fn configure_layer_shell(window: &gtk4::ApplicationWindow) {
     for (anchor, state) in anchors {
         window.set_anchor(anchor, state);
     }
-
-    window.set_default_height(30);
 
     info!("Layer shell configured successfully");
 }

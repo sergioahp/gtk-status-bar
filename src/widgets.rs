@@ -690,6 +690,12 @@ fn select_menu_entry(
         return Err("open tray menu has no enabled entries".to_string());
     }
     let candidates = entries_in_scope(menu);
+    if candidates.is_empty() {
+        // entries_in_scope can be empty while `entries` is not: e.g. the current
+        // scope is the top level but every enabled entry lives inside a submenu.
+        // Guard before indexing/rem_euclid so a keypress can't panic the bar.
+        return Err("open tray menu has no enabled entries in the current scope".to_string());
+    }
     let len = candidates.len() as isize;
     let candidate = match menu.selected.and_then(|selected| {
         candidates

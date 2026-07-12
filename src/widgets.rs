@@ -1533,6 +1533,10 @@ fn end_nav(
     for entry in entries.values() {
         close_tray_menu(&entry.open_menu);
         entry.button.remove_css_class("nav-selected");
+        // Unmapping the exclusive helper can leave GTK's hover state on the
+        // icon under a stationary pointer. Clear that transient tint with the
+        // keyboard state; normal pointer motion will establish hover again.
+        entry.button.unset_state_flags(gtk4::StateFlags::PRELIGHT);
     }
     container.remove_css_class("nav-focus");
     container.remove_css_class("nav-level-zero");

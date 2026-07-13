@@ -37,7 +37,7 @@ Without `--monitor`, the compositor chooses the output.
 - ⏰ Real-time clock with 12-hour format
 - 🎵 PipeWire volume monitoring with compact display format
 - 📱 Bluetooth device status with battery levels
-- 🔋 System battery status with automatic hiding
+- 🔋 System battery status with automatic hiding and state-aware 🔋/🪫/⚡/🔌 icons
 - 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
 

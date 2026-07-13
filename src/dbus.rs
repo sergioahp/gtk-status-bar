@@ -37,6 +37,28 @@ pub struct BluetoothDevice {
     pub device_name: Option<String>,
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct SystemBattery {
+    percentage: Option<f64>,
+    state: Option<u32>,
+}
+
+impl SystemBattery {
+    fn display_text(&self) -> String {
+        let Some(percentage) = self.percentage else {
+            return String::new();
+        };
+        let icon = match self.state {
+            Some(4) => "🔌",
+            Some(1 | 5) => "⚡",
+            Some(3) => "🪫",
+            _ if percentage <= 20.0 => "🪫",
+            _ => "🔋",
+        };
+        format!("{icon} {percentage:.0}%")
+    }
+}
+
 pub fn compute_bluetooth_display_string(
     bluetooth_devices: &HashMap<String, BluetoothDevice>,
 ) -> String {
@@ -260,6 +282,7 @@ mod tests {
     #[test]
     fn properties_changed_updates_bluetooth_and_upower_outputs() {
         let (bus, mut receivers) = Bus::new();
+        let mut battery = SystemBattery::default();
         let mut devices: HashMap<String, BluetoothDevice> =
             [device("/org/bluez/hci0/dev_test", Some("Pixel"), Some(40))]
                 .into_iter()
@@ -269,7 +292,13 @@ mod tests {
             InterfaceName::try_from("org.bluez.Battery1").expect("valid interface"),
             HashMap::from([("Percentage", Value::U8(75))]),
         );
-        handle_properties_changed(&bluetooth, "/org/bluez/hci0/dev_test", &mut devices, &bus);
+        handle_properties_changed(
+            &bluetooth,
+            "/org/bluez/hci0/dev_test",
+            &mut devices,
+            &mut battery,
+            &bus,
+        );
         assert_eq!(
             devices["/org/bluez/hci0/dev_test"].battery_percentage,
             Some(75)
@@ -287,11 +316,28 @@ mod tests {
             &upower,
             "/org/freedesktop/UPower/devices/battery_BAT0",
             &mut devices,
+            &mut battery,
             &bus,
         );
         assert_eq!(
             receivers.battery.try_recv().expect("UPower display"),
             "🔋 64%"
+        );
+
+        let charging = properties_changed_message(
+            InterfaceName::try_from("org.freedesktop.UPower.Device").expect("valid interface"),
+            HashMap::from([("State", Value::U32(1))]),
+        );
+        handle_properties_changed(
+            &charging,
+            "/org/freedesktop/UPower/devices/battery_BAT0",
+            &mut devices,
+            &mut battery,
+            &bus,
+        );
+        assert_eq!(
+            receivers.battery.try_recv().expect("charging display"),
+            "⚡ 64%"
         );
     }
 
@@ -335,6 +381,10 @@ mod tests {
     #[test]
     fn malformed_signal_bodies_do_not_mutate_state_or_send_updates() {
         let (bus, mut receivers) = Bus::new();
+        let mut battery = SystemBattery {
+            percentage: Some(75.0),
+            state: Some(2),
+        };
         let mut devices: HashMap<String, BluetoothDevice> =
             [device("/existing", Some("Pixel"), Some(80))]
                 .into_iter()
@@ -351,14 +401,41 @@ mod tests {
             &malformed("PropertiesChanged"),
             "/existing",
             &mut devices,
+            &mut battery,
             &bus,
         );
         handle_interfaces_removed(&malformed("InterfacesRemoved"), &mut devices, &bus);
 
         assert_eq!(devices.len(), 1);
         assert_eq!(devices["/existing"].battery_percentage, Some(80));
+        assert_eq!(
+            battery,
+            SystemBattery {
+                percentage: Some(75.0),
+                state: Some(2)
+            }
+        );
         assert!(receivers.bluetooth.try_recv().is_err());
         assert!(receivers.battery.try_recv().is_err());
+    }
+
+    #[test]
+    fn battery_icons_reflect_power_and_low_charge_states() {
+        let display = |percentage, state| {
+            SystemBattery {
+                percentage: Some(percentage),
+                state: Some(state),
+            }
+            .display_text()
+        };
+
+        assert_eq!(display(73.0, 2), "🔋 73%");
+        assert_eq!(display(20.0, 2), "🪫 20%");
+        assert_eq!(display(10.0, 1), "⚡ 10%");
+        assert_eq!(display(80.0, 5), "⚡ 80%");
+        assert_eq!(display(100.0, 4), "🔌 100%");
+        assert_eq!(display(80.0, 3), "🪫 80%");
+        assert_eq!(SystemBattery::default().display_text(), "");
     }
 }
 
@@ -376,29 +453,22 @@ fn process_bluetooth_battery_percentage(value: Value<'_>) -> Option<u8> {
         })
 }
 
-fn process_battery_percentage(value: Value<'_>, bus: &Bus) {
-    if let Some(percentage) = f64::try_from(value)
+fn process_battery_percentage(value: Value<'_>) -> Option<f64> {
+    f64::try_from(value)
         .inspect_err(|e| {
             error!("Failed to convert battery percentage to f64: {}", e);
         })
         .ok()
-    {
-        info!("Battery percentage changed to {:.1}%", percentage);
-        let battery_text = format!("🔋 {:.0}%", percentage);
-        if let Err(e) = bus.send_battery_update(battery_text) {
-            error!("Failed to send battery update: {:#}", e);
-        }
-    }
+        .inspect(|percentage| info!("Battery percentage changed to {:.1}%", percentage))
 }
 
-fn process_battery_state(value: Value<'_>) {
-    if let Some(state) = u32::try_from(value)
+fn process_battery_state(value: Value<'_>) -> Option<u32> {
+    u32::try_from(value)
         .inspect_err(|e| {
             error!("Failed to convert battery state to u32: {}", e);
         })
         .ok()
-    {
-        match state {
+        .inspect(|state| match state {
             1 => info!("Battery is charging (state: {})", state),
             2 => info!("Battery is discharging (state: {})", state),
             3 => info!("Battery is empty (state: {})", state),
@@ -406,9 +476,7 @@ fn process_battery_state(value: Value<'_>) {
             5 => info!("Battery charge is pending (state: {})", state),
             6 => info!("Battery discharge is pending (state: {})", state),
             _ => info!("Battery state unknown: {}", state),
-        }
-        // TODO: Future UI update for battery state
-    }
+        })
 }
 
 fn process_bluetooth_battery_interface(battery_interface_value: &Value<'_>) -> Option<u8> {
@@ -441,8 +509,12 @@ fn process_bluetooth_battery_interface(battery_interface_value: &Value<'_>) -> O
     }
 }
 
-fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
-    // Check State property (charging/discharging/fully charged)
+fn process_battery_device_properties(
+    properties_dict: &zvariant::Dict,
+    battery: &mut SystemBattery,
+) -> bool {
+    let mut changed = false;
+
     match properties_dict.get::<_, zvariant::Value>(&zvariant::Str::from("State")) {
         Err(e) => {
             debug!(
@@ -454,9 +526,32 @@ fn process_battery_device_properties(properties_dict: &zvariant::Dict) {
             debug!("Battery device properties contain no State property");
         }
         Ok(Some(state_value)) => {
-            process_battery_state(state_value.clone());
+            if let Some(state) = process_battery_state(state_value.clone()) {
+                battery.state = Some(state);
+                changed = true;
+            }
         }
     }
+
+    match properties_dict.get::<_, zvariant::Value>(&zvariant::Str::from("Percentage")) {
+        Err(e) => {
+            debug!(
+                "Dbus monitor: Failed to get Percentage property from battery device: {}",
+                e
+            );
+        }
+        Ok(None) => {
+            debug!("Battery device properties contain no Percentage property");
+        }
+        Ok(Some(percentage_value)) => {
+            if let Some(percentage) = process_battery_percentage(percentage_value.clone()) {
+                battery.percentage = Some(percentage);
+                changed = true;
+            }
+        }
+    }
+
+    changed
 }
 
 // MatchRule builders. Each .sender/.interface/.member/.path returns
@@ -744,6 +839,7 @@ fn handle_properties_changed(
     msg: &zbus::Message,
     path: &str,
     bluetooth_devices: &mut HashMap<String, BluetoothDevice>,
+    battery: &mut SystemBattery,
     bus: &Bus,
 ) {
     info!("Dbus monitor: Received PropertiesChanged signal");
@@ -788,14 +884,10 @@ fn handle_properties_changed(
                 }
             };
 
-            // Use the new battery properties processing function
-            process_battery_device_properties(changed_properties);
-
-            // Use dedicated function for percentage changes
-            let percentage_key = Value::Str("Percentage".into());
-            if let Ok(Some(percentage_value)) = changed_properties.get::<_, Value>(&percentage_key)
-            {
-                process_battery_percentage(percentage_value, bus);
+            if process_battery_device_properties(changed_properties, battery) {
+                if let Err(e) = bus.send_battery_update(battery.display_text()) {
+                    error!("Failed to send battery update: {:#}", e);
+                }
             }
         }
         "org.bluez.Battery1" => {
@@ -1036,7 +1128,7 @@ fn handle_interfaces_removed(
 // Every early return sends SOMETHING: the supervisor re-runs this per
 // reconnect, and bailing silently would leave the widget frozen on
 // pre-outage data (stale "80%" while the service is actually unreachable).
-async fn initial_battery_query(connection: &Connection, bus: &Bus) {
+async fn initial_battery_query(connection: &Connection, bus: &Bus) -> SystemBattery {
     // TODO: what if there is no battery (for example, in a desktop?)
     // Probably should monitor if a battery comes into existance so
     // you should not return
@@ -1059,14 +1151,14 @@ async fn initial_battery_query(connection: &Connection, bus: &Bus) {
 
     let Some(proxy) = properties_proxy else {
         send_empty();
-        return;
+        return SystemBattery::default();
     };
     let Some(battery_interface_name) = InterfaceName::try_from("org.freedesktop.UPower.Device")
         .inspect_err(|e| error!("Failed to create interface name: {}", e))
         .ok()
     else {
         send_empty();
-        return;
+        return SystemBattery::default();
     };
 
     let battery_percentage = proxy
@@ -1087,21 +1179,7 @@ async fn initial_battery_query(connection: &Connection, bus: &Bus) {
                 .ok()
         });
 
-    let battery_text = battery_percentage
-        .map(|percentage| {
-            info!("Battery is at {:.1}%", percentage);
-            format!("🔋 {:.0}%", percentage)
-        })
-        .unwrap_or_else(|| {
-            debug!("Using empty battery text");
-            String::new()
-        });
-
-    bus.send_battery_update(battery_text)
-        .inspect_err(|e| error!("Failed to send battery update: {:#}", e))
-        .ok();
-
-    if let Some(state_value) = proxy
+    let battery_state = proxy
         .get(battery_interface_name, "State")
         .await
         .inspect_err(|e| {
@@ -1111,9 +1189,22 @@ async fn initial_battery_query(connection: &Connection, bus: &Bus) {
             )
         })
         .ok()
-    {
-        process_battery_state(state_value.into());
+        .and_then(|state| process_battery_state(state.into()));
+
+    let battery = SystemBattery {
+        percentage: battery_percentage,
+        state: battery_state,
+    };
+    if let Some(percentage) = battery.percentage {
+        info!("Battery is at {:.1}%", percentage);
+    } else {
+        debug!("Using empty battery text");
     }
+    bus.send_battery_update(battery.display_text())
+        .inspect_err(|e| error!("Failed to send battery update: {:#}", e))
+        .ok();
+
+    battery
 }
 
 // Initial BlueZ scan via ObjectManager.GetManagedObjects: enumerate every
@@ -1344,7 +1435,7 @@ pub async fn monitor_dbus(bus: &Bus) -> Result<()> {
     // shape in the loop below.
     let mut stream = zbus::MessageStream::from(&connection);
 
-    initial_battery_query(&connection, bus).await;
+    let mut battery = initial_battery_query(&connection, bus).await;
 
     // TODO: Consider adding has_device1 field to BluetoothDevice struct for full symmetry
     // with has_battery and has_media fields. Current approach uses device_name presence
@@ -1413,7 +1504,7 @@ pub async fn monitor_dbus(bus: &Bus) -> Result<()> {
                 handle_interfaces_added(&msg, &mut bluetooth_devices, bus);
             }
             ("org.freedesktop.DBus.Properties", "PropertiesChanged") => {
-                handle_properties_changed(&msg, path, &mut bluetooth_devices, bus);
+                handle_properties_changed(&msg, path, &mut bluetooth_devices, &mut battery, bus);
             }
             ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved") => {
                 handle_interfaces_removed(&msg, &mut bluetooth_devices, bus);

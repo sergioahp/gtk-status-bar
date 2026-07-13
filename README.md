@@ -50,7 +50,7 @@ connections return to the stable mean.
 - 🎵 PipeWire volume monitoring with compact display format
 - 📱 Bluetooth device status with battery levels
 - 🔋 System battery status with automatic hiding and state-aware 🔋/🪫/⚡/🔌 icons
-- 🌐 Event-driven wired/Wi-Fi status with signal strength and adaptive Internet checks
+- Event-driven wired/Wi-Fi status with signal strength, Nerd Font icons, and adaptive Internet checks
 - 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
 

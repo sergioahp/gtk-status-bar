@@ -28,6 +28,16 @@ const ACTIVE_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.Connection
 const WIRELESS_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const ACCESS_POINT_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 
+const ICON_GLOBE: &str = "\u{f0ac}";
+const ICON_ETHERNET: &str = "\u{f0200}";
+const ICON_NETWORK: &str = "\u{f06f3}";
+const ICON_NETWORK_OFF: &str = "\u{f0c9b}";
+const ICON_WIFI_OUTLINE: &str = "\u{f092f}";
+const ICON_WIFI_1: &str = "\u{f091f}";
+const ICON_WIFI_2: &str = "\u{f0922}";
+const ICON_WIFI_3: &str = "\u{f0925}";
+const ICON_WIFI_4: &str = "\u{f0928}";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkConfig {
     pub ping_targets: Vec<IpAddr>,
@@ -122,14 +132,23 @@ impl NetworkSnapshot {
 fn display_text(link: &Link, reachability: Reachability) -> String {
     let reachability = match reachability {
         Reachability::Unknown => "?",
-        Reachability::Online => "✓",
+        Reachability::Online => ICON_GLOBE,
         Reachability::Offline => "×",
     };
     match link {
-        Link::None => "🌐 ×".to_string(),
-        Link::Wifi { strength } => format!("📶 {strength}% {reachability}"),
-        Link::Wired => format!("🌐 {reachability}"),
-        Link::Other => format!("🔗 {reachability}"),
+        Link::None => format!("{ICON_NETWORK_OFF} ×"),
+        Link::Wifi { strength } => {
+            let icon = match strength {
+                0..=20 => ICON_WIFI_OUTLINE,
+                21..=40 => ICON_WIFI_1,
+                41..=60 => ICON_WIFI_2,
+                61..=80 => ICON_WIFI_3,
+                _ => ICON_WIFI_4,
+            };
+            format!("{icon} {strength}% {reachability}")
+        }
+        Link::Wired => format!("{ICON_ETHERNET} {reachability}"),
+        Link::Other => format!("{ICON_NETWORK} {reachability}"),
     }
 }
 
@@ -621,13 +640,26 @@ mod tests {
 
     #[test]
     fn labels_cover_link_and_reachability_states() {
-        assert_eq!(display_text(&Link::None, Reachability::Offline), "🌐 ×");
-        assert_eq!(display_text(&Link::Wired, Reachability::Online), "🌐 ✓");
+        assert_eq!(
+            display_text(&Link::None, Reachability::Offline),
+            format!("{ICON_NETWORK_OFF} ×")
+        );
+        assert_eq!(
+            display_text(&Link::Wired, Reachability::Online),
+            format!("{ICON_ETHERNET} {ICON_GLOBE}")
+        );
         assert_eq!(
             display_text(&Link::Wifi { strength: 73 }, Reachability::Unknown),
-            "📶 73% ?"
+            format!("{ICON_WIFI_3} 73% ?")
         );
-        assert_eq!(display_text(&Link::Other, Reachability::Offline), "🔗 ×");
+        assert_eq!(
+            display_text(&Link::Wifi { strength: 28 }, Reachability::Online),
+            format!("{ICON_WIFI_1} 28% {ICON_GLOBE}")
+        );
+        assert_eq!(
+            display_text(&Link::Other, Reachability::Offline),
+            format!("{ICON_NETWORK} ×")
+        );
     }
 
     #[test]

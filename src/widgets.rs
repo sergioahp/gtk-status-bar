@@ -716,18 +716,6 @@ fn next_menu_request(sequence: &Cell<u64>) -> u64 {
     next
 }
 
-// Mapping a popover can leave GTK's synthesized hover (PRELIGHT) on whichever
-// menu-item button now sits at the seat's last-known pointer position, even
-// though keyboard/socket navigation never moved a real pointer there — it is
-// consistently the last-built button, since that stale position outlives the
-// button that previously occupied it. Clear it from every entry so a fresh
-// dropdown never shows a phantom highlight the user never hovered.
-fn clear_menu_item_hover(menu: &OpenTrayMenu) {
-    for entry in &menu.entries {
-        entry.button.unset_state_flags(gtk4::StateFlags::PRELIGHT);
-    }
-}
-
 fn select_menu_index(menu: &mut OpenTrayMenu, selected: usize) -> i32 {
     if let Some(previous) = menu.selected {
         menu.entries[previous].button.remove_css_class("selected");
@@ -745,8 +733,6 @@ fn select_menu_index(menu: &mut OpenTrayMenu, selected: usize) -> i32 {
     for popover in &selected_entry.ancestors {
         popover.popup();
     }
-    clear_menu_item_hover(menu);
-    let selected_entry = &menu.entries[selected];
     selected_entry.button.add_css_class("selected");
     selected_entry.button.grab_focus();
     let id = selected_entry.id;
@@ -1908,25 +1894,11 @@ fn show_tray_menu(
             };
             popover.popup();
             box_.grab_focus();
-            glib::idle_add_local_once(move || {
-                if let Some(menu) = open_menu.borrow().as_ref() {
-                    clear_menu_item_hover(menu);
-                }
-            });
             debug!(item = item_key, "Tray dropdown opened at level 0");
         });
     } else {
         popover.popup();
         box_.grab_focus();
-        let open_menu_weak = Rc::downgrade(&entry.open_menu);
-        glib::idle_add_local_once(move || {
-            let Some(open_menu) = open_menu_weak.upgrade() else {
-                return;
-            };
-            if let Some(menu) = open_menu.borrow().as_ref() {
-                clear_menu_item_hover(menu);
-            }
-        });
     }
 }
 
@@ -1954,6 +1926,28 @@ fn build_menu_box(
         entry.set_has_frame(false);
         entry.add_css_class("tray-menu-item");
         entry.set_hexpand(true);
+        let pointer_motion = gtk4::EventControllerMotion::new();
+        let entry_weak = entry.downgrade();
+        pointer_motion.connect_motion(move |controller, _x, _y| {
+            // Popover allocation asks GDK to emit a synthetic motion event so
+            // GTK can repick pointer focus after the popup moves. Its timestamp
+            // is GDK_CURRENT_TIME (zero); exposing :hover for that event is what
+            // produces the one-frame last-row flash. Only timestamped device
+            // motion earns the visual hover class.
+            if controller.current_event_time() == gdk::CURRENT_TIME {
+                return;
+            }
+            if let Some(entry) = entry_weak.upgrade() {
+                entry.add_css_class("pointer-hover");
+            }
+        });
+        let entry_weak = entry.downgrade();
+        pointer_motion.connect_leave(move |_controller| {
+            if let Some(entry) = entry_weak.upgrade() {
+                entry.remove_css_class("pointer-hover");
+            }
+        });
+        entry.add_controller(pointer_motion);
         if !item.enabled {
             entry.set_sensitive(false);
         }

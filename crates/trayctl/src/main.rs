@@ -11,6 +11,7 @@ const USAGE: &str = "Usage:
   trayctl [--json] secondary-activate TARGET
   trayctl [--json] context-menu TARGET
   trayctl [--json] keyboard-menu TARGET
+  trayctl [--json] open
   trayctl [--json] menu-next TARGET
   trayctl [--json] menu-previous TARGET
   trayctl [--json] menu-activate TARGET
@@ -19,7 +20,9 @@ const USAGE: &str = "Usage:
   trayctl socket-path
 
 TARGET is a zero-based index from `trayctl list`, an exact item title, or an
-exact item key. Set GTK_STATUS_BAR_SOCKET to override the default socket path.";
+exact item key. `open` takes no TARGET: it resumes keyboard navigation on the
+icon the last session ended on (or the first icon when that one is gone). Set
+GTK_STATUS_BAR_SOCKET to override the default socket path.";
 
 fn parse_request(arguments: &[String]) -> Result<Option<IpcRequest>> {
     let Some(command) = arguments.first() else {
@@ -39,6 +42,7 @@ fn parse_request(arguments: &[String]) -> Result<Option<IpcRequest>> {
         "keyboard-menu" => IpcRequest::KeyboardMenu {
             target: target(arguments, command)?,
         },
+        "open" if arguments.len() == 1 => IpcRequest::Open,
         "menu-next" | "menu-down" => IpcRequest::MenuNext {
             target: target(arguments, command)?,
         },

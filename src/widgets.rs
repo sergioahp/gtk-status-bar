@@ -892,6 +892,11 @@ fn handle_ipc_request(
             }
             return IpcResponse::success(Vec::new());
         }
+        // Open needs the live nav state (grab, container), so the select loop
+        // handles it directly; it never reaches this stateless helper.
+        IpcRequest::Open => {
+            return IpcResponse::error("open is handled by the nav session directly");
+        }
         IpcRequest::Activate { target } => (target.clone(), None),
         IpcRequest::SecondaryActivate { target } => {
             (target.clone(), Some(TrayAction::SecondaryActivate))
@@ -957,7 +962,7 @@ fn handle_ipc_request(
             };
             action
         }
-        IpcRequest::List | IpcRequest::CloseMenus => {
+        IpcRequest::List | IpcRequest::CloseMenus | IpcRequest::Open => {
             return IpcResponse::error("request was handled before target resolution");
         }
     };
@@ -997,7 +1002,7 @@ fn ipc_request_targets_nav(
         | IpcRequest::MenuPrevious { target }
         | IpcRequest::MenuActivate { target }
         | IpcRequest::MenuClick { target, .. } => target,
-        IpcRequest::List | IpcRequest::CloseMenus => return false,
+        IpcRequest::List | IpcRequest::CloseMenus | IpcRequest::Open => return false,
     };
     resolve_ipc_target(target, order, entries)
         .is_ok_and(|(_, entry)| entry.state.borrow().key == active.key)
@@ -1150,6 +1155,9 @@ pub fn setup_tray_updates(
         let mut entries: HashMap<String, TrayEntry> = HashMap::new();
         let mut order = Vec::new();
         let mut nav: Option<NavActive> = None;
+        // The icon the most recent nav session ended on. Runtime-only, so a bar
+        // restart forgets it; `open` resumes here when the item still exists.
+        let mut last_nav_key: Option<String> = None;
         let mut ipc_available = true;
         loop {
             tokio::select! {
@@ -1196,7 +1204,7 @@ pub fn setup_tray_updates(
                                         .map(|index| index.min(order.len().saturating_sub(1)))
                                         .filter(|_| !order.is_empty())
                                     else {
-                                        end_nav(&mut nav, &container, &entries, &menu_requests);
+                                        end_nav(&mut nav, &mut last_nav_key, &container, &entries, &menu_requests);
                                         continue;
                                     };
                                     if let Err(error) = start_nav(
@@ -1211,7 +1219,7 @@ pub fn setup_tray_updates(
                                         &menu_requests,
                                     ) {
                                         warn!(%error, "Ending tray navigation after item removal");
-                                        end_nav(&mut nav, &container, &entries, &menu_requests);
+                                        end_nav(&mut nav, &mut last_nav_key, &container, &entries, &menu_requests);
                                     }
                                 }
                             }
@@ -1245,6 +1253,7 @@ pub fn setup_tray_updates(
                     handle_nav(
                         nav_cmd,
                         &mut nav,
+                        &mut last_nav_key,
                         &nav_tx,
                         &order,
                         &entries,
@@ -1289,10 +1298,41 @@ pub fn setup_tray_updates(
                                 Err(error) => IpcResponse::error(error),
                             }
                         }
+                        // open is keyboard-menu with no target: resume on the
+                        // icon the last session ended on, else the first icon.
+                        IpcRequest::Open => {
+                            let index = last_nav_key
+                                .as_ref()
+                                .and_then(|key| {
+                                    order.iter().position(|candidate| candidate == key)
+                                })
+                                .unwrap_or(0);
+                            match order.get(index).and_then(|key| entries.get(key)) {
+                                Some(entry) => {
+                                    let selected = ipc_item(index, &entry.state.borrow());
+                                    start_nav(
+                                        &mut nav,
+                                        index,
+                                        &keyboard_grab,
+                                        &nav_tx,
+                                        &container,
+                                        &entries,
+                                        &order,
+                                        &commands,
+                                        &menu_requests,
+                                    )
+                                    .map_or_else(
+                                        IpcResponse::error,
+                                        |()| IpcResponse::success(vec![selected]),
+                                    )
+                                }
+                                None => IpcResponse::error("the tray is empty"),
+                            }
+                        }
                         // close-menus also releases the grab, so it is a
                         // reliable kill-switch for a stuck nav session.
                         IpcRequest::CloseMenus => {
-                            end_nav(&mut nav, &container, &entries, &menu_requests);
+                            end_nav(&mut nav, &mut last_nav_key, &container, &entries, &menu_requests);
                             handle_ipc_request(
                                 IpcRequest::CloseMenus,
                                 &order,
@@ -1329,7 +1369,7 @@ pub fn setup_tray_updates(
                                 &menu_requests,
                             );
                             if response.ok && ends_nav {
-                                end_nav(&mut nav, &container, &entries, &menu_requests);
+                                end_nav(&mut nav, &mut last_nav_key, &container, &entries, &menu_requests);
                             } else if response.ok && targets_nav && enters_menu {
                                 set_nav_in_menu(&mut nav, &container, true);
                             } else if response.ok && targets_nav && activates_menu {
@@ -1340,7 +1380,7 @@ pub fn setup_tray_updates(
                                 if menu_still_open {
                                     set_nav_in_menu(&mut nav, &container, true);
                                 } else {
-                                    end_nav(&mut nav, &container, &entries, &menu_requests);
+                                    end_nav(&mut nav, &mut last_nav_key, &container, &entries, &menu_requests);
                                 }
                             }
                             response
@@ -1557,6 +1597,7 @@ fn start_nav(
 // whatever held it before), close the dropdown, and clear all focus visuals.
 fn end_nav(
     nav: &mut Option<NavActive>,
+    last_nav_key: &mut Option<String>,
     container: &gtk4::Box,
     entries: &HashMap<String, TrayEntry>,
     menu_requests: &Cell<u64>,
@@ -1564,6 +1605,10 @@ fn end_nav(
     let Some(active) = nav.take() else {
         return;
     };
+    // Remember where the user left off so a later `open` resumes here. The key
+    // is kept even when the item just vanished — `open` re-checks existence and
+    // falls back to the first icon, so a stale key is harmless.
+    *last_nav_key = Some(active.key.clone());
     if menu_requests.get() == active.menu_request_id {
         next_menu_request(menu_requests);
     }
@@ -1589,6 +1634,7 @@ fn end_nav(
 fn handle_nav(
     cmd: NavCmd,
     nav: &mut Option<NavActive>,
+    last_nav_key: &mut Option<String>,
     nav_tx: &mpsc::UnboundedSender<NavCmd>,
     order: &[String],
     entries: &HashMap<String, TrayEntry>,
@@ -1598,7 +1644,7 @@ fn handle_nav(
 ) {
     let cmd = match cmd {
         NavCmd::MouseAction(command) => {
-            end_nav(nav, container, entries, menu_requests);
+            end_nav(nav, last_nav_key, container, entries, menu_requests);
             if let Err(error) = commands.send(command) {
                 warn!(%error, "Could not send tray click to D-Bus backend");
             }
@@ -1617,13 +1663,13 @@ fn handle_nav(
             item = key,
             "Ending tray navigation after its selected item disappeared"
         );
-        end_nav(nav, container, entries, menu_requests);
+        end_nav(nav, last_nav_key, container, entries, menu_requests);
         return;
     };
 
     match &cmd {
         NavCmd::UserClosed { request_id } if *request_id == menu_request_id => {
-            end_nav(nav, container, entries, menu_requests);
+            end_nav(nav, last_nav_key, container, entries, menu_requests);
             return;
         }
         NavCmd::UserClosed { request_id } => {
@@ -1643,7 +1689,7 @@ fn handle_nav(
                     item = key,
                     request_id, "Tray menu did not load before timeout"
                 );
-                end_nav(nav, container, entries, menu_requests);
+                end_nav(nav, last_nav_key, container, entries, menu_requests);
             }
             return;
         }
@@ -1655,7 +1701,7 @@ fn handle_nav(
                 }
                 set_nav_in_menu(nav, container, false);
             } else {
-                end_nav(nav, container, entries, menu_requests);
+                end_nav(nav, last_nav_key, container, entries, menu_requests);
             }
             return;
         }
@@ -1692,7 +1738,7 @@ fn handle_nav(
                         }
                         Err(error) => {
                             warn!(%error, "Ending tray navigation after icon switch failed");
-                            end_nav(nav, container, entries, menu_requests);
+                            end_nav(nav, last_nav_key, container, entries, menu_requests);
                         }
                     }
                 }

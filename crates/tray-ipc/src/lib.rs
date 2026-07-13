@@ -26,6 +26,11 @@ pub enum IpcRequest {
     SecondaryActivate { target: String },
     ContextMenu { target: String },
     KeyboardMenu { target: String },
+    // Like KeyboardMenu but with no explicit target: opens the tray at the icon
+    // the last nav session ended on, falling back to the first icon when that
+    // one is gone (or on the very first open). The remembered icon lives in the
+    // running bar's memory only, so a restart resets it to the fallback.
+    Open,
     MenuNext { target: String },
     MenuPrevious { target: String },
     MenuActivate { target: String },
@@ -287,6 +292,17 @@ mod tests {
         };
         let encoded = serde_json::to_string(&request).expect("request should encode");
         assert_eq!(encoded, r#"{"command":"secondary-activate","target":"1"}"#);
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
+            request
+        );
+    }
+
+    #[test]
+    fn open_is_a_targetless_command() {
+        let request = IpcRequest::Open;
+        let encoded = serde_json::to_string(&request).expect("request should encode");
+        assert_eq!(encoded, r#"{"command":"open"}"#);
         assert_eq!(
             serde_json::from_str::<IpcRequest>(&encoded).expect("request should decode"),
             request

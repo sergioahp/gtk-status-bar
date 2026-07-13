@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
 use crate::bus::{VolumeUpdate, WorkspaceUpdate};
+use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
 
@@ -74,15 +75,15 @@ pub fn update_time_widget(label: gtk4::Label) {
     debug!("Setting up time widget updates");
 
     let label_weak = label.downgrade();
-    glib::timeout_add_seconds_local(1, move || {
-        let Some(label) = label_weak.upgrade() else {
-            debug!("Time widget label dropped, stopping updates");
-            return glib::ControlFlow::Break;
-        };
+    Clock::new()
+        .on_second(move |now| {
+            let Some(label) = label_weak.upgrade() else {
+                return;
+            };
 
-        label.set_text(&get_current_time());
-        glib::ControlFlow::Continue
-    });
+            label.set_text(&now.format("%l:%M %p").to_string());
+        })
+        .start();
 }
 
 pub fn create_bt_widget() -> gtk4::Label {

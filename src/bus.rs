@@ -1,4 +1,4 @@
-// The status bar is wired as four producer-consumer fan-outs: each subsystem
+// The status bar is wired as producer-consumer fan-outs: each subsystem
 // (Hyprland title, Hyprland workspace, UPower battery, BlueZ) pushes labels
 // into an unbounded mpsc channel and a glib-local task drains it onto the
 // corresponding GTK widget on the main thread. This module owns the Bus (the
@@ -46,6 +46,7 @@ pub struct Bus {
     title: mpsc::UnboundedSender<String>,
     battery: mpsc::UnboundedSender<String>,
     bluetooth: mpsc::UnboundedSender<String>,
+    network: mpsc::UnboundedSender<String>,
 }
 
 // Consumer side, produced exactly once per Bus by Bus::new. Receivers are not
@@ -55,6 +56,7 @@ pub struct BusReceivers {
     pub title: mpsc::UnboundedReceiver<String>,
     pub battery: mpsc::UnboundedReceiver<String>,
     pub bluetooth: mpsc::UnboundedReceiver<String>,
+    pub network: mpsc::UnboundedReceiver<String>,
 }
 
 impl Bus {
@@ -63,6 +65,7 @@ impl Bus {
         let (title_tx, title_rx) = mpsc::unbounded_channel();
         let (battery_tx, battery_rx) = mpsc::unbounded_channel();
         let (bluetooth_tx, bluetooth_rx) = mpsc::unbounded_channel();
+        let (network_tx, network_rx) = mpsc::unbounded_channel();
 
         (
             Bus {
@@ -70,12 +73,14 @@ impl Bus {
                 title: title_tx,
                 battery: battery_tx,
                 bluetooth: bluetooth_tx,
+                network: network_tx,
             },
             BusReceivers {
                 workspace: workspace_rx,
                 title: title_rx,
                 battery: battery_rx,
                 bluetooth: bluetooth_rx,
+                network: network_rx,
             },
         )
     }
@@ -109,6 +114,12 @@ impl Bus {
         self.bluetooth
             .send(update)
             .context("Failed to send bluetooth update")
+    }
+
+    pub fn send_network_update(&self, update: String) -> Result<()> {
+        self.network
+            .send(update)
+            .context("Failed to send network update")
     }
 }
 
@@ -148,14 +159,17 @@ mod tests {
     }
 
     #[test]
-    fn battery_and_bluetooth_updates_round_trip() {
+    fn status_updates_round_trip() {
         let (bus, mut rx) = Bus::new();
         bus.send_battery_update("🔋 80%".to_string())
             .expect("send_battery_update should succeed");
         bus.send_bluetooth_update("P80".to_string())
             .expect("send_bluetooth_update should succeed");
+        bus.send_network_update("🌐 ✓".to_string())
+            .expect("send_network_update should succeed");
         assert_eq!(rx.battery.try_recv().expect("battery message"), "🔋 80%");
         assert_eq!(rx.bluetooth.try_recv().expect("bluetooth message"), "P80");
+        assert_eq!(rx.network.try_recv().expect("network message"), "🌐 ✓");
     }
 
     // With the receivers dropped, sends must fail with the layered context

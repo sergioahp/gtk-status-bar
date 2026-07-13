@@ -64,6 +64,16 @@
   min-width: 3em;
 }
 
+.network-widget {
+  background-color: rgba(42, 195, 222, 0.5);
+  color: white;
+  padding: 0.1em 1em 0em 1em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.5em 0em;
+  font-weight: bold;
+  min-width: 3em;
+}
+
 .tray-widget {
   background-color: rgba(36, 40, 59, 0.72);
   border-radius: 0 0 0.4em 0.4em;

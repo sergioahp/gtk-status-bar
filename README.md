@@ -10,6 +10,18 @@ gtk-status-bar --monitor DVI-I-1
 
 Without `--monitor`, the compositor chooses the output.
 
+Network reachability defaults to Cloudflare DNS targets and can be tuned with
+repeatable `--network-ping-target ADDRESS` arguments. The randomized adaptive
+policy defaults to a 60-second mean while healthy, a 1-second mean after link or
+probe instability, and 15 seconds of failures across every configured target
+before reporting an outage. Run `gtk-status-bar --help` for every timing option.
+
+Link type, route changes, roaming, and Wi-Fi strength come from NetworkManager
+D-Bus events. ICMP probes are used only for upstream Internet reachability,
+which cannot be inferred from a working local link. Weak Wi-Fi and elevated
+latency shorten the next randomized interval; healthy wired and strong Wi-Fi
+connections return to the stable mean.
+
 ## 📸 Screenshot
 
 ![GTK Status Bar](assets/bar.png)
@@ -38,6 +50,7 @@ Without `--monitor`, the compositor chooses the output.
 - 🎵 PipeWire volume monitoring with compact display format
 - 📱 Bluetooth device status with battery levels
 - 🔋 System battery status with automatic hiding and state-aware 🔋/🪫/⚡/🔌 icons
+- 🌐 Event-driven wired/Wi-Fi status with signal strength and adaptive Internet checks
 - 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
 
@@ -102,7 +115,7 @@ input.
 - **⚡ Tokio** - Async runtime with sophisticated thread management
 - **🎮 Hyprland-rs** - Native Hyprland API bindings
 - **🎵 PipeWire** - Modern Linux audio system integration
-- **🚌 D-Bus** - System service communication for Bluetooth and battery
+- **🚌 D-Bus** - System service communication for Bluetooth, battery, and NetworkManager
 - **📝 Tracing** - Comprehensive structured logging system
 
 ## 🚀 Usage

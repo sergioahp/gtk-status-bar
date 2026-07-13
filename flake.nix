@@ -62,6 +62,9 @@
                 pkgs.glib
                 pkgs.gsettings-desktop-schemas
               ];
+              preFixup = ''
+                gappsWrapperArgs+=(--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.iputils ]})
+              '';
             }
           );
 
@@ -144,6 +147,56 @@
               example = "debug";
               description = "RUST_LOG filter passed to the service via Environment=.";
             };
+
+            monitor = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "DP-1";
+              description = "GDK output connector on which to place the bar.";
+            };
+
+            network = {
+              pingTargets = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [
+                  "1.1.1.1"
+                  "1.0.0.1"
+                  "2606:4700:4700::1111"
+                  "2606:4700:4700::1001"
+                ];
+                description = "IPv4 and IPv6 addresses used for Internet reachability probes.";
+              };
+
+              stableMeanSeconds = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 60;
+                description = "Expected randomized probe interval on a healthy connection.";
+              };
+
+              unstableMeanSeconds = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 1;
+                description = "Expected randomized probe interval after instability.";
+              };
+
+              downAfterSeconds = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 15;
+                description = "Failure duration across all targets required to report an outage.";
+              };
+
+              recentWindowSeconds = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 60;
+                description = "Time to retain the rapid-probing policy after instability.";
+              };
+
+              pingTimeoutSeconds = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 2;
+                description = "Timeout for one ICMP reachability probe.";
+              };
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -159,7 +212,18 @@
                 After = [ "graphical-session.target" ];
               };
               Service = {
-                ExecStart = "${cfg.package}/bin/gtk-status-bar";
+                ExecStart = let
+                  args =
+                    lib.optionals (cfg.monitor != null) [ "--monitor" cfg.monitor ]
+                    ++ lib.concatMap (target: [ "--network-ping-target" target ]) cfg.network.pingTargets
+                    ++ [
+                      "--network-stable-mean-seconds" (toString cfg.network.stableMeanSeconds)
+                      "--network-unstable-mean-seconds" (toString cfg.network.unstableMeanSeconds)
+                      "--network-down-after-seconds" (toString cfg.network.downAfterSeconds)
+                      "--network-recent-window-seconds" (toString cfg.network.recentWindowSeconds)
+                      "--network-ping-timeout-seconds" (toString cfg.network.pingTimeoutSeconds)
+                    ];
+                in "${cfg.package}/bin/gtk-status-bar ${lib.escapeShellArgs args}";
                 Environment = [ "RUST_LOG=${cfg.logLevel}" ];
                 Restart = "on-failure";
                 RestartSec = 2;

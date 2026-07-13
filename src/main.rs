@@ -8,11 +8,13 @@
 mod bus;
 mod dbus;
 mod hypr;
+mod network;
 mod pw;
 mod tray;
 mod widgets;
 
 use std::env;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -23,13 +25,23 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tray_ipc::IpcUiRequest;
 
-const USAGE: &str = "Usage: gtk-status-bar [--monitor CONNECTOR]\n\n\
-CONNECTOR is the GDK output connector name, such as DVI-I-1 or DP-1. Without\n\
---monitor, the compositor chooses the output.";
+const USAGE: &str = "Usage: gtk-status-bar [OPTIONS]\n\n\
+Options:\n\
+  --monitor CONNECTOR\n\
+  --network-ping-target ADDRESS       Repeat to replace the Cloudflare defaults\n\
+  --network-stable-mean-seconds N     Default: 60\n\
+  --network-unstable-mean-seconds N   Default: 1\n\
+  --network-down-after-seconds N      Default: 15\n\
+  --network-recent-window-seconds N   Default: 60\n\
+  --network-ping-timeout-seconds N    Default: 2\n\
+  -h, --help\n\n\
+CONNECTOR is the GDK output connector name, such as DVI-I-1 or DP-1. Ping\n\
+targets must be IPv4 or IPv6 addresses.";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
     monitor: Option<String>,
+    network: network::NetworkConfig,
 }
 
 enum CliAction {
@@ -38,17 +50,65 @@ enum CliAction {
 }
 
 fn parse_cli(arguments: &[String]) -> Result<CliAction> {
-    match arguments {
-        [] => Ok(CliAction::Run(CliOptions { monitor: None })),
-        [flag] if flag == "--help" || flag == "-h" => Ok(CliAction::Help),
-        [flag, connector] if flag == "--monitor" && !connector.is_empty() => {
-            Ok(CliAction::Run(CliOptions {
-                monitor: Some(connector.clone()),
-            }))
+    let mut options = CliOptions {
+        monitor: None,
+        network: network::NetworkConfig::default(),
+    };
+    let mut custom_targets = Vec::new();
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        if flag == "--help" || flag == "-h" {
+            return Ok(CliAction::Help);
         }
-        [flag] if flag == "--monitor" => bail!("--monitor requires a CONNECTOR\n\n{USAGE}"),
-        _ => bail!("unknown or malformed arguments\n\n{USAGE}"),
+        let Some(value) = arguments.get(index + 1) else {
+            if flag == "--monitor" {
+                bail!("--monitor requires a CONNECTOR\n\n{USAGE}");
+            }
+            bail!("{flag} requires a value\n\n{USAGE}");
+        };
+        match flag {
+            "--monitor" if !value.is_empty() => options.monitor = Some(value.clone()),
+            "--network-ping-target" => {
+                custom_targets.push(value.parse::<IpAddr>().with_context(|| {
+                    format!("--network-ping-target requires an IPv4 or IPv6 address: {value}")
+                })?);
+            }
+            "--network-stable-mean-seconds" => {
+                options.network.stable_mean = parse_seconds(flag, value)?;
+            }
+            "--network-unstable-mean-seconds" => {
+                options.network.unstable_mean = parse_seconds(flag, value)?;
+            }
+            "--network-down-after-seconds" => {
+                options.network.outage_confirmation = parse_seconds(flag, value)?;
+            }
+            "--network-recent-window-seconds" => {
+                options.network.recent_instability = parse_seconds(flag, value)?;
+            }
+            "--network-ping-timeout-seconds" => {
+                options.network.ping_timeout = parse_seconds(flag, value)?;
+            }
+            _ => bail!("unknown argument: {flag}\n\n{USAGE}"),
+        }
+        index += 2;
     }
+
+    if !custom_targets.is_empty() {
+        options.network.ping_targets = custom_targets;
+    }
+    Ok(CliAction::Run(options))
+}
+
+fn parse_seconds(flag: &str, value: &str) -> Result<Duration> {
+    let seconds = value
+        .parse::<u64>()
+        .with_context(|| format!("{flag} requires a positive integer number of seconds"))?;
+    if seconds == 0 {
+        bail!("{flag} must be greater than zero");
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn setup_logging() {
@@ -83,20 +143,21 @@ async fn run_tray_ipc_supervised(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
     }
 }
 
-fn activate(application: &gtk4::Application, monitor: Option<&str>) -> Result<()> {
+fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()> {
     info!("Activating GTK application");
 
     let window = gtk4::ApplicationWindow::new(application);
     window.add_css_class("layer-bar");
 
     widgets::load_css_styles(&window);
-    widgets::configure_layer_shell(&window, monitor)?;
+    widgets::configure_layer_shell(&window, options.monitor.as_deref())?;
 
     let (
         bar,
         tray_widget,
         bt_widget,
         volume_widget,
+        network_widget,
         battery_widget,
         time_widget,
         workspace_widget,
@@ -115,6 +176,7 @@ fn activate(application: &gtk4::Application, monitor: Option<&str>) -> Result<()
     widgets::setup_title_updates(receivers.title, title_widget);
     widgets::setup_battery_updates(receivers.battery, battery_widget);
     widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
+    widgets::setup_network_updates(receivers.network, network_widget);
     widgets::setup_volume_updates(volume_widget)?;
 
     // Every consumer above is wired before any producer below spawns. The
@@ -122,7 +184,11 @@ fn activate(application: &gtk4::Application, monitor: Option<&str>) -> Result<()
     // a UI-to-backend command channel; both still obey the same ordering.
     tokio::spawn(hypr::run_workspace_listener_supervised(bus.clone()));
     tokio::spawn(hypr::run_title_listener_supervised(bus.clone()));
-    tokio::spawn(dbus::run_dbus_monitor_supervised(bus));
+    tokio::spawn(dbus::run_dbus_monitor_supervised(bus.clone()));
+    tokio::spawn(network::run_network_monitor_supervised(
+        bus,
+        options.network.clone(),
+    ));
     tokio::spawn(tray::run_tray_supervised(tray_backend));
     tokio::spawn(run_tray_ipc_supervised(tray_ipc_tx));
 
@@ -163,7 +229,7 @@ fn main() -> Result<()> {
             window.present();
             return;
         }
-        if let Err(e) = activate(app, options.monitor.as_deref()) {
+        if let Err(e) = activate(app, &options) {
             error!("Application activation failed: {:#}", e);
             std::process::exit(1);
         }
@@ -188,7 +254,13 @@ mod tests {
         let CliAction::Run(options) = parse_cli(&[]).expect("empty arguments should parse") else {
             panic!("empty arguments unexpectedly requested help");
         };
-        assert_eq!(options, CliOptions { monitor: None });
+        assert_eq!(
+            options,
+            CliOptions {
+                monitor: None,
+                network: network::NetworkConfig::default(),
+            }
+        );
     }
 
     #[test]
@@ -201,7 +273,8 @@ mod tests {
         assert_eq!(
             options,
             CliOptions {
-                monitor: Some("DVI-I-1".to_string())
+                monitor: Some("DVI-I-1".to_string()),
+                network: network::NetworkConfig::default(),
             }
         );
     }
@@ -212,5 +285,37 @@ mod tests {
             .err()
             .expect("missing connector should fail");
         assert!(error.to_string().contains("requires a CONNECTOR"));
+    }
+
+    #[test]
+    fn repeated_ping_targets_replace_defaults_and_timings_parse() {
+        let CliAction::Run(options) = parse_cli(&arguments(&[
+            "--network-ping-target",
+            "192.0.2.1",
+            "--network-ping-target",
+            "2001:db8::1",
+            "--network-stable-mean-seconds",
+            "90",
+            "--network-down-after-seconds",
+            "12",
+        ]))
+        .expect("network arguments should parse") else {
+            panic!("network arguments unexpectedly requested help");
+        };
+        assert_eq!(
+            options.network.ping_targets,
+            vec![
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap()
+            ]
+        );
+        assert_eq!(options.network.stable_mean, Duration::from_secs(90));
+        assert_eq!(options.network.outage_confirmation, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn invalid_network_arguments_are_rejected() {
+        assert!(parse_cli(&arguments(&["--network-ping-target", "cloudflare"])).is_err());
+        assert!(parse_cli(&arguments(&["--network-stable-mean-seconds", "0"])).is_err());
     }
 }

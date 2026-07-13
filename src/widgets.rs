@@ -54,6 +54,12 @@ pub fn create_title_widget() -> gtk4::Label {
     label.add_css_class("title-widget");
     label.set_halign(gtk4::Align::End);
     label.set_valign(gtk4::Align::Start);
+    // The producer already crops long titles by character count, but wide
+    // glyphs can still exceed the remaining monitor width when right-side
+    // pills are added. Ellipsizing gives GTK permission to shrink the label's
+    // minimum width instead of expanding the layer surface past the output.
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    label.set_single_line_mode(true);
     label
 }
 
@@ -97,6 +103,14 @@ pub fn create_battery_widget() -> gtk4::Label {
     debug!("Creating battery widget");
     let label = gtk4::Label::new(Some("🔋 ??%"));
     label.add_css_class("battery-widget");
+    label.set_halign(gtk4::Align::End);
+    label
+}
+
+pub fn create_network_widget() -> gtk4::Label {
+    debug!("Creating network widget");
+    let label = gtk4::Label::new(Some("🌐 ?"));
+    label.add_css_class("network-widget");
     label.set_halign(gtk4::Align::End);
     label
 }
@@ -160,6 +174,7 @@ pub fn create_right_group() -> (
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
+    gtk4::Label,
 ) {
     debug!("Creating right group");
 
@@ -184,6 +199,9 @@ pub fn create_right_group() -> (
     let volume_widget = create_volume_widget();
     right_group.append(&volume_widget);
 
+    let network_widget = create_network_widget();
+    right_group.append(&network_widget);
+
     let battery_widget = create_battery_widget();
     right_group.append(&battery_widget);
 
@@ -198,6 +216,7 @@ pub fn create_right_group() -> (
         tray_widget,
         bt_widget,
         volume_widget,
+        network_widget,
         battery_widget,
         time_widget,
     )
@@ -206,6 +225,7 @@ pub fn create_right_group() -> (
 pub fn create_experimental_bar() -> (
     gtk4::Box,
     gtk4::Box,
+    gtk4::Label,
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
@@ -221,8 +241,15 @@ pub fn create_experimental_bar() -> (
 
     let (left_group, workspace_widget) = create_left_group();
     let (center_spacer_start, title_widget, center_spacer_end) = create_center_group();
-    let (right_group, tray_widget, bt_widget, volume_widget, battery_widget, time_widget) =
-        create_right_group();
+    let (
+        right_group,
+        tray_widget,
+        bt_widget,
+        volume_widget,
+        network_widget,
+        battery_widget,
+        time_widget,
+    ) = create_right_group();
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
@@ -244,6 +271,7 @@ pub fn create_experimental_bar() -> (
         tray_widget,
         bt_widget,
         volume_widget,
+        network_widget,
         battery_widget,
         time_widget,
         workspace_widget,
@@ -2270,6 +2298,17 @@ pub fn setup_bluetooth_updates(mut rx: mpsc::UnboundedReceiver<String>, label: g
                 label.set_text(&update);
                 debug!("👁️  SHOWING Bluetooth widget - data: {}", update);
             }
+        }
+    });
+}
+
+pub fn setup_network_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
+    debug!("Setting up network updates");
+
+    glib::spawn_future_local(async move {
+        while let Some(update) = rx.recv().await {
+            debug!("Updating network label: {}", update);
+            label.set_text(&update);
         }
     });
 }

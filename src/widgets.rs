@@ -2400,6 +2400,14 @@ pub fn setup_client_updates(
 
             let mut next_pills = HashMap::with_capacity(update.clients.len());
             for client in update.clients {
+                debug!(
+                    address = %client.address,
+                    title = client.title,
+                    compact_title = client.compact_title,
+                    class = client.class,
+                    active = client.active,
+                    "Updating client pill"
+                );
                 let mut pill = pills
                     .remove(&client.address)
                     .unwrap_or_else(create_client_pill);

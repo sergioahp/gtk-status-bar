@@ -175,26 +175,6 @@ pub fn create_left_group() -> (gtk4::Box, gtk4::Label) {
     (left_container, workspace_widget)
 }
 
-pub fn create_center_group() -> (gtk4::Box, TitleWidget, gtk4::Box) {
-    debug!("Creating center group");
-
-    let center_spacer_start = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    center_spacer_start.set_hexpand(true);
-
-    let center_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    center_group.add_css_class("center-group");
-    center_group.set_valign(gtk4::Align::Center);
-    center_group.set_hexpand(false);
-
-    let title_widget = create_title_widget();
-    center_group.append(&title_widget.root);
-
-    let center_spacer_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    center_spacer_end.set_hexpand(true);
-
-    (center_spacer_start, title_widget, center_spacer_end)
-}
-
 pub fn create_right_group() -> (
     gtk4::Box,
     gtk4::Box,
@@ -251,7 +231,7 @@ pub fn create_right_group() -> (
 }
 
 pub fn create_experimental_bar() -> (
-    gtk4::Box,
+    gtk4::CenterBox,
     gtk4::Box,
     gtk4::Label,
     gtk4::Label,
@@ -263,12 +243,12 @@ pub fn create_experimental_bar() -> (
 ) {
     debug!("Creating experimental bar");
 
-    let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    let main_box = gtk4::CenterBox::new();
     main_box.set_hexpand(true);
     main_box.set_valign(gtk4::Align::Start);
 
     let (left_group, workspace_widget) = create_left_group();
-    let (center_spacer_start, title_widget, center_spacer_end) = create_center_group();
+    let title_widget = create_title_widget();
     let (
         right_group,
         tray_widget,
@@ -279,11 +259,12 @@ pub fn create_experimental_bar() -> (
         time_widget,
     ) = create_right_group();
 
-    main_box.append(&left_group);
-    main_box.append(&center_spacer_start);
-    main_box.append(&title_widget.root);
-    main_box.append(&center_spacer_end);
-    main_box.append(&right_group);
+    // GtkCenterLayout keeps the title at the monitor midpoint independently
+    // of the side groups' widths. Equal expanding spacers cannot guarantee
+    // that once the dynamic right group grows wider than its 20em container.
+    main_box.set_start_widget(Some(&left_group));
+    main_box.set_center_widget(Some(&title_widget.root));
+    main_box.set_end_widget(Some(&right_group));
 
     // Pin the height once the font is resolvable, so dynamic content (title
     // length, tray removal) can't resize the bar and shift windows below it.
@@ -320,7 +301,7 @@ const BAR_HEIGHT_CHAR_MULTIPLIER: f64 = 1.4;
 // move every window below the bar. We measure on the realized widget so the
 // font (and thus its metrics) is actually resolvable, mirroring how the tray
 // sizes its icon to a tall glyph rather than a fixed pixel count.
-fn pin_bar_height_to_font(bar: &gtk4::Box) {
+fn pin_bar_height_to_font(bar: &gtk4::CenterBox) {
     let ctx = bar.pango_context();
     let layout = gtk4::pango::Layout::new(&ctx);
     if let Some(font) = ctx.font_description() {

@@ -68,8 +68,9 @@ pub fn create_client_strip() -> ClientStrip {
 
     let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     root.add_css_class("client-strip");
-    root.set_halign(gtk4::Align::Center);
+    root.set_halign(gtk4::Align::Fill);
     root.set_valign(gtk4::Align::Start);
+    root.set_hexpand(true);
 
     let workspace_css = gtk4::CssProvider::new();
     workspace_css
@@ -98,7 +99,6 @@ fn create_client_pill() -> ClientPill {
     icon.add_css_class("title-icon");
     icon.set_valign(gtk4::Align::Center);
     icon.set_visible(false);
-    root.set_start_widget(Some(&icon));
 
     let label = gtk4::Label::new(None);
     label.add_css_class("title-label");
@@ -109,10 +109,14 @@ fn create_client_pill() -> ClientPill {
     // minimum width instead of expanding the layer surface past the output.
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_single_line_mode(true);
-    // The active pill retains the existing label-centered layout. Compact
-    // inactive pills have no minimum width, so they collapse around the icon
-    // and first-word label while using the same widget tree.
-    root.set_center_widget(Some(&label));
+    // Keep the icon and title together at the center of an expanding active
+    // pill. With the icon in CenterBox's start slot, filling the available bar
+    // space would otherwise separate it from the centered title.
+    let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    content.set_halign(gtk4::Align::Center);
+    content.append(&icon);
+    content.append(&label);
+    root.set_center_widget(Some(&content));
 
     ClientPill {
         root,
@@ -264,7 +268,7 @@ pub fn create_right_group() -> (
 }
 
 pub fn create_experimental_bar() -> (
-    gtk4::CenterBox,
+    gtk4::Box,
     gtk4::Box,
     gtk4::Label,
     gtk4::Label,
@@ -276,7 +280,7 @@ pub fn create_experimental_bar() -> (
 ) {
     debug!("Creating experimental bar");
 
-    let main_box = gtk4::CenterBox::new();
+    let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     main_box.set_hexpand(true);
     main_box.set_valign(gtk4::Align::Start);
 
@@ -292,12 +296,12 @@ pub fn create_experimental_bar() -> (
         time_widget,
     ) = create_right_group();
 
-    // GtkCenterLayout keeps the client strip at the monitor midpoint independently
-    // of the side groups' widths. Equal expanding spacers cannot guarantee
-    // that once the dynamic right group grows wider than its 20em container.
-    main_box.set_start_widget(Some(&left_group));
-    main_box.set_center_widget(Some(&client_strip.root));
-    main_box.set_end_widget(Some(&right_group));
+    // Preserve the existing edge groups and give every remaining pixel between
+    // their fixed allocations to the client strip. The active pill is the only
+    // expanding child in that strip, so inactive clients stay compact.
+    main_box.append(&left_group);
+    main_box.append(&client_strip.root);
+    main_box.append(&right_group);
 
     // Pin the height once the font is resolvable, so dynamic content (title
     // length, tray removal) can't resize the bar and shift windows below it.
@@ -334,7 +338,7 @@ const BAR_HEIGHT_CHAR_MULTIPLIER: f64 = 1.4;
 // move every window below the bar. We measure on the realized widget so the
 // font (and thus its metrics) is actually resolvable, mirroring how the tray
 // sizes its icon to a tall glyph rather than a fixed pixel count.
-fn pin_bar_height_to_font(bar: &gtk4::CenterBox) {
+fn pin_bar_height_to_font(bar: &gtk4::Box) {
     let ctx = bar.pango_context();
     let layout = gtk4::pango::Layout::new(&ctx);
     if let Some(font) = ctx.font_description() {
@@ -2359,12 +2363,16 @@ fn update_client_icon(image: &gtk4::Image, class: &str) {
 
 fn update_client_pill(pill: &mut ClientPill, client: &WorkspaceClient) {
     if client.active {
+        pill.root.set_hexpand(true);
+        pill.root.set_halign(gtk4::Align::Fill);
         pill.root.remove_css_class("client-pill-inactive");
         pill.root.add_css_class("title-widget");
         pill.root.add_css_class("client-pill-active");
         pill.label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         pill.label.set_text(&client.title);
     } else {
+        pill.root.set_hexpand(false);
+        pill.root.set_halign(gtk4::Align::Center);
         pill.root.remove_css_class("title-widget");
         pill.root.remove_css_class("client-pill-active");
         pill.root.add_css_class("client-pill-inactive");

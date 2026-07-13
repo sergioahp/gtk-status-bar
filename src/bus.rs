@@ -30,6 +30,12 @@ pub struct WorkspaceUpdate {
     pub id: hyprland::shared::WorkspaceId,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TitleUpdate {
+    pub title: String,
+    pub class: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct VolumeUpdate {
     pub name: String,
@@ -43,7 +49,7 @@ pub struct VolumeUpdate {
 #[derive(Clone)]
 pub struct Bus {
     workspace: mpsc::UnboundedSender<WorkspaceUpdate>,
-    title: mpsc::UnboundedSender<String>,
+    title: mpsc::UnboundedSender<TitleUpdate>,
     battery: mpsc::UnboundedSender<String>,
     bluetooth: mpsc::UnboundedSender<String>,
     network: mpsc::UnboundedSender<String>,
@@ -53,7 +59,7 @@ pub struct Bus {
 // cloneable; each field is moved into its widget's glib-local drain task.
 pub struct BusReceivers {
     pub workspace: mpsc::UnboundedReceiver<WorkspaceUpdate>,
-    pub title: mpsc::UnboundedReceiver<String>,
+    pub title: mpsc::UnboundedReceiver<TitleUpdate>,
     pub battery: mpsc::UnboundedReceiver<String>,
     pub bluetooth: mpsc::UnboundedReceiver<String>,
     pub network: mpsc::UnboundedReceiver<String>,
@@ -96,11 +102,9 @@ impl Bus {
             .context("Failed to send workspace update")
     }
 
-    pub fn send_title_update(&self, update: Option<String>) -> Result<()> {
-        // TODO: maybe handle None variant as: remove the widget? maybe pass as optional and handle
-        // that None case elsewere
+    pub fn send_title_update(&self, update: TitleUpdate) -> Result<()> {
         self.title
-            .send(update.unwrap_or_default())
+            .send(update)
             .context("Failed to send title update")
     }
 
@@ -146,16 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn title_update_round_trips_and_none_maps_to_empty() {
+    fn title_update_round_trips() {
         let (bus, mut rx) = Bus::new();
-        bus.send_title_update(Some("hello".to_string()))
+        let update = TitleUpdate {
+            title: "hello".to_string(),
+            class: "kitty".to_string(),
+        };
+        bus.send_title_update(update.clone())
             .expect("send_title_update should succeed");
-        // The None-arm should round-trip as the empty string per the TODO in
-        // send_title_update: "maybe handle None variant as: remove the widget?"
-        bus.send_title_update(None)
-            .expect("send_title_update(None) should map to empty string and succeed");
-        assert_eq!(rx.title.try_recv().expect("title message"), "hello");
-        assert_eq!(rx.title.try_recv().expect("title None -> empty"), "");
+        assert_eq!(rx.title.try_recv().expect("title message"), update);
     }
 
     #[test]
@@ -182,7 +185,10 @@ mod tests {
         let (bus, rx) = Bus::new();
         drop(rx);
         let err = bus
-            .send_title_update(Some("x".to_string()))
+            .send_title_update(TitleUpdate {
+                title: "x".to_string(),
+                class: "example".to_string(),
+            })
             .expect_err("send into closed channel must fail");
         let chain = format!("{:#}", err);
         assert!(

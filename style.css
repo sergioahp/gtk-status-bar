@@ -35,6 +35,10 @@
   min-width: 10em;
 }
 
+.title-icon {
+  margin-right: 0.45em;
+}
+
 .bt-widget {
   background-color: rgba(250, 112, 154, 0.5);
   color: white;

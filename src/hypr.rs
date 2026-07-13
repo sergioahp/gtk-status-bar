@@ -13,7 +13,7 @@ use hyprland::event_listener::AsyncEventListener;
 use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
 use tracing::{debug, error, info, warn};
 
-use crate::bus::{Bus, WorkspaceUpdate};
+use crate::bus::{Bus, TitleUpdate, WorkspaceUpdate};
 
 // Special workspaces have negative ids in Hyprland, but the activespecial
 // event only carries names. Any negative id lands on the default arm of
@@ -67,19 +67,26 @@ pub fn format_title_string(title: String, max_length: usize) -> String {
     }
 }
 
-async fn get_initial_title_state() -> Result<String> {
+async fn get_initial_title_state() -> Result<TitleUpdate> {
     // We do want to know when the operation is successfull but the title string is not there,
     // which would be because there is no active client
     debug!("Fetching initial title state");
 
     let client = hyprland::data::Client::get_active_async().await?;
-    let display_name = match client {
-        Some(client) => format_title_string(client.title, 64),
-        None => String::new(),
+    let update = match client {
+        Some(client) => TitleUpdate {
+            title: format_title_string(client.title, 64),
+            class: client.class,
+        },
+        None => TitleUpdate::default(),
     };
 
-    debug!("Initial title: {:?}", display_name);
-    Ok(display_name)
+    debug!(
+        title = update.title,
+        class = update.class,
+        "Initial title state"
+    );
+    Ok(update)
 }
 
 async fn handle_workspace_change(
@@ -113,9 +120,12 @@ async fn handle_title_change(
         .filter(|client| client.address == title_data.address);
 
     if let Some(client) = active_client {
-        let formatted_title = format_title_string(client.title, 64);
-        debug!("Title changed to: {}", formatted_title);
-        bus.send_title_update(Some(formatted_title))
+        let update = TitleUpdate {
+            title: format_title_string(client.title, 64),
+            class: client.class,
+        };
+        debug!(title = update.title, class = update.class, "Title changed");
+        bus.send_title_update(update)
     } else {
         debug!("No active client matches the title change event");
         Ok(())
@@ -128,23 +138,29 @@ async fn handle_active_window_change(
 ) -> Result<()> {
     debug!("Handling active window change event");
 
-    let formatted_title = match &window_data {
+    let update = match window_data {
         Some(data) => {
             debug!(
                 "Window data - class: '{}', title: '{}', address: '{}'",
                 data.class, data.title, data.address
             );
-            format_title_string(data.title.clone(), 64)
+            TitleUpdate {
+                title: format_title_string(data.title, 64),
+                class: data.class,
+            }
         }
         None => {
             debug!("No active window (window_data is None)");
-            String::new()
+            TitleUpdate::default()
         }
     };
 
-    debug!("Active window changed, title: '{}'", formatted_title);
-    debug!("Sending title update: '{}'", formatted_title);
-    bus.send_title_update(Some(formatted_title))
+    debug!(
+        title = update.title,
+        class = update.class,
+        "Active window changed"
+    );
+    bus.send_title_update(update)
 }
 
 // Supervised wrapper around setup_title_event_listener. The inner listener
@@ -227,10 +243,10 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
 
     let initial_state = get_initial_title_state().await.unwrap_or_else(|e| {
         error!("Failed to get initial title state: {}", e);
-        "".to_string()
+        TitleUpdate::default()
     });
 
-    if let Err(e) = bus.send_title_update(Some(initial_state)) {
+    if let Err(e) = bus.send_title_update(initial_state) {
         error!("Failed to send initial title update: {}", e);
     }
 

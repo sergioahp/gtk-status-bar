@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
-use crate::bus::{VolumeUpdate, WorkspaceUpdate};
+use crate::bus::{TitleUpdate, VolumeUpdate, WorkspaceUpdate};
 use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
@@ -49,19 +49,38 @@ pub fn create_volume_widget() -> gtk4::Label {
     label
 }
 
-pub fn create_title_widget() -> gtk4::Label {
+#[derive(Clone)]
+pub struct TitleWidget {
+    root: gtk4::Box,
+    icon: gtk4::Image,
+    label: gtk4::Label,
+}
+
+pub fn create_title_widget() -> TitleWidget {
     debug!("Creating title widget");
+
+    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    root.add_css_class("title-widget");
+    root.set_halign(gtk4::Align::End);
+    root.set_valign(gtk4::Align::Start);
+
+    let icon = gtk4::Image::new();
+    icon.add_css_class("title-icon");
+    icon.set_visible(false);
+    root.append(&icon);
+
     let label = gtk4::Label::new(Some("Application Title"));
-    label.add_css_class("title-widget");
+    label.add_css_class("title-label");
     label.set_halign(gtk4::Align::End);
-    label.set_valign(gtk4::Align::Start);
     // The producer already crops long titles by character count, but wide
     // glyphs can still exceed the remaining monitor width when right-side
     // pills are added. Ellipsizing gives GTK permission to shrink the label's
     // minimum width instead of expanding the layer surface past the output.
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_single_line_mode(true);
-    label
+    root.append(&label);
+
+    TitleWidget { root, icon, label }
 }
 
 pub fn create_time_widget() -> gtk4::Label {
@@ -150,7 +169,7 @@ pub fn create_left_group() -> (gtk4::Box, gtk4::Label) {
     (left_container, workspace_widget)
 }
 
-pub fn create_center_group() -> (gtk4::Box, gtk4::Label, gtk4::Box) {
+pub fn create_center_group() -> (gtk4::Box, TitleWidget, gtk4::Box) {
     debug!("Creating center group");
 
     let center_spacer_start = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -162,7 +181,7 @@ pub fn create_center_group() -> (gtk4::Box, gtk4::Label, gtk4::Box) {
     center_group.set_hexpand(false);
 
     let title_widget = create_title_widget();
-    center_group.append(&title_widget);
+    center_group.append(&title_widget.root);
 
     let center_spacer_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     center_spacer_end.set_hexpand(true);
@@ -234,7 +253,7 @@ pub fn create_experimental_bar() -> (
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
-    gtk4::Label,
+    TitleWidget,
 ) {
     debug!("Creating experimental bar");
 
@@ -256,7 +275,7 @@ pub fn create_experimental_bar() -> (
 
     main_box.append(&left_group);
     main_box.append(&center_spacer_start);
-    main_box.append(&title_widget);
+    main_box.append(&title_widget.root);
     main_box.append(&center_spacer_end);
     main_box.append(&right_group);
 
@@ -2109,7 +2128,7 @@ pub fn configure_layer_shell(
 }
 
 fn update_title_widget_workspace_color(
-    title_widget: &gtk4::Label,
+    title_widget: &TitleWidget,
     workspace_id: hyprland::shared::WorkspaceId,
 ) {
     // Get workspace color based on ID
@@ -2121,7 +2140,7 @@ fn update_title_widget_workspace_color(
 
     css_provider.load_from_data(&css);
 
-    let style_context = title_widget.style_context();
+    let style_context = title_widget.root.style_context();
     style_context.add_provider(&css_provider, gtk4::STYLE_PROVIDER_PRIORITY_USER + 1);
 
     debug!(
@@ -2230,7 +2249,7 @@ mod tests {
 pub fn setup_workspace_updates(
     mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>,
     label: gtk4::Label,
-    title_widget: gtk4::Label,
+    title_widget: TitleWidget,
 ) {
     debug!("Setting up workspace updates");
 
@@ -2248,15 +2267,103 @@ pub fn setup_workspace_updates(
     });
 }
 
-pub fn setup_title_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
+fn desktop_app_class_match_score(app: &gtk4::gio::DesktopAppInfo, class: &str) -> u8 {
+    if app
+        .startup_wm_class()
+        .is_some_and(|wm_class| wm_class.eq_ignore_ascii_case(class))
+    {
+        return 4;
+    }
+
+    if let Some(id) = app.id() {
+        let desktop_id = id.strip_suffix(".desktop").unwrap_or(&id);
+        if desktop_id.eq_ignore_ascii_case(class) {
+            return 3;
+        }
+        if desktop_id
+            .rsplit('.')
+            .next()
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case(class))
+        {
+            return 2;
+        }
+    }
+
+    u8::from(app.name().eq_ignore_ascii_case(class))
+}
+
+fn desktop_icon_for_class(class: &str) -> Option<gtk4::gio::Icon> {
+    gtk4::gio::AppInfo::all()
+        .into_iter()
+        .filter_map(|app| app.downcast::<gtk4::gio::DesktopAppInfo>().ok())
+        .filter_map(|app| {
+            let score = desktop_app_class_match_score(&app, class);
+            (score > 0).then_some((score, app))
+        })
+        .max_by_key(|(score, _app)| *score)
+        .and_then(|(_score, app)| app.icon())
+}
+
+fn update_title_icon(image: &gtk4::Image, class: &str) {
+    let class = class.trim();
+    if class.is_empty() {
+        image.set_visible(false);
+        return;
+    }
+
+    image.set_pixel_size(tray_icon_pixel_size(image));
+    if let Some(icon) = desktop_icon_for_class(class) {
+        image.set_from_gicon(&icon);
+        image.set_visible(true);
+        debug!(
+            class,
+            "Resolved title icon from desktop application metadata"
+        );
+        return;
+    }
+
+    let icon_theme = gtk4::IconTheme::for_display(&image.display());
+    let lowercase = class.to_lowercase();
+    let leaf = lowercase.rsplit('.').next().unwrap_or(&lowercase);
+    for candidate in [class, lowercase.as_str(), leaf] {
+        if icon_theme.has_icon(candidate) {
+            image.set_icon_name(Some(candidate));
+            image.set_visible(true);
+            debug!(
+                class,
+                icon = candidate,
+                "Resolved title icon directly from theme"
+            );
+            return;
+        }
+    }
+
+    image.set_icon_name(Some("application-x-executable-symbolic"));
+    image.set_visible(true);
+    debug!(class, "Using generic fallback for title icon");
+}
+
+pub fn setup_title_updates(
+    mut rx: mpsc::UnboundedReceiver<TitleUpdate>,
+    title_widget: TitleWidget,
+) {
     debug!("Setting up title updates");
 
     glib::spawn_future_local(async move {
+        let mut current_class = String::new();
         while let Some(update) = rx.recv().await {
-            debug!("Updating title label: {}", update);
+            debug!(
+                title = update.title,
+                class = update.class,
+                "Updating title widget"
+            );
             // NOTE: Title widget always remains visible even when empty, unlike battery/bluetooth widgets.
             // This provides consistent visual layout and shows the centered position in the bar.
-            label.set_text(&update);
+            title_widget.label.set_text(&update.title);
+            if update.class != current_class {
+                update_title_icon(&title_widget.icon, &update.class);
+                current_class = update.class;
+            }
         }
     });
 }

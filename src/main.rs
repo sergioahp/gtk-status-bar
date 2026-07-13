@@ -6,6 +6,7 @@
 // restarted with exponential backoff by their run_*_supervised wrappers.
 
 mod bus;
+mod clock;
 mod dbus;
 mod hypr;
 mod network;

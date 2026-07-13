@@ -87,7 +87,9 @@ pub fn update_time_widget(label: gtk4::Label) {
                 return;
             };
 
-            label.set_text(&now.format("%l:%M %p").to_string());
+            let text = now.format("%l:%M %p").to_string();
+            debug!("Updating time label: {text}");
+            label.set_text(&text);
         })
         .start();
 }

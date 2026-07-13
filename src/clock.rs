@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -26,36 +25,38 @@ impl Clock {
     /// Start dispatching on the GTK main thread at wall-clock second boundaries.
     pub fn start(self) {
         let subscribers = Rc::new(self.second_subscribers);
-        let generation = Rc::new(Cell::new(0_u64));
+        dispatch_and_schedule(subscribers);
+    }
+}
 
-        let now = Local::now();
-        for callback in subscribers.iter() {
-            callback(now);
-        }
+fn dispatch_and_schedule(subscribers: Rc<Vec<Callback>>) {
+    let now = Local::now();
+    for callback in subscribers.iter() {
+        callback(now);
+    }
 
-        glib::timeout_add_local(Duration::from_millis(200), move || {
-            let now = Local::now();
-            let delay = Duration::from_millis(1_000 - u64::from(now.nanosecond() / 1_000_000));
+    let delay = delay_until_next_second(now.nanosecond());
+    glib::timeout_add_local_once(delay, move || dispatch_and_schedule(subscribers));
+}
 
-            // Each guard tick supersedes its earlier one-shot. This keeps the
-            // next update aligned after NTP corrections or manual clock jumps.
-            let current_generation = generation.get().wrapping_add(1);
-            generation.set(current_generation);
+fn delay_until_next_second(nanosecond: u32) -> Duration {
+    Duration::from_millis(1_000 - u64::from(nanosecond / 1_000_000))
+}
 
-            let subscribers = subscribers.clone();
-            let generation = generation.clone();
-            glib::timeout_add_local_once(delay, move || {
-                if generation.get() != current_generation {
-                    return;
-                }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-                let now = Local::now();
-                for callback in subscribers.iter() {
-                    callback(now);
-                }
-            });
-
-            glib::ControlFlow::Continue
-        });
+    #[test]
+    fn next_second_delay_is_bounded_and_aligned() {
+        assert_eq!(delay_until_next_second(0), Duration::from_secs(1));
+        assert_eq!(
+            delay_until_next_second(500_000_000),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            delay_until_next_second(999_999_999),
+            Duration::from_millis(1)
+        );
     }
 }

@@ -39,6 +39,23 @@
   margin-right: 0.45em;
 }
 
+.client-strip {
+  background-color: transparent;
+}
+
+.client-pill-inactive {
+  background-color: rgba(36, 40, 59, 0.72);
+  color: white;
+  padding: 0.1em 0.4em 0em 0.4em;
+  border-radius: 0 0 0.4em 0.4em;
+  margin: 0em 0.15em 0em;
+  font-weight: bold;
+}
+
+.client-pill-inactive .title-icon {
+  margin-right: 0.25em;
+}
+
 .bt-widget {
   background-color: rgba(250, 112, 154, 0.5);
   color: white;

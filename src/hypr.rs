@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use hyprland::event_listener::AsyncEventListener;
-use hyprland::shared::{HyprDataActive, HyprDataActiveOptional};
+use hyprland::shared::{HyprData, HyprDataActive, HyprDataActiveOptional, HyprDataVec};
 use tracing::{debug, error, info, warn};
 
-use crate::bus::{Bus, TitleUpdate, WorkspaceUpdate};
+use crate::bus::{Bus, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate};
 
 // Special workspaces have negative ids in Hyprland, but the activespecial
 // event only carries names. Any negative id lands on the default arm of
@@ -67,26 +67,77 @@ pub fn format_title_string(title: String, max_length: usize) -> String {
     }
 }
 
-async fn get_initial_title_state() -> Result<TitleUpdate> {
-    // We do want to know when the operation is successfull but the title string is not there,
-    // which would be because there is no active client
-    debug!("Fetching initial title state");
+pub fn format_compact_title(title: &str, max_length: usize) -> String {
+    let first_word = title.split_whitespace().next().unwrap_or_default();
+    let char_count = first_word.chars().count();
+    if char_count <= max_length {
+        return first_word.to_string();
+    }
+    if max_length == 0 {
+        return String::new();
+    }
+    if max_length == 1 {
+        return "…".to_string();
+    }
 
-    let client = hyprland::data::Client::get_active_async().await?;
-    let update = match client {
-        Some(client) => TitleUpdate {
-            title: format_title_string(client.title, 64),
-            class: client.class,
-        },
-        None => TitleUpdate::default(),
+    let prefix: String = first_word.chars().take(max_length - 1).collect();
+    format!("{}…", prefix)
+}
+
+async fn get_workspace_clients_state() -> Result<WorkspaceClientsUpdate> {
+    let active_client = hyprland::data::Client::get_active_async().await?;
+    let workspace_id = match active_client.as_ref() {
+        Some(client) => client.workspace.id,
+        None => hyprland::data::Workspace::get_active_async().await?.id,
     };
+    let active_address = active_client.as_ref().map(|client| &client.address);
 
+    // Hyprland's `clients` IPC response iterates the compositor's client
+    // vector. Preserve that order after filtering instead of introducing a
+    // focus-history or hash-map order of our own.
+    let clients = hyprland::data::Clients::get_async()
+        .await?
+        .to_vec()
+        .into_iter()
+        .filter(|client| client.mapped && client.workspace.id == workspace_id)
+        .map(|client| {
+            let active = active_address == Some(&client.address);
+            let display_title = if client.title.trim().is_empty() {
+                client.class.clone()
+            } else {
+                client.title
+            };
+            WorkspaceClient {
+                address: client.address,
+                compact_title: format_compact_title(&display_title, 12),
+                title: format_title_string(display_title, 64),
+                class: client.class,
+                active,
+            }
+        })
+        .collect();
+
+    Ok(WorkspaceClientsUpdate {
+        workspace_id,
+        clients,
+    })
+}
+
+async fn refresh_workspace_clients(reason: &'static str, bus: &Bus) -> Result<()> {
+    let update = get_workspace_clients_state().await?;
+    let active_address = update
+        .clients
+        .iter()
+        .find(|client| client.active)
+        .map(|client| client.address.to_string());
     debug!(
-        title = update.title,
-        class = update.class,
-        "Initial title state"
+        reason,
+        workspace_id = update.workspace_id,
+        client_count = update.clients.len(),
+        active_address,
+        "Refreshing current workspace clients"
     );
-    Ok(update)
+    bus.send_clients_update(update)
 }
 
 async fn handle_workspace_change(
@@ -104,63 +155,6 @@ async fn handle_workspace_change(
         id: workspace_data.id,
     };
     bus.send_workspace_update(update)
-}
-
-async fn handle_title_change(
-    title_data: hyprland::event_listener::WindowTitleEventData,
-    bus: &Bus,
-) -> Result<()> {
-    debug!("Handling title change event");
-
-    // If not active client skip event except if there is no active client, use title_data.address
-    let active_client = hyprland::data::Client::get_active_async()
-        .await?
-        // log + early return, not as debug it is normal sometimes for it to not be an active client,
-        // use combinators
-        .filter(|client| client.address == title_data.address);
-
-    if let Some(client) = active_client {
-        let update = TitleUpdate {
-            title: format_title_string(client.title, 64),
-            class: client.class,
-        };
-        debug!(title = update.title, class = update.class, "Title changed");
-        bus.send_title_update(update)
-    } else {
-        debug!("No active client matches the title change event");
-        Ok(())
-    }
-}
-
-async fn handle_active_window_change(
-    window_data: Option<hyprland::event_listener::WindowEventData>,
-    bus: &Bus,
-) -> Result<()> {
-    debug!("Handling active window change event");
-
-    let update = match window_data {
-        Some(data) => {
-            debug!(
-                "Window data - class: '{}', title: '{}', address: '{}'",
-                data.class, data.title, data.address
-            );
-            TitleUpdate {
-                title: format_title_string(data.title, 64),
-                class: data.class,
-            }
-        }
-        None => {
-            debug!("No active window (window_data is None)");
-            TitleUpdate::default()
-        }
-    };
-
-    debug!(
-        title = update.title,
-        class = update.class,
-        "Active window changed"
-    );
-    bus.send_title_update(update)
 }
 
 // Supervised wrapper around setup_title_event_listener. The inner listener
@@ -241,13 +235,13 @@ pub async fn run_workspace_listener_supervised(bus: Bus) {
 pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     debug!("Setting up title event listener");
 
-    let initial_state = get_initial_title_state().await.unwrap_or_else(|e| {
-        error!("Failed to get initial title state: {}", e);
-        TitleUpdate::default()
+    let initial_state = get_workspace_clients_state().await.unwrap_or_else(|e| {
+        error!("Failed to get initial workspace clients state: {}", e);
+        WorkspaceClientsUpdate::default()
     });
 
-    if let Err(e) = bus.send_title_update(initial_state) {
-        error!("Failed to send initial title update: {}", e);
+    if let Err(e) = bus.send_clients_update(initial_state) {
+        error!("Failed to send initial workspace clients update: {}", e);
     }
 
     let mut event_listener = AsyncEventListener::new();
@@ -262,8 +256,13 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     event_listener.add_window_title_changed_handler(move |title_data| {
         let bus = title_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_title_change(title_data, &bus).await {
-                error!("Failed to handle title change: {}", e);
+            debug!(
+                address = %title_data.address,
+                title = title_data.title,
+                "Window title changed"
+            );
+            if let Err(e) = refresh_workspace_clients("title-changed", &bus).await {
+                error!("Failed to refresh clients after title change: {}", e);
             }
         })
     });
@@ -272,8 +271,84 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     event_listener.add_active_window_changed_handler(move |window_data| {
         let bus = window_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_active_window_change(window_data, &bus).await {
-                error!("Failed to handle active window change: {}", e);
+            debug!(window = ?window_data, "Active window changed");
+            if let Err(e) = refresh_workspace_clients("active-window-changed", &bus).await {
+                error!(
+                    "Failed to refresh clients after active window change: {}",
+                    e
+                );
+            }
+        })
+    });
+
+    let opened_bus = bus.clone();
+    event_listener.add_window_opened_handler(move |window_data| {
+        let bus = opened_bus.clone();
+        Box::pin(async move {
+            debug!(window = ?window_data, "Window opened");
+            if let Err(e) = refresh_workspace_clients("window-opened", &bus).await {
+                error!("Failed to refresh clients after window open: {}", e);
+            }
+        })
+    });
+
+    let closed_bus = bus.clone();
+    event_listener.add_window_closed_handler(move |address| {
+        let bus = closed_bus.clone();
+        Box::pin(async move {
+            debug!(%address, "Window closed");
+            if let Err(e) = refresh_workspace_clients("window-closed", &bus).await {
+                error!("Failed to refresh clients after window close: {}", e);
+            }
+        })
+    });
+
+    let moved_bus = bus.clone();
+    event_listener.add_window_moved_handler(move |window_data| {
+        let bus = moved_bus.clone();
+        Box::pin(async move {
+            debug!(window = ?window_data, "Window moved");
+            if let Err(e) = refresh_workspace_clients("window-moved", &bus).await {
+                error!("Failed to refresh clients after window move: {}", e);
+            }
+        })
+    });
+
+    let title_workspace_bus = bus.clone();
+    event_listener.add_workspace_changed_handler(move |workspace_data| {
+        let bus = title_workspace_bus.clone();
+        Box::pin(async move {
+            debug!(workspace = ?workspace_data, "Refreshing clients for workspace change");
+            if let Err(e) = refresh_workspace_clients("workspace-changed", &bus).await {
+                error!("Failed to refresh clients after workspace change: {}", e);
+            }
+        })
+    });
+
+    let changed_special_bus = bus.clone();
+    event_listener.add_changed_special_handler(move |workspace_data| {
+        let bus = changed_special_bus.clone();
+        Box::pin(async move {
+            debug!(workspace = ?workspace_data, "Refreshing clients for special workspace");
+            if let Err(e) = refresh_workspace_clients("special-workspace-changed", &bus).await {
+                error!("Failed to refresh clients for special workspace: {}", e);
+            }
+        })
+    });
+
+    let removed_special_bus = bus.clone();
+    event_listener.add_special_removed_handler(move |monitor| {
+        let bus = removed_special_bus.clone();
+        Box::pin(async move {
+            debug!(
+                monitor,
+                "Refreshing clients after special workspace removal"
+            );
+            if let Err(e) = refresh_workspace_clients("special-workspace-removed", &bus).await {
+                error!(
+                    "Failed to refresh clients after special workspace removal: {}",
+                    e
+                );
             }
         })
     });
@@ -452,6 +527,28 @@ mod tests {
         assert_eq!(format_title_string("abcdef".to_string(), 0), "…");
         // max_length=2: 0 left, 1 right.
         assert_eq!(format_title_string("abcdef".to_string(), 2), "…f");
+    }
+
+    #[test]
+    fn compact_title_uses_only_first_word() {
+        assert_eq!(format_compact_title("Mozilla Firefox", 12), "Mozilla");
+        assert_eq!(format_compact_title("  hello   world  ", 12), "hello");
+    }
+
+    #[test]
+    fn compact_title_caps_long_first_word_at_character_boundary() {
+        assert_eq!(
+            format_compact_title("abcdefghijklmnop second", 8),
+            "abcdefg…"
+        );
+        assert_eq!(format_compact_title("界🙂界🙂界 next", 4), "界🙂界…");
+    }
+
+    #[test]
+    fn compact_title_handles_empty_and_tiny_limits() {
+        assert_eq!(format_compact_title("", 12), "");
+        assert_eq!(format_compact_title("hello", 0), "");
+        assert_eq!(format_compact_title("hello", 1), "…");
     }
 
     // format_workspace_name_from_string: empty name falls back to id.

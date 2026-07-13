@@ -162,7 +162,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
         battery_widget,
         time_widget,
         workspace_widget,
-        title_widget,
+        client_strip,
     ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
@@ -173,8 +173,8 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
 
     widgets::update_time_widget(time_widget);
     widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget, &window);
-    widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
-    widgets::setup_title_updates(receivers.title, title_widget);
+    widgets::setup_workspace_updates(receivers.workspace, workspace_widget, client_strip.clone());
+    widgets::setup_client_updates(receivers.clients, client_strip);
     widgets::setup_battery_updates(receivers.battery, battery_widget);
     widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
     widgets::setup_network_updates(receivers.network, network_widget);

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
-use crate::bus::{TitleUpdate, VolumeUpdate, WorkspaceUpdate};
+use crate::bus::{VolumeUpdate, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate};
 use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
@@ -50,18 +50,48 @@ pub fn create_volume_widget() -> gtk4::Label {
 }
 
 #[derive(Clone)]
-pub struct TitleWidget {
+pub struct ClientStrip {
+    root: gtk4::Box,
+    workspace_css: gtk4::CssProvider,
+}
+
+#[derive(Clone)]
+struct ClientPill {
     root: gtk4::CenterBox,
     icon: gtk4::Image,
     label: gtk4::Label,
+    class: String,
 }
 
-pub fn create_title_widget() -> TitleWidget {
-    debug!("Creating title widget");
+pub fn create_client_strip() -> ClientStrip {
+    debug!("Creating workspace client strip");
+
+    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    root.add_css_class("client-strip");
+    root.set_halign(gtk4::Align::Center);
+    root.set_valign(gtk4::Align::Start);
+
+    let workspace_css = gtk4::CssProvider::new();
+    workspace_css
+        .load_from_data(".client-pill-active { background-color: rgba(67, 233, 123, 0.5); }");
+    gtk4::style_context_add_provider_for_display(
+        &root.display(),
+        &workspace_css,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
+
+    ClientStrip {
+        root,
+        workspace_css,
+    }
+}
+
+fn create_client_pill() -> ClientPill {
+    debug!("Creating client title pill");
 
     let root = gtk4::CenterBox::new();
-    root.add_css_class("title-widget");
-    root.set_halign(gtk4::Align::End);
+    root.add_css_class("client-pill");
+    root.set_halign(gtk4::Align::Center);
     root.set_valign(gtk4::Align::Start);
 
     let icon = gtk4::Image::new();
@@ -70,7 +100,7 @@ pub fn create_title_widget() -> TitleWidget {
     icon.set_visible(false);
     root.set_start_widget(Some(&icon));
 
-    let label = gtk4::Label::new(Some("Application Title"));
+    let label = gtk4::Label::new(None);
     label.add_css_class("title-label");
     label.set_valign(gtk4::Align::Center);
     // The producer already crops long titles by character count, but wide
@@ -79,14 +109,17 @@ pub fn create_title_widget() -> TitleWidget {
     // minimum width instead of expanding the layer surface past the output.
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_single_line_mode(true);
-    // Label is the CenterBox's own center widget (icon is the start widget)
-    // so GtkCenterLayout keeps the title text truly centered in the pill
-    // regardless of whether the icon is showing — packing both into one
-    // "center" child instead visually centers the icon+label group, which
-    // pulls short titles off-center once an icon appears.
+    // The active pill retains the existing label-centered layout. Compact
+    // inactive pills have no minimum width, so they collapse around the icon
+    // and first-word label while using the same widget tree.
     root.set_center_widget(Some(&label));
 
-    TitleWidget { root, icon, label }
+    ClientPill {
+        root,
+        icon,
+        label,
+        class: String::new(),
+    }
 }
 
 pub fn create_time_widget() -> gtk4::Label {
@@ -239,7 +272,7 @@ pub fn create_experimental_bar() -> (
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
-    TitleWidget,
+    ClientStrip,
 ) {
     debug!("Creating experimental bar");
 
@@ -248,7 +281,7 @@ pub fn create_experimental_bar() -> (
     main_box.set_valign(gtk4::Align::Start);
 
     let (left_group, workspace_widget) = create_left_group();
-    let title_widget = create_title_widget();
+    let client_strip = create_client_strip();
     let (
         right_group,
         tray_widget,
@@ -259,11 +292,11 @@ pub fn create_experimental_bar() -> (
         time_widget,
     ) = create_right_group();
 
-    // GtkCenterLayout keeps the title at the monitor midpoint independently
+    // GtkCenterLayout keeps the client strip at the monitor midpoint independently
     // of the side groups' widths. Equal expanding spacers cannot guarantee
     // that once the dynamic right group grows wider than its 20em container.
     main_box.set_start_widget(Some(&left_group));
-    main_box.set_center_widget(Some(&title_widget.root));
+    main_box.set_center_widget(Some(&client_strip.root));
     main_box.set_end_widget(Some(&right_group));
 
     // Pin the height once the font is resolvable, so dynamic content (title
@@ -284,7 +317,7 @@ pub fn create_experimental_bar() -> (
         battery_widget,
         time_widget,
         workspace_widget,
-        title_widget,
+        client_strip,
     )
 }
 
@@ -2114,21 +2147,15 @@ pub fn configure_layer_shell(
     Ok(())
 }
 
-fn update_title_widget_workspace_color(
-    title_widget: &TitleWidget,
+fn update_client_strip_workspace_color(
+    client_strip: &ClientStrip,
     workspace_id: hyprland::shared::WorkspaceId,
 ) {
     // Get workspace color based on ID
     let color = get_workspace_color(workspace_id);
 
-    // Apply color directly via CSS provider for immediate update
-    let css_provider = gtk4::CssProvider::new();
-    let css = format!(".title-widget {{ background-color: {}; }}", color);
-
-    css_provider.load_from_data(&css);
-
-    let style_context = title_widget.root.style_context();
-    style_context.add_provider(&css_provider, gtk4::STYLE_PROVIDER_PRIORITY_USER + 1);
+    let css = format!(".client-pill-active {{ background-color: {}; }}", color);
+    client_strip.workspace_css.load_from_data(&css);
 
     debug!(
         "Updated title widget color to: {} for workspace: {}",
@@ -2236,7 +2263,7 @@ mod tests {
 pub fn setup_workspace_updates(
     mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>,
     label: gtk4::Label,
-    title_widget: TitleWidget,
+    client_strip: ClientStrip,
 ) {
     debug!("Setting up workspace updates");
 
@@ -2247,9 +2274,9 @@ pub fn setup_workspace_updates(
                 "Updating workspace - label: '{}', color for workspace: {}",
                 update.name, update.id
             );
-            // Update both workspace text and title color atomically
+            // Update both workspace text and active-client color atomically
             label.set_text(&update.name);
-            update_title_widget_workspace_color(&title_widget, update.id);
+            update_client_strip_workspace_color(&client_strip, update.id);
         }
     });
 }
@@ -2291,7 +2318,7 @@ fn desktop_icon_for_class(class: &str) -> Option<gtk4::gio::Icon> {
         .and_then(|(_score, app)| app.icon())
 }
 
-fn update_title_icon(image: &gtk4::Image, class: &str) {
+fn update_client_icon(image: &gtk4::Image, class: &str) {
     let class = class.trim();
     if class.is_empty() {
         image.set_visible(false);
@@ -2330,27 +2357,57 @@ fn update_title_icon(image: &gtk4::Image, class: &str) {
     debug!(class, "Using generic fallback for title icon");
 }
 
-pub fn setup_title_updates(
-    mut rx: mpsc::UnboundedReceiver<TitleUpdate>,
-    title_widget: TitleWidget,
+fn update_client_pill(pill: &mut ClientPill, client: &WorkspaceClient) {
+    if client.active {
+        pill.root.remove_css_class("client-pill-inactive");
+        pill.root.add_css_class("title-widget");
+        pill.root.add_css_class("client-pill-active");
+        pill.label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        pill.label.set_text(&client.title);
+    } else {
+        pill.root.remove_css_class("title-widget");
+        pill.root.remove_css_class("client-pill-active");
+        pill.root.add_css_class("client-pill-inactive");
+        pill.label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        pill.label.set_text(&client.compact_title);
+    }
+    pill.root.set_tooltip_text(Some(&client.title));
+
+    if client.class != pill.class {
+        update_client_icon(&pill.icon, &client.class);
+        pill.class.clone_from(&client.class);
+    }
+}
+
+pub fn setup_client_updates(
+    mut rx: mpsc::UnboundedReceiver<WorkspaceClientsUpdate>,
+    client_strip: ClientStrip,
 ) {
-    debug!("Setting up title updates");
+    debug!("Setting up workspace client updates");
 
     glib::spawn_future_local(async move {
-        let mut current_class = String::new();
+        let mut pills = HashMap::new();
         while let Some(update) = rx.recv().await {
             debug!(
-                title = update.title,
-                class = update.class,
-                "Updating title widget"
+                workspace_id = update.workspace_id,
+                client_count = update.clients.len(),
+                "Updating workspace client strip"
             );
-            // NOTE: Title widget always remains visible even when empty, unlike battery/bluetooth widgets.
-            // This provides consistent visual layout and shows the centered position in the bar.
-            title_widget.label.set_text(&update.title);
-            if update.class != current_class {
-                update_title_icon(&title_widget.icon, &update.class);
-                current_class = update.class;
+
+            while let Some(child) = client_strip.root.first_child() {
+                client_strip.root.remove(&child);
             }
+
+            let mut next_pills = HashMap::with_capacity(update.clients.len());
+            for client in update.clients {
+                let mut pill = pills
+                    .remove(&client.address)
+                    .unwrap_or_else(create_client_pill);
+                update_client_pill(&mut pill, &client);
+                client_strip.root.append(&pill.root);
+                next_pills.insert(client.address, pill);
+            }
+            pills = next_pills;
         }
     });
 }

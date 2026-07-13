@@ -12,15 +12,44 @@ mod pw;
 mod tray;
 mod widgets;
 
+use std::env;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use gio::prelude::*;
 use gtk4::prelude::*;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tray_ipc::IpcUiRequest;
+
+const USAGE: &str = "Usage: gtk-status-bar [--monitor CONNECTOR]\n\n\
+CONNECTOR is the GDK output connector name, such as DVI-I-1 or DP-1. Without\n\
+--monitor, the compositor chooses the output.";
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliOptions {
+    monitor: Option<String>,
+}
+
+enum CliAction {
+    Run(CliOptions),
+    Help,
+}
+
+fn parse_cli(arguments: &[String]) -> Result<CliAction> {
+    match arguments {
+        [] => Ok(CliAction::Run(CliOptions { monitor: None })),
+        [flag] if flag == "--help" || flag == "-h" => Ok(CliAction::Help),
+        [flag, connector] if flag == "--monitor" && !connector.is_empty() => {
+            Ok(CliAction::Run(CliOptions {
+                monitor: Some(connector.clone()),
+            }))
+        }
+        [flag] if flag == "--monitor" => bail!("--monitor requires a CONNECTOR\n\n{USAGE}"),
+        _ => bail!("unknown or malformed arguments\n\n{USAGE}"),
+    }
+}
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -54,14 +83,14 @@ async fn run_tray_ipc_supervised(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
     }
 }
 
-fn activate(application: &gtk4::Application) -> Result<()> {
+fn activate(application: &gtk4::Application, monitor: Option<&str>) -> Result<()> {
     info!("Activating GTK application");
 
     let window = gtk4::ApplicationWindow::new(application);
     window.add_css_class("layer-bar");
 
     widgets::load_css_styles(&window);
-    widgets::configure_layer_shell(&window);
+    widgets::configure_layer_shell(&window, monitor)?;
 
     let (
         bar,
@@ -106,6 +135,15 @@ fn create_tokio_runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> Result<()> {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    let options = match parse_cli(&arguments)? {
+        CliAction::Run(options) => options,
+        CliAction::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+    };
+
     setup_logging();
     info!("Starting GTK status bar application");
 
@@ -114,7 +152,7 @@ fn main() -> Result<()> {
 
     let application = gtk4::Application::new(Some("sh.wmww.gtk-layer-example"), Default::default());
 
-    application.connect_activate(|app| {
+    application.connect_activate(move |app| {
         // GApplication re-fires activate on the primary instance when a second
         // copy of the binary launches under the same application id. Rebuilding
         // the bar would double-spawn every producer, so present the existing
@@ -125,14 +163,54 @@ fn main() -> Result<()> {
             window.present();
             return;
         }
-        if let Err(e) = activate(app) {
+        if let Err(e) = activate(app, options.monitor.as_deref()) {
             error!("Application activation failed: {:#}", e);
             std::process::exit(1);
         }
     });
 
     info!("Running GTK application");
-    application.run();
+    application.run_with_args(&["gtk-status-bar"]);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn monitor_is_optional() {
+        let CliAction::Run(options) = parse_cli(&[]).expect("empty arguments should parse") else {
+            panic!("empty arguments unexpectedly requested help");
+        };
+        assert_eq!(options, CliOptions { monitor: None });
+    }
+
+    #[test]
+    fn parses_monitor_connector() {
+        let CliAction::Run(options) =
+            parse_cli(&arguments(&["--monitor", "DVI-I-1"])).expect("monitor should parse")
+        else {
+            panic!("monitor arguments unexpectedly requested help");
+        };
+        assert_eq!(
+            options,
+            CliOptions {
+                monitor: Some("DVI-I-1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_monitor_without_connector() {
+        let error = parse_cli(&arguments(&["--monitor"]))
+            .err()
+            .expect("missing connector should fail");
+        assert!(error.to_string().contains("requires a CONNECTOR"));
+    }
 }

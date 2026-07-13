@@ -14,7 +14,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Local;
 use gtk4::gdk;
 use gtk4::gio::prelude::*;
@@ -2010,10 +2010,55 @@ pub fn load_css_styles(window: &gtk4::ApplicationWindow) {
     info!("CSS styles loaded successfully");
 }
 
-pub fn configure_layer_shell(window: &gtk4::ApplicationWindow) {
+pub fn configure_layer_shell(
+    window: &gtk4::ApplicationWindow,
+    monitor_connector: Option<&str>,
+) -> Result<()> {
     debug!("Configuring layer shell");
 
     window.init_layer_shell();
+    if let Some(requested) = monitor_connector {
+        let display = gtk4::prelude::WidgetExt::display(window);
+        let monitors = display.monitors();
+        let mut available = Vec::new();
+        let mut selected = None;
+
+        for index in 0..monitors.n_items() {
+            let Some(object) = monitors.item(index) else {
+                warn!(index, "GDK monitor list omitted an advertised item");
+                continue;
+            };
+            let Ok(monitor) = object.downcast::<gdk::Monitor>() else {
+                warn!(index, "GDK monitor list contained a non-monitor object");
+                continue;
+            };
+            let Some(connector) = monitor.connector() else {
+                warn!(index, "GDK monitor has no connector name");
+                continue;
+            };
+
+            if connector == requested {
+                selected = Some(monitor);
+                break;
+            }
+            available.push(connector.to_string());
+        }
+
+        let Some(monitor) = selected else {
+            available.sort();
+            let available = if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            };
+            bail!(
+                "monitor connector {requested:?} was not found; available connectors: {available}"
+            );
+        };
+
+        window.set_monitor(Some(&monitor));
+        info!(monitor = requested, "Selected layer-shell monitor");
+    }
     window.set_layer(Layer::Bottom);
     window.auto_exclusive_zone_enable();
 
@@ -2029,6 +2074,7 @@ pub fn configure_layer_shell(window: &gtk4::ApplicationWindow) {
     }
 
     info!("Layer shell configured successfully");
+    Ok(())
 }
 
 fn update_title_widget_workspace_color(

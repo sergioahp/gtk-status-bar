@@ -2,6 +2,14 @@
 
 A modern, transparent status bar for Wayland compositors built directly in Rust with GTK4 and layer-shell protocol. Designed for Hyprland with real-time workspace tracking, PipeWire audio monitoring, and async event handling.
 
+Select a specific output by its connector name when starting the bar:
+
+```sh
+gtk-status-bar --monitor DVI-I-1
+```
+
+Without `--monitor`, the compositor chooses the output.
+
 ## 📸 Screenshot
 
 ![GTK Status Bar](assets/bar.png)

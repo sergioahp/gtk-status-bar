@@ -51,7 +51,7 @@ pub fn create_volume_widget() -> gtk4::Label {
 
 #[derive(Clone)]
 pub struct TitleWidget {
-    root: gtk4::Box,
+    root: gtk4::CenterBox,
     icon: gtk4::Image,
     label: gtk4::Label,
 }
@@ -59,15 +59,18 @@ pub struct TitleWidget {
 pub fn create_title_widget() -> TitleWidget {
     debug!("Creating title widget");
 
-    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    let root = gtk4::CenterBox::new();
     root.add_css_class("title-widget");
     root.set_halign(gtk4::Align::End);
     root.set_valign(gtk4::Align::Start);
 
+    let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    content.set_valign(gtk4::Align::Center);
+
     let icon = gtk4::Image::new();
     icon.add_css_class("title-icon");
     icon.set_visible(false);
-    root.append(&icon);
+    content.append(&icon);
 
     let label = gtk4::Label::new(Some("Application Title"));
     label.add_css_class("title-label");
@@ -78,7 +81,8 @@ pub fn create_title_widget() -> TitleWidget {
     // minimum width instead of expanding the layer surface past the output.
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_single_line_mode(true);
-    root.append(&label);
+    content.append(&label);
+    root.set_center_widget(Some(&content));
 
     TitleWidget { root, icon, label }
 }

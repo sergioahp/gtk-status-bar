@@ -64,25 +64,27 @@ pub fn create_title_widget() -> TitleWidget {
     root.set_halign(gtk4::Align::End);
     root.set_valign(gtk4::Align::Start);
 
-    let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    content.set_valign(gtk4::Align::Center);
-
     let icon = gtk4::Image::new();
     icon.add_css_class("title-icon");
+    icon.set_valign(gtk4::Align::Center);
     icon.set_visible(false);
-    content.append(&icon);
+    root.set_start_widget(Some(&icon));
 
     let label = gtk4::Label::new(Some("Application Title"));
     label.add_css_class("title-label");
-    label.set_halign(gtk4::Align::End);
+    label.set_valign(gtk4::Align::Center);
     // The producer already crops long titles by character count, but wide
     // glyphs can still exceed the remaining monitor width when right-side
     // pills are added. Ellipsizing gives GTK permission to shrink the label's
     // minimum width instead of expanding the layer surface past the output.
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_single_line_mode(true);
-    content.append(&label);
-    root.set_center_widget(Some(&content));
+    // Label is the CenterBox's own center widget (icon is the start widget)
+    // so GtkCenterLayout keeps the title text truly centered in the pill
+    // regardless of whether the icon is showing — packing both into one
+    // "center" child instead visually centers the icon+label group, which
+    // pulls short titles off-center once an icon appears.
+    root.set_center_widget(Some(&label));
 
     TitleWidget { root, icon, label }
 }

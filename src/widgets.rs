@@ -346,11 +346,14 @@ pub fn create_experimental_bar() -> (
 
     // The right spacer absorbs routine content growth inside a stable reserve.
     // Only content wider than this budget can reduce the left allocation.
-    let right_group_for_map = right_group.clone();
-    bar.connect_map(move |bar| {
+    let right_group_for_tick = right_group.clone();
+    bar.add_tick_callback(move |bar, _clock| {
         let reserved = right_group_reserved_width(bar.width());
-        right_group_for_map.set_width_request(reserved);
-        debug!(reserved, "Reserved stable width for right group");
+        if right_group_for_tick.width_request() != reserved {
+            right_group_for_tick.set_width_request(reserved);
+            debug!(reserved, "Reserved stable width for right group");
+        }
+        glib::ControlFlow::Continue
     });
 
     // Pin the height once the font is resolvable, so dynamic content (title

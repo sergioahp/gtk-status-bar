@@ -25,7 +25,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
-use crate::bus::{TitleUpdate, VolumeUpdate, WorkspaceUpdate};
+use crate::bus::{
+    TitleUpdate, VolumeUpdate, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate,
+};
 use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
@@ -54,6 +56,78 @@ pub struct TitleWidget {
     root: gtk4::CenterBox,
     icon: gtk4::Image,
     label: gtk4::Label,
+}
+
+#[derive(Clone)]
+pub struct ClientStrip {
+    root: gtk4::ScrolledWindow,
+    list: gtk4::Box,
+}
+
+#[derive(Clone)]
+struct ClientPill {
+    root: gtk4::CenterBox,
+    icon: gtk4::Image,
+    label: gtk4::Label,
+    class: Option<String>,
+}
+
+const CLIENT_PILL_TITLE_CHARS: i32 = 10;
+
+pub fn create_client_strip() -> ClientStrip {
+    debug!("Creating workspace client strip");
+
+    let list = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    list.add_css_class("client-strip");
+    list.set_halign(gtk4::Align::Start);
+    list.set_valign(gtk4::Align::Start);
+
+    // The viewport, rather than its potentially very wide child, participates
+    // in the bar's size negotiation. Extra pills are clipped at the right edge
+    // of the left allocation and cannot displace the centered title.
+    let root = gtk4::ScrolledWindow::new();
+    root.add_css_class("client-strip-viewport");
+    root.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+    root.set_propagate_natural_width(false);
+    root.set_hexpand(true);
+    root.set_halign(gtk4::Align::Fill);
+    root.set_valign(gtk4::Align::Start);
+    root.set_visible(false);
+    root.set_child(Some(&list));
+
+    ClientStrip { root, list }
+}
+
+fn create_client_pill() -> ClientPill {
+    let root = gtk4::CenterBox::new();
+    root.add_css_class("client-pill");
+    root.set_halign(gtk4::Align::Start);
+    root.set_valign(gtk4::Align::Start);
+    root.set_overflow(gtk4::Overflow::Hidden);
+
+    let icon = gtk4::Image::new();
+    icon.add_css_class("title-icon");
+    icon.set_valign(gtk4::Align::Center);
+    root.set_start_widget(Some(&icon));
+
+    let label = gtk4::Label::new(None);
+    label.add_css_class("title-label");
+    label.set_valign(gtk4::Align::Center);
+    label.set_xalign(0.0);
+    label.set_single_line_mode(true);
+    // The producer hard-truncates at this same character count. Keeping Pango
+    // ellipsizing disabled avoids spending any of the small slot on an ellipsis.
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+    label.set_width_chars(CLIENT_PILL_TITLE_CHARS);
+    label.set_max_width_chars(CLIENT_PILL_TITLE_CHARS);
+    root.set_center_widget(Some(&label));
+
+    ClientPill {
+        root,
+        icon,
+        label,
+        class: None,
+    }
 }
 
 pub fn create_title_widget() -> TitleWidget {
@@ -151,33 +225,29 @@ pub fn create_tray_widget() -> gtk4::Box {
     tray
 }
 
-pub fn create_left_group() -> (gtk4::Box, gtk4::Label) {
+pub fn create_left_group() -> (gtk4::Box, ClientStrip) {
     debug!("Creating left group");
 
     let left_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_container.add_css_class("left-container");
     left_container.set_valign(gtk4::Align::Start);
-    left_container.set_hexpand(false);
+    left_container.set_hexpand(true);
 
     let left_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
-    left_group.set_hexpand(false);
+    left_group.set_hexpand(true);
 
-    let workspace_widget = create_workspace_widget();
-    left_group.append(&workspace_widget);
-
-    let left_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    left_spacer.set_hexpand(true);
-
+    let client_strip = create_client_strip();
+    left_group.append(&client_strip.root);
     left_container.append(&left_group);
-    left_container.append(&left_spacer);
 
-    (left_container, workspace_widget)
+    (left_container, client_strip)
 }
 
 pub fn create_right_group() -> (
     gtk4::Box,
     gtk4::Box,
+    gtk4::Label,
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
@@ -197,6 +267,9 @@ pub fn create_right_group() -> (
     let right_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     right_group.add_css_class("right-group");
     right_group.set_hexpand(false);
+
+    let workspace_widget = create_workspace_widget();
+    right_group.append(&workspace_widget);
 
     let tray_widget = create_tray_widget();
     right_group.append(&tray_widget);
@@ -227,6 +300,7 @@ pub fn create_right_group() -> (
         network_widget,
         battery_widget,
         time_widget,
+        workspace_widget,
     )
 }
 
@@ -240,6 +314,7 @@ pub fn create_experimental_bar() -> (
     gtk4::Label,
     gtk4::Label,
     TitleWidget,
+    ClientStrip,
 ) {
     debug!("Creating experimental bar");
 
@@ -247,7 +322,7 @@ pub fn create_experimental_bar() -> (
     main_box.set_hexpand(true);
     main_box.set_valign(gtk4::Align::Start);
 
-    let (left_group, workspace_widget) = create_left_group();
+    let (left_group, client_strip) = create_left_group();
     let title_widget = create_title_widget();
     let (
         right_group,
@@ -257,6 +332,7 @@ pub fn create_experimental_bar() -> (
         network_widget,
         battery_widget,
         time_widget,
+        workspace_widget,
     ) = create_right_group();
 
     // GtkCenterLayout keeps the title at the monitor midpoint independently
@@ -285,6 +361,7 @@ pub fn create_experimental_bar() -> (
         time_widget,
         workspace_widget,
         title_widget,
+        client_strip,
     )
 }
 
@@ -2374,6 +2451,63 @@ fn update_title_icon(image: &gtk4::Image, class: &str) {
     image.set_icon_name(Some("application-x-executable-symbolic"));
     image.set_visible(true);
     debug!(class, "Using generic fallback for title icon");
+}
+
+fn update_client_icon(image: &gtk4::Image, class: &str) {
+    if !class.trim().is_empty() {
+        update_title_icon(image, class);
+        return;
+    }
+
+    image.set_pixel_size(tray_icon_pixel_size(image));
+    image.set_icon_name(Some("application-x-executable-symbolic"));
+    image.set_visible(true);
+}
+
+fn update_client_pill(pill: &mut ClientPill, client: &WorkspaceClient) {
+    pill.label.set_text(&client.compact_title);
+    pill.root.set_tooltip_text(Some(&client.title));
+
+    if pill.class.as_deref() != Some(client.class.as_str()) {
+        update_client_icon(&pill.icon, &client.class);
+        pill.class = Some(client.class.clone());
+    }
+}
+
+pub fn setup_client_updates(
+    mut rx: mpsc::UnboundedReceiver<WorkspaceClientsUpdate>,
+    client_strip: ClientStrip,
+) {
+    debug!("Setting up workspace client updates");
+
+    glib::spawn_future_local(async move {
+        let mut pills = HashMap::new();
+        while let Some(update) = rx.recv().await {
+            while let Some(child) = client_strip.list.first_child() {
+                client_strip.list.remove(&child);
+            }
+
+            let mut next_pills = HashMap::with_capacity(update.clients.len());
+            for client in update.clients.into_iter().filter(|client| !client.active) {
+                debug!(
+                    workspace_id = update.workspace_id,
+                    address = %client.address,
+                    title = client.title,
+                    compact_title = client.compact_title,
+                    class = client.class,
+                    "Updating fixed-size client pill"
+                );
+                let mut pill = pills
+                    .remove(&client.address)
+                    .unwrap_or_else(create_client_pill);
+                update_client_pill(&mut pill, &client);
+                client_strip.list.append(&pill.root);
+                next_pills.insert(client.address, pill);
+            }
+            client_strip.root.set_visible(!next_pills.is_empty());
+            pills = next_pills;
+        }
+    });
 }
 
 pub fn setup_title_updates(

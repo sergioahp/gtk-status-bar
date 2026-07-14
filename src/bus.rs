@@ -1,8 +1,9 @@
 // The status bar is wired as producer-consumer fan-outs: each subsystem
-// (Hyprland title, Hyprland workspace, UPower battery, BlueZ) pushes labels
+// (Hyprland title/clients, Hyprland workspace, UPower battery, BlueZ) pushes
+// labels
 // into an unbounded mpsc channel and a glib-local task drains it onto the
 // corresponding GTK widget on the main thread. This module owns the Bus (the
-// four senders, cloned into each producer at spawn time) and the typed send
+// six senders, cloned into each producer at spawn time) and the typed send
 // helpers; the widget layer (setup_*_updates) owns the receivers. The
 // PipeWire volume channel stays outside the Bus: its producer is a dedicated
 // std::thread that already takes its sender as a parameter (see
@@ -36,6 +37,21 @@ pub struct TitleUpdate {
     pub class: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceClient {
+    pub address: hyprland::shared::Address,
+    pub title: String,
+    pub compact_title: String,
+    pub class: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceClientsUpdate {
+    pub workspace_id: hyprland::shared::WorkspaceId,
+    pub clients: Vec<WorkspaceClient>,
+}
+
 #[derive(Debug, Clone)]
 pub struct VolumeUpdate {
     pub name: String,
@@ -44,12 +60,13 @@ pub struct VolumeUpdate {
     pub is_muted: Option<bool>,
 }
 
-// Producer-side handle: cheap to clone (four UnboundedSender clones), Send +
+// Producer-side handle: cheap to clone (six UnboundedSender clones), Send +
 // Sync, so it moves freely into tokio tasks and hyprland-rs handler closures.
 #[derive(Clone)]
 pub struct Bus {
     workspace: mpsc::UnboundedSender<WorkspaceUpdate>,
     title: mpsc::UnboundedSender<TitleUpdate>,
+    clients: mpsc::UnboundedSender<WorkspaceClientsUpdate>,
     battery: mpsc::UnboundedSender<String>,
     bluetooth: mpsc::UnboundedSender<String>,
     network: mpsc::UnboundedSender<String>,
@@ -60,6 +77,7 @@ pub struct Bus {
 pub struct BusReceivers {
     pub workspace: mpsc::UnboundedReceiver<WorkspaceUpdate>,
     pub title: mpsc::UnboundedReceiver<TitleUpdate>,
+    pub clients: mpsc::UnboundedReceiver<WorkspaceClientsUpdate>,
     pub battery: mpsc::UnboundedReceiver<String>,
     pub bluetooth: mpsc::UnboundedReceiver<String>,
     pub network: mpsc::UnboundedReceiver<String>,
@@ -69,6 +87,7 @@ impl Bus {
     pub fn new() -> (Bus, BusReceivers) {
         let (workspace_tx, workspace_rx) = mpsc::unbounded_channel();
         let (title_tx, title_rx) = mpsc::unbounded_channel();
+        let (clients_tx, clients_rx) = mpsc::unbounded_channel();
         let (battery_tx, battery_rx) = mpsc::unbounded_channel();
         let (bluetooth_tx, bluetooth_rx) = mpsc::unbounded_channel();
         let (network_tx, network_rx) = mpsc::unbounded_channel();
@@ -77,6 +96,7 @@ impl Bus {
             Bus {
                 workspace: workspace_tx,
                 title: title_tx,
+                clients: clients_tx,
                 battery: battery_tx,
                 bluetooth: bluetooth_tx,
                 network: network_tx,
@@ -84,6 +104,7 @@ impl Bus {
             BusReceivers {
                 workspace: workspace_rx,
                 title: title_rx,
+                clients: clients_rx,
                 battery: battery_rx,
                 bluetooth: bluetooth_rx,
                 network: network_rx,
@@ -106,6 +127,12 @@ impl Bus {
         self.title
             .send(update)
             .context("Failed to send title update")
+    }
+
+    pub fn send_clients_update(&self, update: WorkspaceClientsUpdate) -> Result<()> {
+        self.clients
+            .send(update)
+            .context("Failed to send workspace clients update")
     }
 
     pub fn send_battery_update(&self, update: String) -> Result<()> {
@@ -159,6 +186,27 @@ mod tests {
         bus.send_title_update(update.clone())
             .expect("send_title_update should succeed");
         assert_eq!(rx.title.try_recv().expect("title message"), update);
+    }
+
+    #[test]
+    fn workspace_clients_update_round_trips() {
+        let (bus, mut rx) = Bus::new();
+        let update = WorkspaceClientsUpdate {
+            workspace_id: 2,
+            clients: vec![WorkspaceClient {
+                address: hyprland::shared::Address::new("1234"),
+                title: "hello world".to_string(),
+                compact_title: "hello".to_string(),
+                class: "kitty".to_string(),
+                active: false,
+            }],
+        };
+        bus.send_clients_update(update.clone())
+            .expect("send_clients_update should succeed");
+        assert_eq!(
+            rx.clients.try_recv().expect("workspace clients message"),
+            update
+        );
     }
 
     #[test]

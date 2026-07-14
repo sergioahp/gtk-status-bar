@@ -1,7 +1,7 @@
-// Hyprland subsystem: title + workspace listeners.
+// Hyprland subsystem: workspace-client + workspace-label listeners.
 //
 // We connect to Hyprland's IPC event socket (.socket2.sock) via hyprland-rs's
-// AsyncEventListener. activate() spawns supervised tokio tasks for the title
+// AsyncEventListener. activate() spawns supervised tokio tasks for the client
 // and workspace listeners. If a listener errors out (EOF on the socket, parse
 // failure on an unknown event variant, etc.), its wrapper retries with
 // exponential backoff.
@@ -13,11 +13,11 @@ use hyprland::event_listener::AsyncEventListener;
 use hyprland::shared::{HyprData, HyprDataActive, HyprDataActiveOptional, HyprDataVec};
 use tracing::{debug, error, info, warn};
 
-use crate::bus::{Bus, TitleUpdate, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate};
+use crate::bus::{Bus, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate};
 
 // Special workspaces have negative ids in Hyprland, but the activespecial
-// event only carries names. Any negative id lands on the default arm of
-// get_workspace_color; -99 is pinned by a widgets test.
+// event only carries names. This sentinel preserves the existing label data
+// shape even though the workspace id is no longer used for title coloring.
 const SPECIAL_WORKSPACE_COLOR_ID: hyprland::shared::WorkspaceId = -99;
 
 pub fn format_workspace_name_from_string(name: &str, id: hyprland::shared::WorkspaceId) -> String {
@@ -75,28 +75,6 @@ pub fn format_compact_title(title: &str, max_length: usize) -> String {
         .chars()
         .take(max_length)
         .collect()
-}
-
-async fn get_initial_title_state() -> Result<TitleUpdate> {
-    // We do want to know when the operation is successfull but the title string is not there,
-    // which would be because there is no active client
-    debug!("Fetching initial title state");
-
-    let client = hyprland::data::Client::get_active_async().await?;
-    let update = match client {
-        Some(client) => TitleUpdate {
-            title: format_title_string(client.title, 64),
-            class: client.class,
-        },
-        None => TitleUpdate::default(),
-    };
-
-    debug!(
-        title = update.title,
-        class = update.class,
-        "Initial title state"
-    );
-    Ok(update)
 }
 
 async fn get_workspace_clients_state() -> Result<WorkspaceClientsUpdate> {
@@ -170,64 +148,7 @@ async fn handle_workspace_change(
     bus.send_workspace_update(update)
 }
 
-async fn handle_title_change(
-    title_data: hyprland::event_listener::WindowTitleEventData,
-    bus: &Bus,
-) -> Result<()> {
-    debug!("Handling title change event");
-
-    // If not active client skip event except if there is no active client, use title_data.address
-    let active_client = hyprland::data::Client::get_active_async()
-        .await?
-        // log + early return, not as debug it is normal sometimes for it to not be an active client,
-        // use combinators
-        .filter(|client| client.address == title_data.address);
-
-    if let Some(client) = active_client {
-        let update = TitleUpdate {
-            title: format_title_string(client.title, 64),
-            class: client.class,
-        };
-        debug!(title = update.title, class = update.class, "Title changed");
-        bus.send_title_update(update)
-    } else {
-        debug!("No active client matches the title change event");
-        Ok(())
-    }
-}
-
-async fn handle_active_window_change(
-    window_data: Option<hyprland::event_listener::WindowEventData>,
-    bus: &Bus,
-) -> Result<()> {
-    debug!("Handling active window change event");
-
-    let update = match window_data {
-        Some(data) => {
-            debug!(
-                "Window data - class: '{}', title: '{}', address: '{}'",
-                data.class, data.title, data.address
-            );
-            TitleUpdate {
-                title: format_title_string(data.title, 64),
-                class: data.class,
-            }
-        }
-        None => {
-            debug!("No active window (window_data is None)");
-            TitleUpdate::default()
-        }
-    };
-
-    debug!(
-        title = update.title,
-        class = update.class,
-        "Active window changed"
-    );
-    bus.send_title_update(update)
-}
-
-// Supervised wrapper around setup_title_event_listener. The inner listener
+// Supervised wrapper around setup_client_event_listener. The inner listener
 // returns when Hyprland disconnects the IPC stream (EOF on .socket2.sock, parse
 // failure on an unknown event variant, or any other I/O error in
 // AsyncEventListener::start_listener_async). We log the cause, sleep with
@@ -238,32 +159,32 @@ async fn handle_active_window_change(
 //
 // This function never returns and is meant to be `tokio::spawn`ed from the
 // widget setup.
-pub async fn run_title_listener_supervised(bus: Bus) {
+pub async fn run_client_listener_supervised(bus: Bus) {
     let max_delay = Duration::from_secs(60);
     let reset_threshold = Duration::from_secs(30);
     let mut delay = Duration::from_secs(1);
 
     loop {
         let started = Instant::now();
-        info!("🔌 Starting title event listener");
-        match setup_title_event_listener(&bus).await {
+        info!("🔌 Starting workspace client event listener");
+        match setup_client_event_listener(&bus).await {
             Ok(()) => {
-                warn!("⚠️ Title event listener returned cleanly (unexpected)");
+                warn!("⚠️ Workspace client event listener returned cleanly (unexpected)");
             }
             Err(e) => {
-                error!("❌ Title event listener crashed: {:#}", e);
+                error!("❌ Workspace client event listener crashed: {:#}", e);
             }
         }
 
         if started.elapsed() >= reset_threshold {
             debug!(
-                "🔄 Title listener ran for {:?}, resetting backoff",
+                "🔄 Workspace client listener ran for {:?}, resetting backoff",
                 started.elapsed()
             );
             delay = Duration::from_secs(1);
         }
 
-        warn!("🔄 Reconnecting title listener in {:?}", delay);
+        warn!("🔄 Reconnecting workspace client listener in {:?}", delay);
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, max_delay);
     }
@@ -302,17 +223,8 @@ pub async fn run_workspace_listener_supervised(bus: Bus) {
     }
 }
 
-pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
-    debug!("Setting up title event listener");
-
-    let initial_state = get_initial_title_state().await.unwrap_or_else(|e| {
-        error!("Failed to get initial title state: {}", e);
-        TitleUpdate::default()
-    });
-
-    if let Err(e) = bus.send_title_update(initial_state) {
-        error!("Failed to send initial title update: {}", e);
-    }
+pub async fn setup_client_event_listener(bus: &Bus) -> Result<()> {
+    debug!("Setting up workspace client event listener");
 
     let initial_clients = get_workspace_clients_state().await.unwrap_or_else(|e| {
         error!("Failed to get initial workspace clients state: {}", e);
@@ -331,12 +243,9 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     // Each handler clones the Bus twice: once into the closure (which must be
     // Fn, callable many times) and once per invocation into the async move.
     let title_bus = bus.clone();
-    event_listener.add_window_title_changed_handler(move |title_data| {
+    event_listener.add_window_title_changed_handler(move |_title_data| {
         let bus = title_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_title_change(title_data, &bus).await {
-                error!("Failed to handle title change: {}", e);
-            }
             if let Err(e) = refresh_workspace_clients("title-changed", &bus).await {
                 error!("Failed to refresh clients after title change: {}", e);
             }
@@ -344,12 +253,9 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
     });
 
     let window_bus = bus.clone();
-    event_listener.add_active_window_changed_handler(move |window_data| {
+    event_listener.add_active_window_changed_handler(move |_window_data| {
         let bus = window_bus.clone();
         Box::pin(async move {
-            if let Err(e) = handle_active_window_change(window_data, &bus).await {
-                error!("Failed to handle active window change: {}", e);
-            }
             if let Err(e) = refresh_workspace_clients("active-window-changed", &bus).await {
                 error!(
                     "Failed to refresh clients after active window change: {}",
@@ -428,7 +334,7 @@ pub async fn setup_title_event_listener(bus: &Bus) -> Result<()> {
         })
     });
 
-    info!("Starting title event listener");
+    info!("Starting workspace client event listener");
     event_listener.start_listener_async().await?;
 
     Ok(())
@@ -485,8 +391,7 @@ pub async fn setup_workspace_event_listener(bus: &Bus) -> Result<()> {
         let bus = special_bus.clone();
         Box::pin(async move {
             // The event carries names only; special workspaces have negative
-            // ids in Hyprland, so use a sentinel that hits the default color
-            // arm of get_workspace_color.
+            // ids in Hyprland, so preserve a sentinel id in the update.
             let name = special_data
                 .workspace_name
                 .strip_prefix("special:")

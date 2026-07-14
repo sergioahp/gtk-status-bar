@@ -1,5 +1,5 @@
 // The status bar is wired as producer-consumer fan-outs: each subsystem
-// (Hyprland title/clients, Hyprland workspace, UPower battery, BlueZ) pushes
+// (Hyprland clients, Hyprland workspace, UPower battery, BlueZ) pushes
 // labels
 // into an unbounded mpsc channel and a glib-local task drains it onto the
 // corresponding GTK widget on the main thread. This module owns the Bus (the
@@ -31,12 +31,6 @@ pub struct WorkspaceUpdate {
     pub id: hyprland::shared::WorkspaceId,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TitleUpdate {
-    pub title: String,
-    pub class: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceClient {
     pub address: hyprland::shared::Address,
@@ -60,12 +54,11 @@ pub struct VolumeUpdate {
     pub is_muted: Option<bool>,
 }
 
-// Producer-side handle: cheap to clone (six UnboundedSender clones), Send +
+// Producer-side handle: cheap to clone (five UnboundedSender clones), Send +
 // Sync, so it moves freely into tokio tasks and hyprland-rs handler closures.
 #[derive(Clone)]
 pub struct Bus {
     workspace: mpsc::UnboundedSender<WorkspaceUpdate>,
-    title: mpsc::UnboundedSender<TitleUpdate>,
     clients: mpsc::UnboundedSender<WorkspaceClientsUpdate>,
     battery: mpsc::UnboundedSender<String>,
     bluetooth: mpsc::UnboundedSender<String>,
@@ -76,7 +69,6 @@ pub struct Bus {
 // cloneable; each field is moved into its widget's glib-local drain task.
 pub struct BusReceivers {
     pub workspace: mpsc::UnboundedReceiver<WorkspaceUpdate>,
-    pub title: mpsc::UnboundedReceiver<TitleUpdate>,
     pub clients: mpsc::UnboundedReceiver<WorkspaceClientsUpdate>,
     pub battery: mpsc::UnboundedReceiver<String>,
     pub bluetooth: mpsc::UnboundedReceiver<String>,
@@ -86,7 +78,6 @@ pub struct BusReceivers {
 impl Bus {
     pub fn new() -> (Bus, BusReceivers) {
         let (workspace_tx, workspace_rx) = mpsc::unbounded_channel();
-        let (title_tx, title_rx) = mpsc::unbounded_channel();
         let (clients_tx, clients_rx) = mpsc::unbounded_channel();
         let (battery_tx, battery_rx) = mpsc::unbounded_channel();
         let (bluetooth_tx, bluetooth_rx) = mpsc::unbounded_channel();
@@ -95,7 +86,6 @@ impl Bus {
         (
             Bus {
                 workspace: workspace_tx,
-                title: title_tx,
                 clients: clients_tx,
                 battery: battery_tx,
                 bluetooth: bluetooth_tx,
@@ -103,7 +93,6 @@ impl Bus {
             },
             BusReceivers {
                 workspace: workspace_rx,
-                title: title_rx,
                 clients: clients_rx,
                 battery: battery_rx,
                 bluetooth: bluetooth_rx,
@@ -121,12 +110,6 @@ impl Bus {
         self.workspace
             .send(update)
             .context("Failed to send workspace update")
-    }
-
-    pub fn send_title_update(&self, update: TitleUpdate) -> Result<()> {
-        self.title
-            .send(update)
-            .context("Failed to send title update")
     }
 
     pub fn send_clients_update(&self, update: WorkspaceClientsUpdate) -> Result<()> {
@@ -177,18 +160,6 @@ mod tests {
     }
 
     #[test]
-    fn title_update_round_trips() {
-        let (bus, mut rx) = Bus::new();
-        let update = TitleUpdate {
-            title: "hello".to_string(),
-            class: "kitty".to_string(),
-        };
-        bus.send_title_update(update.clone())
-            .expect("send_title_update should succeed");
-        assert_eq!(rx.title.try_recv().expect("title message"), update);
-    }
-
-    #[test]
     fn workspace_clients_update_round_trips() {
         let (bus, mut rx) = Bus::new();
         let update = WorkspaceClientsUpdate {
@@ -232,15 +203,13 @@ mod tests {
     fn send_into_closed_channel_reports_layered_context() {
         let (bus, rx) = Bus::new();
         drop(rx);
+        let update = WorkspaceClientsUpdate::default();
         let err = bus
-            .send_title_update(TitleUpdate {
-                title: "x".to_string(),
-                class: "example".to_string(),
-            })
+            .send_clients_update(update)
             .expect_err("send into closed channel must fail");
         let chain = format!("{:#}", err);
         assert!(
-            chain.contains("Failed to send title update"),
+            chain.contains("Failed to send workspace clients update"),
             "outer context missing: {}",
             chain
         );

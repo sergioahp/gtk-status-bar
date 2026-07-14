@@ -162,7 +162,6 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
         battery_widget,
         time_widget,
         workspace_widget,
-        title_widget,
         client_strip,
     ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
@@ -174,8 +173,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
 
     widgets::update_time_widget(time_widget);
     widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget, &window);
-    widgets::setup_workspace_updates(receivers.workspace, workspace_widget, title_widget.clone());
-    widgets::setup_title_updates(receivers.title, title_widget);
+    widgets::setup_workspace_updates(receivers.workspace, workspace_widget);
     widgets::setup_client_updates(receivers.clients, client_strip);
     widgets::setup_battery_updates(receivers.battery, battery_widget);
     widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
@@ -186,7 +184,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
     // D-Bus monitor serves both battery and bluetooth, while the tray also has
     // a UI-to-backend command channel; both still obey the same ordering.
     tokio::spawn(hypr::run_workspace_listener_supervised(bus.clone()));
-    tokio::spawn(hypr::run_title_listener_supervised(bus.clone()));
+    tokio::spawn(hypr::run_client_listener_supervised(bus.clone()));
     tokio::spawn(dbus::run_dbus_monitor_supervised(bus.clone()));
     tokio::spawn(network::run_network_monitor_supervised(
         bus,

@@ -25,9 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
-use crate::bus::{
-    TitleUpdate, VolumeUpdate, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate,
-};
+use crate::bus::{VolumeUpdate, WorkspaceClient, WorkspaceClientsUpdate, WorkspaceUpdate};
 use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
@@ -52,16 +50,10 @@ pub fn create_volume_widget() -> gtk4::Label {
 }
 
 #[derive(Clone)]
-pub struct TitleWidget {
-    root: gtk4::CenterBox,
-    icon: gtk4::Image,
-    label: gtk4::Label,
-}
-
-#[derive(Clone)]
 pub struct ClientStrip {
     root: gtk4::ScrolledWindow,
-    list: gtk4::Box,
+    grid: gtk4::Grid,
+    slots: Rc<Cell<i32>>,
 }
 
 #[derive(Clone)]
@@ -73,20 +65,20 @@ struct ClientPill {
 }
 
 const CLIENT_PILL_TITLE_CHARS: i32 = 10;
+const CLIENT_PILL_PREFERRED_SLOT_WIDTH: i32 = 144;
 
 pub fn create_client_strip() -> ClientStrip {
     debug!("Creating workspace client strip");
 
-    let list = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    list.add_css_class("client-strip");
-    list.set_homogeneous(true);
-    list.set_hexpand(true);
-    list.set_halign(gtk4::Align::Fill);
-    list.set_valign(gtk4::Align::Start);
+    let grid = gtk4::Grid::new();
+    grid.add_css_class("client-strip");
+    grid.set_column_homogeneous(true);
+    grid.set_halign(gtk4::Align::Center);
+    grid.set_valign(gtk4::Align::Start);
 
-    // The viewport, rather than its potentially very wide child, participates
-    // in the bar's size negotiation. The homogeneous child box fills this
-    // viewport and divides it equally without displacing the centered title.
+    // Keep the centered pill block from contributing a minimum width to the
+    // two-group bar. If the right group grows, this viewport yields space and
+    // the grid is repartitioned on the next frame.
     let root = gtk4::ScrolledWindow::new();
     root.add_css_class("client-strip-viewport");
     root.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
@@ -94,10 +86,36 @@ pub fn create_client_strip() -> ClientStrip {
     root.set_hexpand(true);
     root.set_halign(gtk4::Align::Fill);
     root.set_valign(gtk4::Align::Start);
+    root.set_overflow(gtk4::Overflow::Hidden);
     root.set_visible(false);
-    root.set_child(Some(&list));
+    root.set_child(Some(&grid));
 
-    ClientStrip { root, list }
+    let slots = Rc::new(Cell::new(0));
+    let strip = ClientStrip { root, grid, slots };
+    let strip_for_tick = strip.clone();
+    strip.root.add_tick_callback(move |_root, _clock| {
+        resize_client_strip(&strip_for_tick);
+        glib::ControlFlow::Continue
+    });
+
+    strip
+}
+
+fn client_strip_target_width(available: i32, slots: i32) -> i32 {
+    available
+        .max(0)
+        .min(slots.max(0) * CLIENT_PILL_PREFERRED_SLOT_WIDTH)
+}
+
+fn client_pill_column_span(active: bool) -> i32 {
+    if active { 2 } else { 1 }
+}
+
+fn resize_client_strip(strip: &ClientStrip) {
+    let target = client_strip_target_width(strip.root.width(), strip.slots.get());
+    if strip.grid.width_request() != target {
+        strip.grid.set_width_request(target);
+    }
 }
 
 fn create_client_pill() -> ClientPill {
@@ -114,7 +132,8 @@ fn create_client_pill() -> ClientPill {
     root.set_overflow(gtk4::Overflow::Hidden);
 
     let content = gtk4::CenterBox::new();
-    content.set_halign(gtk4::Align::Start);
+    content.set_hexpand(true);
+    content.set_halign(gtk4::Align::Fill);
 
     let icon = gtk4::Image::new();
     icon.add_css_class("title-icon");
@@ -124,7 +143,7 @@ fn create_client_pill() -> ClientPill {
     let label = gtk4::Label::new(None);
     label.add_css_class("title-label");
     label.set_valign(gtk4::Align::Center);
-    label.set_xalign(0.0);
+    label.set_xalign(0.5);
     label.set_single_line_mode(true);
     // The producer hard-truncates at this same character count. Keeping Pango
     // ellipsizing disabled avoids spending any of the small slot on an ellipsis.
@@ -140,39 +159,6 @@ fn create_client_pill() -> ClientPill {
         label,
         class: None,
     }
-}
-
-pub fn create_title_widget() -> TitleWidget {
-    debug!("Creating title widget");
-
-    let root = gtk4::CenterBox::new();
-    root.add_css_class("title-widget");
-    root.set_halign(gtk4::Align::End);
-    root.set_valign(gtk4::Align::Start);
-
-    let icon = gtk4::Image::new();
-    icon.add_css_class("title-icon");
-    icon.set_valign(gtk4::Align::Center);
-    icon.set_visible(false);
-    root.set_start_widget(Some(&icon));
-
-    let label = gtk4::Label::new(Some("Application Title"));
-    label.add_css_class("title-label");
-    label.set_valign(gtk4::Align::Center);
-    // The producer already crops long titles by character count, but wide
-    // glyphs can still exceed the remaining monitor width when right-side
-    // pills are added. Ellipsizing gives GTK permission to shrink the label's
-    // minimum width instead of expanding the layer surface past the output.
-    label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-    label.set_single_line_mode(true);
-    // Label is the CenterBox's own center widget (icon is the start widget)
-    // so GtkCenterLayout keeps the title text truly centered in the pill
-    // regardless of whether the icon is showing — packing both into one
-    // "center" child instead visually centers the icon+label group, which
-    // pulls short titles off-center once an icon appears.
-    root.set_center_widget(Some(&label));
-
-    TitleWidget { root, icon, label }
 }
 
 pub fn create_time_widget() -> gtk4::Label {
@@ -243,7 +229,8 @@ pub fn create_left_group() -> (gtk4::Box, ClientStrip) {
     let left_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_container.add_css_class("left-container");
     left_container.set_valign(gtk4::Align::Start);
-    left_container.set_halign(gtk4::Align::Start);
+    left_container.set_hexpand(true);
+    left_container.set_halign(gtk4::Align::Fill);
 
     let left_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
@@ -317,7 +304,7 @@ pub fn create_right_group() -> (
 }
 
 pub fn create_experimental_bar() -> (
-    gtk4::Overlay,
+    gtk4::Box,
     gtk4::Box,
     gtk4::Label,
     gtk4::Label,
@@ -325,21 +312,15 @@ pub fn create_experimental_bar() -> (
     gtk4::Label,
     gtk4::Label,
     gtk4::Label,
-    TitleWidget,
     ClientStrip,
 ) {
     debug!("Creating experimental bar");
 
-    let bar = gtk4::Overlay::new();
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.set_hexpand(true);
     bar.set_valign(gtk4::Align::Start);
 
-    let main_box = gtk4::CenterBox::new();
-    main_box.set_hexpand(true);
-    main_box.set_valign(gtk4::Align::Start);
-
     let (left_group, client_strip) = create_left_group();
-    let title_widget = create_title_widget();
     let (
         right_group,
         tray_widget,
@@ -351,52 +332,20 @@ pub fn create_experimental_bar() -> (
         workspace_widget,
     ) = create_right_group();
 
-    // Keep the title as the sole participant in GtkCenterLayout. Edge groups
-    // are overlays, so neither can shift it when their contents change width.
-    title_widget.root.set_halign(gtk4::Align::Center);
-    main_box.set_center_widget(Some(&title_widget.root));
-    bar.set_child(Some(&main_box));
-    bar.add_overlay(&left_group);
-    right_group.set_halign(gtk4::Align::End);
-    bar.add_overlay(&right_group);
-
-    let strip_for_map = client_strip.root.clone();
-    let title_for_map = title_widget.root.clone();
-    bar.connect_map(move |bar| {
-        constrain_client_strip(bar, &strip_for_map, &title_for_map);
-    });
-    let bar_for_title = bar.downgrade();
-    let strip_for_title = client_strip.root.downgrade();
-    let title_for_update = title_widget.root.downgrade();
-    title_widget.label.connect_label_notify(move |_label| {
-        let bar = bar_for_title.clone();
-        let strip = strip_for_title.clone();
-        let title = title_for_update.clone();
-        glib::idle_add_local_once(move || {
-            let (Some(bar), Some(strip), Some(title)) =
-                (bar.upgrade(), strip.upgrade(), title.upgrade())
-            else {
-                return;
-            };
-            constrain_client_strip(&bar, &strip, &title);
-        });
-    });
+    // The expanding left group yields to the natural-width right group. Its
+    // own viewport has a zero minimum, so client content cannot push any right
+    // group item off the output.
+    bar.append(&left_group);
+    bar.append(&right_group);
 
     // Pin the height once the font is resolvable, so dynamic content (title
     // length, tray removal) can't resize the bar and shift windows below it.
     let bar_weak = bar.downgrade();
-    let strip_weak = client_strip.root.downgrade();
-    let title_weak = title_widget.root.downgrade();
     glib::idle_add_local_once(move || {
-        let (Some(bar), Some(strip), Some(title)) = (
-            bar_weak.upgrade(),
-            strip_weak.upgrade(),
-            title_weak.upgrade(),
-        ) else {
+        let Some(bar) = bar_weak.upgrade() else {
             return;
         };
         pin_bar_height_to_font(&bar);
-        constrain_client_strip(&bar, &strip, &title);
     });
 
     (
@@ -408,28 +357,8 @@ pub fn create_experimental_bar() -> (
         battery_widget,
         time_widget,
         workspace_widget,
-        title_widget,
         client_strip,
     )
-}
-
-fn constrain_client_strip(
-    bar: &gtk4::Overlay,
-    strip: &gtk4::ScrolledWindow,
-    title: &gtk4::CenterBox,
-) {
-    // width() reports the current content allocation, while measure() includes
-    // the title pill's CSS padding. Reserve the full natural width so a strip
-    // that fills its allocation cannot paint over the centered title edges.
-    let (_minimum, natural, _minimum_baseline, _natural_baseline) =
-        title.measure(gtk4::Orientation::Horizontal, -1);
-    let title_width = title.width().max(natural);
-    let available = ((bar.width() - title_width) / 2).max(0);
-    strip.set_min_content_width(-1);
-    strip.set_max_content_width(-1);
-    strip.set_max_content_width(available);
-    strip.set_min_content_width(available);
-    strip.set_propagate_natural_width(true);
 }
 
 // Multiplier applied to the measured tall-character height when pinning the bar
@@ -445,7 +374,7 @@ const BAR_HEIGHT_CHAR_MULTIPLIER: f64 = 1.4;
 // move every window below the bar. We measure on the realized widget so the
 // font (and thus its metrics) is actually resolvable, mirroring how the tray
 // sizes its icon to a tall glyph rather than a fixed pixel count.
-fn pin_bar_height_to_font(bar: &gtk4::Overlay) {
+fn pin_bar_height_to_font(bar: &gtk4::Box) {
     let ctx = bar.pango_context();
     let layout = gtk4::pango::Layout::new(&ctx);
     if let Some(font) = ctx.font_description() {
@@ -2304,87 +2233,27 @@ pub fn configure_layer_shell(
     Ok(())
 }
 
-fn update_title_widget_workspace_color(
-    title_widget: &TitleWidget,
-    workspace_id: hyprland::shared::WorkspaceId,
-) {
-    // Get workspace color based on ID
-    let color = get_workspace_color(workspace_id);
-
-    // Apply color directly via CSS provider for immediate update
-    let css_provider = gtk4::CssProvider::new();
-    let css = format!(".title-widget {{ background-color: {}; }}", color);
-
-    css_provider.load_from_data(&css);
-
-    let style_context = title_widget.root.style_context();
-    style_context.add_provider(&css_provider, gtk4::STYLE_PROVIDER_PRIORITY_USER + 1);
-
-    debug!(
-        "Updated title widget color to: {} for workspace: {}",
-        color, workspace_id
-    );
-}
-
-fn get_workspace_color(workspace_id: hyprland::shared::WorkspaceId) -> &'static str {
-    match workspace_id {
-        1 => "rgba(122, 162, 247, 0.5)",
-        2 => "rgba(125, 207, 255, 0.5)",
-        3 => "rgba(158, 206, 106, 0.5)",
-        4 => "rgba(187, 154, 247, 0.5)",
-        5 => "rgba(247, 118, 142, 0.5)",
-        6 => "rgba(255, 158, 102, 0.5)",
-        7 => "rgba(157, 124, 216, 0.5)",
-        8 => "rgba(224, 175, 104, 0.5)",
-        9 => "rgba(42, 195, 222, 0.5)",
-        10 => "rgba(13, 185, 215, 0.5)",
-        _ => "rgba(67, 233, 123, 0.5)", // Default color
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Workspaces 1..=10 have explicit color entries; everything else hits the
-    // default arm. Tests pin the boundaries — a typo in the match arms
-    // (e.g. duplicate id, wrong default fallthrough) would flip these.
     #[test]
-    fn workspace_color_1_is_blue_ish() {
-        assert_eq!(get_workspace_color(1), "rgba(122, 162, 247, 0.5)");
+    fn inactive_client_uses_one_column_and_active_uses_two() {
+        assert_eq!(client_pill_column_span(false), 1);
+        assert_eq!(client_pill_column_span(true), 2);
     }
 
     #[test]
-    fn workspace_color_10_is_last_explicit() {
-        assert_eq!(get_workspace_color(10), "rgba(13, 185, 215, 0.5)");
+    fn sparse_client_blocks_keep_transparent_side_space() {
+        assert_eq!(client_strip_target_width(1200, 2), 288);
+        assert_eq!(client_strip_target_width(1200, 3), 432);
     }
 
     #[test]
-    fn workspace_color_11_falls_through_to_default() {
-        let default = "rgba(67, 233, 123, 0.5)";
-        assert_eq!(get_workspace_color(11), default);
-        assert_eq!(get_workspace_color(100), default);
-    }
-
-    // Hyprland uses negative workspace IDs for special workspaces; verify we
-    // don't accidentally match a positive arm and that we hit the default.
-    #[test]
-    fn workspace_color_negative_id_falls_through_to_default() {
-        let default = "rgba(67, 233, 123, 0.5)";
-        assert_eq!(get_workspace_color(-1), default);
-        assert_eq!(get_workspace_color(-99), default);
-    }
-
-    // Every explicit arm returns a different color — if a regression turns
-    // two of them into the same rgba, this catches it.
-    #[test]
-    fn workspace_colors_are_all_distinct() {
-        let mut colors: Vec<&str> = (1..=10).map(get_workspace_color).collect();
-        colors.push(get_workspace_color(0)); // default
-        colors.sort();
-        let len_before = colors.len();
-        colors.dedup();
-        assert_eq!(colors.len(), len_before, "expected all distinct colors");
+    fn crowded_client_blocks_use_all_available_space() {
+        assert_eq!(client_strip_target_width(1200, 10), 1200);
+        assert_eq!(client_strip_target_width(0, 10), 0);
+        assert_eq!(client_strip_target_width(1200, 0), 0);
     }
 
     #[test]
@@ -2426,7 +2295,6 @@ mod tests {
 pub fn setup_workspace_updates(
     mut rx: mpsc::UnboundedReceiver<WorkspaceUpdate>,
     label: gtk4::Label,
-    title_widget: TitleWidget,
 ) {
     debug!("Setting up workspace updates");
 
@@ -2434,12 +2302,10 @@ pub fn setup_workspace_updates(
     glib::spawn_future_local(async move {
         while let Some(update) = rx.recv().await {
             debug!(
-                "Updating workspace - label: '{}', color for workspace: {}",
+                "Updating workspace - label: '{}', workspace: {}",
                 update.name, update.id
             );
-            // Update both workspace text and title color atomically
             label.set_text(&update.name);
-            update_title_widget_workspace_color(&title_widget, update.id);
         }
     });
 }
@@ -2534,6 +2400,11 @@ fn update_client_icon(image: &gtk4::Image, class: &str) {
 fn update_client_pill(pill: &mut ClientPill, client: &WorkspaceClient) {
     pill.label.set_text(&client.compact_title);
     pill.root.set_tooltip_text(Some(&client.title));
+    if client.active {
+        pill.root.add_css_class("client-pill-active");
+    } else {
+        pill.root.remove_css_class("client-pill-active");
+    }
 
     if pill.class.as_deref() != Some(client.class.as_str()) {
         update_client_icon(&pill.icon, &client.class);
@@ -2550,54 +2421,41 @@ pub fn setup_client_updates(
     glib::spawn_future_local(async move {
         let mut pills = HashMap::new();
         while let Some(update) = rx.recv().await {
-            while let Some(child) = client_strip.list.first_child() {
-                client_strip.list.remove(&child);
+            while let Some(child) = client_strip.grid.first_child() {
+                client_strip.grid.remove(&child);
             }
 
+            let slots = update
+                .clients
+                .iter()
+                .map(|client| client_pill_column_span(client.active))
+                .sum();
+            client_strip.slots.set(slots);
+
+            let mut column = 0;
             let mut next_pills = HashMap::with_capacity(update.clients.len());
-            for client in update.clients.into_iter().filter(|client| !client.active) {
+            for client in update.clients {
                 debug!(
                     workspace_id = update.workspace_id,
                     address = %client.address,
                     title = client.title,
                     compact_title = client.compact_title,
                     class = client.class,
-                    "Updating equal-share client pill"
+                    active = client.active,
+                    "Updating weighted client pill"
                 );
                 let mut pill = pills
                     .remove(&client.address)
                     .unwrap_or_else(create_client_pill);
                 update_client_pill(&mut pill, &client);
-                client_strip.list.append(&pill.root);
+                let span = client_pill_column_span(client.active);
+                client_strip.grid.attach(&pill.root, column, 0, span, 1);
+                column += span;
                 next_pills.insert(client.address, pill);
             }
             client_strip.root.set_visible(!next_pills.is_empty());
+            resize_client_strip(&client_strip);
             pills = next_pills;
-        }
-    });
-}
-
-pub fn setup_title_updates(
-    mut rx: mpsc::UnboundedReceiver<TitleUpdate>,
-    title_widget: TitleWidget,
-) {
-    debug!("Setting up title updates");
-
-    glib::spawn_future_local(async move {
-        let mut current_class = String::new();
-        while let Some(update) = rx.recv().await {
-            debug!(
-                title = update.title,
-                class = update.class,
-                "Updating title widget"
-            );
-            // NOTE: Title widget always remains visible even when empty, unlike battery/bluetooth widgets.
-            // This provides consistent visual layout and shows the centered position in the bar.
-            title_widget.label.set_text(&update.title);
-            if update.class != current_class {
-                update_title_icon(&title_widget.icon, &update.class);
-                current_class = update.class;
-            }
         }
     });
 }

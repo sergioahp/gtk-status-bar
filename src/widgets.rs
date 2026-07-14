@@ -416,8 +416,10 @@ fn constrain_client_strip(
     title: &gtk4::CenterBox,
 ) {
     let available = ((bar.width() - title.width()) / 2).max(0);
-    strip.set_min_content_width(available);
+    strip.set_min_content_width(-1);
+    strip.set_max_content_width(-1);
     strip.set_max_content_width(available);
+    strip.set_min_content_width(available);
     strip.set_propagate_natural_width(true);
 }
 

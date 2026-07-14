@@ -66,13 +66,14 @@ pub struct ClientStrip {
 
 #[derive(Clone)]
 struct ClientPill {
-    root: gtk4::CenterBox,
+    root: gtk4::ScrolledWindow,
     icon: gtk4::Image,
     label: gtk4::Label,
     class: Option<String>,
 }
 
 const CLIENT_PILL_TITLE_CHARS: i32 = 10;
+const CLIENT_PILL_WIDTH: i32 = 132;
 
 pub fn create_client_strip() -> ClientStrip {
     debug!("Creating workspace client strip");
@@ -99,16 +100,23 @@ pub fn create_client_strip() -> ClientStrip {
 }
 
 fn create_client_pill() -> ClientPill {
-    let root = gtk4::CenterBox::new();
+    let root = gtk4::ScrolledWindow::new();
     root.add_css_class("client-pill");
+    root.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+    root.set_min_content_width(CLIENT_PILL_WIDTH);
+    root.set_max_content_width(CLIENT_PILL_WIDTH);
+    root.set_propagate_natural_width(true);
     root.set_halign(gtk4::Align::Start);
     root.set_valign(gtk4::Align::Start);
     root.set_overflow(gtk4::Overflow::Hidden);
 
+    let content = gtk4::CenterBox::new();
+    content.set_halign(gtk4::Align::Start);
+
     let icon = gtk4::Image::new();
     icon.add_css_class("title-icon");
     icon.set_valign(gtk4::Align::Center);
-    root.set_start_widget(Some(&icon));
+    content.set_start_widget(Some(&icon));
 
     let label = gtk4::Label::new(None);
     label.add_css_class("title-label");
@@ -120,7 +128,8 @@ fn create_client_pill() -> ClientPill {
     label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
     label.set_width_chars(CLIENT_PILL_TITLE_CHARS);
     label.set_max_width_chars(CLIENT_PILL_TITLE_CHARS);
-    root.set_center_widget(Some(&label));
+    content.set_center_widget(Some(&label));
+    root.set_child(Some(&content));
 
     ClientPill {
         root,
@@ -231,7 +240,7 @@ pub fn create_left_group() -> (gtk4::Box, ClientStrip) {
     let left_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_container.add_css_class("left-container");
     left_container.set_valign(gtk4::Align::Start);
-    left_container.set_halign(gtk4::Align::Start);
+    left_container.set_hexpand(true);
 
     let left_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     left_group.add_css_class("left-group");
@@ -305,7 +314,7 @@ pub fn create_right_group() -> (
 }
 
 pub fn create_experimental_bar() -> (
-    gtk4::Overlay,
+    gtk4::CenterBox,
     gtk4::Box,
     gtk4::Label,
     gtk4::Label,
@@ -317,10 +326,6 @@ pub fn create_experimental_bar() -> (
     ClientStrip,
 ) {
     debug!("Creating experimental bar");
-
-    let bar = gtk4::Overlay::new();
-    bar.set_hexpand(true);
-    bar.set_valign(gtk4::Align::Start);
 
     let main_box = gtk4::CenterBox::new();
     main_box.set_hexpand(true);
@@ -339,63 +344,23 @@ pub fn create_experimental_bar() -> (
         workspace_widget,
     ) = create_right_group();
 
-    // Keep the title as the sole participant in GtkCenterLayout. Both edge
-    // groups are overlays so neither can shift the monitor-centered title as
-    // its client list, tray, or status labels change width.
-    // create_title_widget uses End when packed beside edge groups. With the
-    // title now alone in this full-width center slot, center its outer
-    // allocation explicitly while leaving the widget's internal layout intact.
-    title_widget.root.set_halign(gtk4::Align::Center);
+    // GtkCenterLayout keeps the title at the monitor midpoint and allocates
+    // the client-strip viewport only the start-side space that remains.
+    main_box.set_start_widget(Some(&left_group));
     main_box.set_center_widget(Some(&title_widget.root));
-    bar.set_child(Some(&main_box));
-    bar.add_overlay(&left_group);
-    right_group.set_halign(gtk4::Align::End);
-    bar.add_overlay(&right_group);
-
-    // The left strip is an overlay so its natural width never participates in
-    // GtkCenterLayout's title placement. Bound it to the pixels before the
-    // centered title, updating the viewport when either allocation changes.
-    let left_group_for_map = left_group.clone();
-    let title_for_map = title_widget.root.clone();
-    bar.connect_map(move |bar| {
-        constrain_client_strip(bar, &left_group_for_map, &title_for_map);
-    });
-    let bar_for_title = bar.downgrade();
-    let left_group_for_title = left_group.downgrade();
-    let title_for_update = title_widget.root.downgrade();
-    title_widget.label.connect_label_notify(move |_label| {
-        let bar = bar_for_title.clone();
-        let left_group = left_group_for_title.clone();
-        let title = title_for_update.clone();
-        glib::idle_add_local_once(move || {
-            let (Some(bar), Some(left_group), Some(title)) =
-                (bar.upgrade(), left_group.upgrade(), title.upgrade())
-            else {
-                return;
-            };
-            constrain_client_strip(&bar, &left_group, &title);
-        });
-    });
+    main_box.set_end_widget(Some(&right_group));
 
     // Pin the height once the font is resolvable, so dynamic content (title
     // length, tray removal) can't resize the bar and shift windows below it.
-    let bar_weak = bar.downgrade();
-    let left_group_weak = left_group.downgrade();
-    let title_weak = title_widget.root.downgrade();
+    let bar_weak = main_box.downgrade();
     glib::idle_add_local_once(move || {
-        let (Some(bar), Some(left_group), Some(title)) = (
-            bar_weak.upgrade(),
-            left_group_weak.upgrade(),
-            title_weak.upgrade(),
-        ) else {
-            return;
-        };
-        pin_bar_height_to_font(&bar);
-        constrain_client_strip(&bar, &left_group, &title);
+        if let Some(bar) = bar_weak.upgrade() {
+            pin_bar_height_to_font(&bar);
+        }
     });
 
     (
-        bar,
+        main_box,
         tray_widget,
         bt_widget,
         volume_widget,
@@ -406,11 +371,6 @@ pub fn create_experimental_bar() -> (
         title_widget,
         client_strip,
     )
-}
-
-fn constrain_client_strip(bar: &gtk4::Overlay, left_group: &gtk4::Box, title: &gtk4::CenterBox) {
-    let available = ((bar.width() - title.width()) / 2).max(0);
-    left_group.set_size_request(available, -1);
 }
 
 // Multiplier applied to the measured tall-character height when pinning the bar
@@ -426,7 +386,7 @@ const BAR_HEIGHT_CHAR_MULTIPLIER: f64 = 1.4;
 // move every window below the bar. We measure on the realized widget so the
 // font (and thus its metrics) is actually resolvable, mirroring how the tray
 // sizes its icon to a tall glyph rather than a fixed pixel count.
-fn pin_bar_height_to_font(bar: &gtk4::Overlay) {
+fn pin_bar_height_to_font(bar: &gtk4::CenterBox) {
     let ctx = bar.pango_context();
     let layout = gtk4::pango::Layout::new(&ctx);
     if let Some(font) = ctx.font_description() {

@@ -342,6 +342,10 @@ pub fn create_experimental_bar() -> (
     // Keep the title as the sole participant in GtkCenterLayout. Both edge
     // groups are overlays so neither can shift the monitor-centered title as
     // its client list, tray, or status labels change width.
+    // create_title_widget uses End when packed beside edge groups. With the
+    // title now alone in this full-width center slot, center its outer
+    // allocation explicitly while leaving the widget's internal layout intact.
+    title_widget.root.set_halign(gtk4::Align::Center);
     main_box.set_center_widget(Some(&title_widget.root));
     bar.set_child(Some(&main_box));
     bar.add_overlay(&left_group);

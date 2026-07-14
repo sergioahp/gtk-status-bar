@@ -418,7 +418,13 @@ fn constrain_client_strip(
     strip: &gtk4::ScrolledWindow,
     title: &gtk4::CenterBox,
 ) {
-    let available = ((bar.width() - title.width()) / 2).max(0);
+    // width() reports the current content allocation, while measure() includes
+    // the title pill's CSS padding. Reserve the full natural width so a strip
+    // that fills its allocation cannot paint over the centered title edges.
+    let (_minimum, natural, _minimum_baseline, _natural_baseline) =
+        title.measure(gtk4::Orientation::Horizontal, -1);
+    let title_width = title.width().max(natural);
+    let available = ((bar.width() - title_width) / 2).max(0);
     strip.set_min_content_width(-1);
     strip.set_max_content_width(-1);
     strip.set_max_content_width(available);

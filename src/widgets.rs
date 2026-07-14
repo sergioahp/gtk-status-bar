@@ -339,13 +339,14 @@ pub fn create_experimental_bar() -> (
         workspace_widget,
     ) = create_right_group();
 
-    // GtkCenterLayout keeps the title at the monitor midpoint independently
-    // of the side groups' widths. Equal expanding spacers cannot guarantee
-    // that once the dynamic right group grows wider than its 20em container.
+    // Keep the title as the sole participant in GtkCenterLayout. Both edge
+    // groups are overlays so neither can shift the monitor-centered title as
+    // its client list, tray, or status labels change width.
     main_box.set_center_widget(Some(&title_widget.root));
-    main_box.set_end_widget(Some(&right_group));
     bar.set_child(Some(&main_box));
     bar.add_overlay(&left_group);
+    right_group.set_halign(gtk4::Align::End);
+    bar.add_overlay(&right_group);
 
     // The left strip is an overlay so its natural width never participates in
     // GtkCenterLayout's title placement. Bound it to the pixels before the

@@ -73,19 +73,20 @@ struct ClientPill {
 }
 
 const CLIENT_PILL_TITLE_CHARS: i32 = 10;
-const CLIENT_PILL_WIDTH: i32 = 132;
 
 pub fn create_client_strip() -> ClientStrip {
     debug!("Creating workspace client strip");
 
     let list = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     list.add_css_class("client-strip");
-    list.set_halign(gtk4::Align::Start);
+    list.set_homogeneous(true);
+    list.set_hexpand(true);
+    list.set_halign(gtk4::Align::Fill);
     list.set_valign(gtk4::Align::Start);
 
     // The viewport, rather than its potentially very wide child, participates
-    // in the bar's size negotiation. Extra pills are clipped at the right edge
-    // of the left allocation and cannot displace the centered title.
+    // in the bar's size negotiation. The homogeneous child box fills this
+    // viewport and divides it equally without displacing the centered title.
     let root = gtk4::ScrolledWindow::new();
     root.add_css_class("client-strip-viewport");
     root.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
@@ -103,10 +104,12 @@ fn create_client_pill() -> ClientPill {
     let root = gtk4::ScrolledWindow::new();
     root.add_css_class("client-pill");
     root.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
-    root.set_min_content_width(CLIENT_PILL_WIDTH);
-    root.set_max_content_width(CLIENT_PILL_WIDTH);
-    root.set_propagate_natural_width(true);
-    root.set_halign(gtk4::Align::Start);
+    // GtkBox divides the strip equally between these zero-minimum viewports.
+    // Their content can be wider, but cannot influence the allocated share.
+    root.set_min_content_width(0);
+    root.set_propagate_natural_width(false);
+    root.set_hexpand(true);
+    root.set_halign(gtk4::Align::Fill);
     root.set_valign(gtk4::Align::Start);
     root.set_overflow(gtk4::Overflow::Hidden);
 
@@ -2553,7 +2556,7 @@ pub fn setup_client_updates(
                     title = client.title,
                     compact_title = client.compact_title,
                     class = client.class,
-                    "Updating fixed-size client pill"
+                    "Updating equal-share client pill"
                 );
                 let mut pill = pills
                     .remove(&client.address)

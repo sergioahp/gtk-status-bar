@@ -66,6 +66,7 @@ struct ClientPill {
 
 const CLIENT_PILL_TITLE_CHARS: i32 = 10;
 const CLIENT_PILL_PREFERRED_SLOT_WIDTH: i32 = 144;
+const RIGHT_GROUP_RESERVED_PERCENT: i32 = 42;
 
 pub fn create_client_strip() -> ClientStrip {
     debug!("Creating workspace client strip");
@@ -109,6 +110,11 @@ fn client_strip_target_width(available: i32, slots: i32) -> i32 {
 
 fn client_pill_column_span(active: bool) -> i32 {
     if active { 2 } else { 1 }
+}
+
+fn right_group_reserved_width(bar_width: i32) -> i32 {
+    let width = i64::from(bar_width.max(0));
+    (width * i64::from(RIGHT_GROUP_RESERVED_PERCENT) / 100) as i32
 }
 
 fn resize_client_strip(strip: &ClientStrip) {
@@ -337,6 +343,15 @@ pub fn create_experimental_bar() -> (
     // group item off the output.
     bar.append(&left_group);
     bar.append(&right_group);
+
+    // The right spacer absorbs routine content growth inside a stable reserve.
+    // Only content wider than this budget can reduce the left allocation.
+    let right_group_for_map = right_group.clone();
+    bar.connect_map(move |bar| {
+        let reserved = right_group_reserved_width(bar.width());
+        right_group_for_map.set_width_request(reserved);
+        debug!(reserved, "Reserved stable width for right group");
+    });
 
     // Pin the height once the font is resolvable, so dynamic content (title
     // length, tray removal) can't resize the bar and shift windows below it.
@@ -2254,6 +2269,14 @@ mod tests {
         assert_eq!(client_strip_target_width(1200, 10), 1200);
         assert_eq!(client_strip_target_width(0, 10), 0);
         assert_eq!(client_strip_target_width(1200, 0), 0);
+    }
+
+    #[test]
+    fn right_group_reserves_stable_output_fraction() {
+        assert_eq!(right_group_reserved_width(1920), 806);
+        assert_eq!(right_group_reserved_width(1366), 573);
+        assert_eq!(right_group_reserved_width(0), 0);
+        assert_eq!(right_group_reserved_width(-1), 0);
     }
 
     #[test]

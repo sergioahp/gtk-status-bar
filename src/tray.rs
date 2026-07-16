@@ -43,6 +43,11 @@ pub struct TrayMenuItem {
     pub id: i32,
     pub label: Option<String>,
     pub icon_name: Option<String>,
+    /// Raw bytes of the entry's `icon-data` property (a PNG). Apps that name
+    /// their menu icons with a private theme (KDE/Breeze: `smartphonedisconnected`,
+    /// `battery-060`, `klipper`, …) usually also embed this fallback, which is the
+    /// only thing that resolves when our icon theme lacks those names.
+    pub icon_data: Option<Vec<u8>>,
     pub enabled: bool,
     pub visible: bool,
     pub is_separator: bool,
@@ -742,6 +747,25 @@ fn menu_prop_bool(props: &zvariant::Dict<'_, '_>, key: &str, default: bool) -> b
     }
 }
 
+// dbusmenu `icon-data` is an `ay`; zvariant hands it back as an array of U8
+// values. Collect it into the raw PNG buffer the widget layer decodes.
+fn menu_prop_bytes(props: &zvariant::Dict<'_, '_>, key: &str) -> Option<Vec<u8>> {
+    let zvariant::Value::Array(array) = menu_prop(props, key)? else {
+        return None;
+    };
+    let mut bytes = Vec::with_capacity(array.len());
+    for element in array.iter() {
+        match element {
+            zvariant::Value::U8(byte) => bytes.push(*byte),
+            _ => return None,
+        }
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(bytes)
+}
+
 fn menu_prop_toggle_state(props: &zvariant::Dict<'_, '_>) -> Option<bool> {
     match menu_prop(props, "toggle-state")? {
         zvariant::Value::I32(value) => Some(*value != 0),
@@ -808,6 +832,7 @@ fn parse_menu_node(node: &zvariant::Structure<'_>) -> Option<TrayMenuItem> {
     let is_separator = menu_prop_str(props, "type").as_deref() == Some("separator");
     let label = menu_prop_str(props, "label").map(strip_mnemonic);
     let icon_name = menu_prop_str(props, "icon-name");
+    let icon_data = menu_prop_bytes(props, "icon-data");
     let enabled = menu_prop_bool(props, "enabled", true);
     let visible = menu_prop_bool(props, "visible", true);
     let toggle_type = menu_prop_str(props, "toggle-type");
@@ -828,6 +853,7 @@ fn parse_menu_node(node: &zvariant::Structure<'_>) -> Option<TrayMenuItem> {
         id,
         label,
         icon_name,
+        icon_data,
         enabled,
         visible,
         is_separator,

@@ -144,8 +144,61 @@ async fn run_tray_ipc_supervised(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
     }
 }
 
+// Align GTK's theme preference with the desktop color scheme before any widget
+// realizes, so our symbolic icons and theme-based icon lookups resolve their
+// dark-mode variants. The bar's CSS is always dark, so when no preference is
+// exposed (e.g. a session without a color-scheme portal) we default to dark
+// rather than leaving GTK on its light default.
+fn configure_color_scheme() {
+    let prefer_dark = detect_prefer_dark().unwrap_or_else(|| {
+        debug!("No desktop color-scheme preference available; defaulting the bar to dark");
+        true
+    });
+    let Some(settings) = gtk4::Settings::default() else {
+        warn!("No default GtkSettings; cannot apply color-scheme preference");
+        return;
+    };
+    settings.set_gtk_application_prefer_dark_theme(prefer_dark);
+    info!(
+        prefer_dark,
+        "Applied color-scheme preference to GTK settings"
+    );
+}
+
+// Read `org.freedesktop.appearance color-scheme` from the settings portal:
+// 1 = prefer dark, 2 = prefer light, 0 = no preference. Returns None when the
+// portal or the setting is unavailable, letting the caller pick a default.
+fn detect_prefer_dark() -> Option<bool> {
+    use zbus::blocking::Connection;
+
+    let connection = Connection::session().ok()?;
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.Settings"),
+            "Read",
+            &("org.freedesktop.appearance", "color-scheme"),
+        )
+        .ok()?;
+    // The reply is a `v` whose payload is a `u`; zbus can hand it back
+    // double-wrapped, so peel variant layers until the integer surfaces.
+    let body = reply.body();
+    let mut value: zvariant::Value = body.deserialize().ok()?;
+    while let zvariant::Value::Value(inner) = value {
+        value = *inner;
+    }
+    match u32::try_from(value).ok()? {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
 fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()> {
     info!("Activating GTK application");
+
+    configure_color_scheme();
 
     let window = gtk4::ApplicationWindow::new(application);
     window.add_css_class("layer-bar");

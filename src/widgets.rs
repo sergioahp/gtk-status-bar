@@ -2221,6 +2221,118 @@ fn show_tray_menu(
 // submenus (whose own activation bubbles up to the same popover). Every popover
 // built here is also pushed into `popovers` so the caller can unparent the full
 // set when the menu goes away.
+// Matches the `.tray-menu` foreground in style.css. Monochrome menu icons are
+// repainted to it (see recolored_if_dark) so KDE's dark Breeze glyphs stay
+// legible against the dark popover instead of vanishing into it.
+const MENU_ICON_FG: (u8, u8, u8) = (0xc0, 0xca, 0xf5);
+const MENU_ICON_SIZE: i32 = 16;
+
+// dbusmenu entries carry a themed `icon-name` and often an embedded `icon-data`
+// PNG. A named icon is only usable when our icon theme actually has it: KDE apps
+// name menu icons with the Breeze theme (`smartphonedisconnected`, `battery-060`,
+// `klipper`, …), which resolve to nothing under Adwaita, and handing those
+// straight to Image::from_icon_name paints GTK's broken "image-missing" glyph.
+// So prefer a resolvable named icon, fall back to the embedded PNG, and render
+// no icon at all when neither is drawable.
+fn menu_icon_image(reference: &gtk4::Box, item: &TrayMenuItem) -> Option<gtk4::Image> {
+    let icon_theme = gtk4::IconTheme::for_display(&reference.display());
+    if let Some(name) = item.icon_name.as_deref().filter(|name| !name.is_empty()) {
+        if icon_theme.has_icon(name)
+            && named_icon_render_error(&icon_theme, name, MENU_ICON_SIZE, reference.scale_factor())
+                .is_none()
+        {
+            return Some(gtk4::Image::from_icon_name(name));
+        }
+    }
+
+    let texture = decode_menu_icon_data(item.icon_data.as_deref()?)?;
+    let image = gtk4::Image::new();
+    image.set_paintable(Some(&texture));
+    Some(image)
+}
+
+fn decode_menu_icon_data(data: &[u8]) -> Option<gdk::Texture> {
+    let bytes = glib::Bytes::from(data);
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+    let pixbuf = match gtk4::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+    {
+        Ok(pixbuf) => pixbuf,
+        Err(error) => {
+            debug!(%error, "Could not decode dbusmenu icon-data as an image");
+            return None;
+        }
+    };
+    let pixbuf = recolored_if_dark(&pixbuf).unwrap_or(pixbuf);
+    Some(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+// A menu icon-data PNG that is a monochrome dark mask (KDE renders them in
+// Breeze's near-black "text" color, meant for light panels) is invisible on our
+// dark popover. When every visible pixel is dark, repaint the mask in the menu
+// foreground and keep its alpha so it reads like the rest of the menu. Colourful
+// or already-light icons are left untouched (returns None).
+const MENU_ICON_DARK_LUMA_MAX: u16 = 110;
+const MENU_ICON_ALPHA_FLOOR: u8 = 24;
+
+fn recolored_if_dark(pixbuf: &gtk4::gdk_pixbuf::Pixbuf) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
+    if pixbuf.colorspace() != gtk4::gdk_pixbuf::Colorspace::Rgb
+        || pixbuf.bits_per_sample() != 8
+        || !pixbuf.has_alpha()
+        || pixbuf.n_channels() != 4
+    {
+        return None;
+    }
+    let width = pixbuf.width();
+    let height = pixbuf.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let rowstride = pixbuf.rowstride() as usize;
+    let width_u = width as usize;
+    let height_u = height as usize;
+    let src = pixbuf.read_pixel_bytes();
+
+    // Scan first: only fully dark glyphs are recolored, so a colored icon is
+    // never flattened to a single tint.
+    let mut any_ink = false;
+    for y in 0..height_u {
+        let row = &src[y * rowstride..y * rowstride + width_u * 4];
+        for pixel in row.chunks_exact(4) {
+            if pixel[3] < MENU_ICON_ALPHA_FLOOR {
+                continue;
+            }
+            any_ink = true;
+            let luma = 30 * pixel[0] as u16 + 59 * pixel[1] as u16 + 11 * pixel[2] as u16;
+            if luma / 100 > MENU_ICON_DARK_LUMA_MAX {
+                return None;
+            }
+        }
+    }
+    if !any_ink {
+        return None;
+    }
+
+    let mut recolored = src.to_vec();
+    for y in 0..height_u {
+        let base = y * rowstride;
+        for x in 0..width_u {
+            recolored[base + x * 4] = MENU_ICON_FG.0;
+            recolored[base + x * 4 + 1] = MENU_ICON_FG.1;
+            recolored[base + x * 4 + 2] = MENU_ICON_FG.2;
+            // Alpha (recolored[base + x*4 + 3]) is left as the source mask.
+        }
+    }
+    Some(gtk4::gdk_pixbuf::Pixbuf::from_bytes(
+        &glib::Bytes::from_owned(recolored),
+        gtk4::gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        width,
+        height,
+        rowstride as i32,
+    ))
+}
+
 fn build_menu_box(
     box_: &gtk4::Box,
     items: &[TrayMenuItem],
@@ -2257,11 +2369,7 @@ fn build_menu_box(
             (Some(toggle_type), Some(true)) if toggle_type == "radio" => {
                 Some(gtk4::Image::from_icon_name("media-record-symbolic"))
             }
-            _ => item
-                .icon_name
-                .as_ref()
-                .filter(|name| !name.is_empty())
-                .map(|name| gtk4::Image::from_icon_name(name)),
+            _ => menu_icon_image(box_, item),
         };
         if let Some(icon) = leading {
             content.append(&icon);
@@ -2523,6 +2631,60 @@ mod tests {
     fn tray_pixmap_rejects_invalid_dimensions_and_length() {
         assert_eq!(argb_to_rgba(0, 1, &[]), None);
         assert_eq!(argb_to_rgba(1, 1, &[0, 1, 2]), None);
+    }
+
+    // Pack a flat RGBA buffer (rowstride == width*4) into a Pixbuf the way
+    // decode_menu_icon_data would after decoding a PNG.
+    fn rgba_pixbuf(width: i32, height: i32, pixels: &[u8]) -> gtk4::gdk_pixbuf::Pixbuf {
+        gtk4::gdk_pixbuf::Pixbuf::from_bytes(
+            &glib::Bytes::from(pixels),
+            gtk4::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            width,
+            height,
+            width * 4,
+        )
+    }
+
+    // KDE menu icons arrive as near-black masks; recoloring must repaint the ink
+    // to the menu foreground while preserving the alpha silhouette.
+    #[test]
+    fn dark_menu_icon_mask_is_recolored_to_foreground() {
+        // Two opaque dark pixels, one fully transparent hole.
+        let pixels = [10, 12, 14, 255, 20, 18, 16, 255, 0, 0, 0, 0, 5, 5, 5, 200];
+        let pixbuf = rgba_pixbuf(2, 2, &pixels);
+        let recolored = recolored_if_dark(&pixbuf).expect("dark mask should be recolored");
+        let out = recolored.read_pixel_bytes();
+        // Opaque ink takes the foreground color; alpha is carried through.
+        assert_eq!(
+            &out[0..4],
+            &[MENU_ICON_FG.0, MENU_ICON_FG.1, MENU_ICON_FG.2, 255]
+        );
+        assert_eq!(
+            &out[12..16],
+            &[MENU_ICON_FG.0, MENU_ICON_FG.1, MENU_ICON_FG.2, 200]
+        );
+        // The transparent hole stays transparent.
+        assert_eq!(out[11], 0);
+    }
+
+    // A light or colorful icon must be left exactly as decoded.
+    #[test]
+    fn light_menu_icon_is_left_untouched() {
+        let pixels = [
+            200, 210, 240, 255, 180, 190, 220, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let pixbuf = rgba_pixbuf(2, 2, &pixels);
+        assert!(recolored_if_dark(&pixbuf).is_none());
+    }
+
+    // Nothing to recolor when the glyph is entirely transparent.
+    #[test]
+    fn fully_transparent_menu_icon_is_left_untouched() {
+        let pixels = [10, 10, 10, 0, 10, 10, 10, 0, 10, 10, 10, 0, 10, 10, 10, 0];
+        let pixbuf = rgba_pixbuf(2, 2, &pixels);
+        assert!(recolored_if_dark(&pixbuf).is_none());
     }
 
     #[test]

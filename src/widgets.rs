@@ -2831,6 +2831,26 @@ pub fn setup_title_updates(
     });
 }
 
+// Apply live desktop color-scheme changes to GTK. The appearance producer sends
+// the current preference on connect and again on every portal SettingChanged, so
+// the bar's prefer-dark follows a light/dark switch instead of only the value
+// read at startup. The `!=` guard keeps the no-op re-sends (and the initial
+// value, already applied synchronously in configure_color_scheme) from churning.
+pub fn setup_color_scheme_updates(mut rx: mpsc::UnboundedReceiver<bool>) {
+    glib::spawn_future_local(async move {
+        while let Some(prefer_dark) = rx.recv().await {
+            let Some(settings) = gtk4::Settings::default() else {
+                warn!("No default GtkSettings; cannot apply color-scheme change");
+                continue;
+            };
+            if settings.is_gtk_application_prefer_dark_theme() != prefer_dark {
+                settings.set_gtk_application_prefer_dark_theme(prefer_dark);
+                info!(prefer_dark, "Applied desktop color-scheme change to GTK");
+            }
+        }
+    });
+}
+
 pub fn setup_battery_updates(mut rx: mpsc::UnboundedReceiver<String>, label: gtk4::Label) {
     debug!("Setting up battery updates");
 

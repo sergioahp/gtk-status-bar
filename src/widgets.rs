@@ -1185,9 +1185,23 @@ pub fn setup_tray_updates(
     open_menu
         .popover
         .connect_map(|_| debug!("Fused tray menu surface mapped"));
-    open_menu
-        .popover
-        .connect_unmap(|_| debug!("Fused tray menu surface unmapped"));
+    let open_menu_weak = Rc::downgrade(&open_menu);
+    let nav_tx_unmapped = nav_tx.clone();
+    open_menu.popover.connect_unmap(move |_| {
+        debug!("Fused tray menu surface unmapped");
+        let Some(open_menu) = open_menu_weak.upgrade() else {
+            return;
+        };
+        let request_id = open_menu
+            .open
+            .borrow()
+            .as_ref()
+            .filter(|menu| menu.keyboard_grab)
+            .map(|menu| menu.request_id);
+        if let Some(request_id) = request_id {
+            let _ = nav_tx_unmapped.send(NavCmd::UserClosed { request_id });
+        }
+    });
     let open_menu_weak = Rc::downgrade(&open_menu);
     let nav_tx_closed = nav_tx.clone();
     open_menu.popover.connect_closed(move |_popover| {
@@ -1503,7 +1517,7 @@ fn point_tray_menu_at(
         bounds.height().ceil().max(1.0) as i32,
     );
     open_menu.popover.set_pointing_to(Some(&rectangle));
-    if open_menu.popover.is_visible() {
+    if open_menu.popover.is_mapped() {
         open_menu.popover.present();
     }
     debug!(
@@ -1814,10 +1828,15 @@ fn handle_nav(
                 .borrow()
                 .as_ref()
                 .is_some_and(|menu| menu.key == key && menu.request_id == *request_id);
-            if !menu_loaded {
+            let surface_mapped = open_menu.popover.is_mapped();
+            let menu_ready = menu_loaded && surface_mapped;
+            if !menu_ready {
                 warn!(
                     item = key,
-                    request_id, "Tray menu did not load before timeout"
+                    request_id,
+                    menu_loaded,
+                    surface_mapped,
+                    "Tray menu was not ready before timeout"
                 );
                 end_nav(
                     nav,
@@ -1990,7 +2009,7 @@ fn show_tray_menu(
 ) {
     let open_menu = &entry.open_menu;
     let popover = &open_menu.popover;
-    let was_visible = popover.is_visible();
+    let was_mapped = popover.is_mapped();
     if let Some(previous) = open_menu.open.borrow_mut().take() {
         teardown_tray_submenus(previous);
     }
@@ -2042,10 +2061,10 @@ fn show_tray_menu(
         item = menu.key,
         entries = menu.items.len(),
         keyboard_grab = menu.keyboard_grab,
-        reused_surface = was_visible,
+        reused_surface = was_mapped,
         "Presenting tray menu"
     );
-    if was_visible {
+    if was_mapped {
         popover.present();
         box_.grab_focus();
         return;

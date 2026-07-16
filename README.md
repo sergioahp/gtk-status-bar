@@ -54,7 +54,7 @@ connections return to the stable mean.
 - 🧰 Clickable system tray with icon theme, file icon, and ARGB pixmap support
 - 🧩 Extensible widget architecture with centered layout
 
-System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well. Context menus are read from the application's com.canonical.dbusmenu interface and rendered by the bar itself in one shared native popover, since applications cannot reliably draw their own menus over a layer-shell surface. During tray-wide keyboard navigation that popover moves between icons and replaces its contents without closing, so switching applications does not release and reacquire keyboard focus.
+System tray controls follow the StatusNotifierItem convention: left click activates an application, middle click performs its secondary action, and right click opens its context menu. Menu-only items open their menu on left click as well. Context menus are read from the application's com.canonical.dbusmenu interface and rendered by the bar itself as native popovers, since applications cannot reliably draw their own menus over a layer-shell surface.
 
 ### External tray control
 

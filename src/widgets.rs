@@ -557,6 +557,8 @@ struct OpenTrayMenuEntry {
 
 struct KeyboardGrab {
     application: glib::object::WeakRef<gtk4::Application>,
+    bar_window: glib::object::WeakRef<gtk4::ApplicationWindow>,
+    monitor: Option<gdk::Monitor>,
     active_request: Cell<Option<u64>>,
 }
 
@@ -584,16 +586,61 @@ impl KeyboardGrab {
             .default_width(1)
             .default_height(1)
             .build();
+        let focus_target = gtk4::Fixed::new();
+        focus_target.set_size_request(1, 1);
+        focus_target.set_focusable(true);
+        window.set_child(Some(&focus_target));
         window.init_layer_shell();
-        window.set_layer(Layer::Bottom);
+        window.set_namespace(Some("gtk-status-bar-keyboard-grab"));
+        window.set_layer(Layer::Overlay);
+        window.set_monitor(self.monitor.as_ref());
         window.set_anchor(Edge::Top, true);
         window.set_anchor(Edge::Right, true);
         window.set_exclusive_zone(0);
         window.set_keyboard_mode(KeyboardMode::Exclusive);
         window.add_controller(nav_key_controller(nav_tx, "keyboard-grab"));
-        window.present();
+
+        let monitor = self
+            .monitor
+            .as_ref()
+            .and_then(gdk::Monitor::connector)
+            .unwrap_or_else(|| "compositor-default".into());
+        window.connect_map(move |window| {
+            if let Some(surface) = window.surface() {
+                surface.set_input_region(&gtk4::cairo::Region::create());
+            }
+            info!(
+                request_id,
+                active = window.is_active(),
+                keyboard_mode = ?window.keyboard_mode(),
+                layer = ?window.layer(),
+                monitor = %monitor,
+                "Tray keyboard helper mapped"
+            );
+        });
+        window.connect_unmap(move |_| {
+            info!(request_id, "Tray keyboard helper unmapped");
+        });
+        window.connect_is_active_notify(move |window| {
+            info!(
+                request_id,
+                active = window.is_active(),
+                "Tray keyboard helper active state changed"
+            );
+        });
+
         self.active_request.set(Some(request_id));
-        info!(request_id, "Tray menu acquired exclusive keyboard focus");
+        window.present();
+        focus_target.grab_focus();
+        info!(
+            request_id,
+            helper_active = window.is_active(),
+            bar_active = self
+                .bar_window
+                .upgrade()
+                .is_some_and(|window| window.is_active()),
+            "Tray menu requested exclusive keyboard focus"
+        );
         Some(KeyboardGrabLease {
             state: self.clone(),
             request_id,
@@ -615,6 +662,18 @@ impl Drop for KeyboardGrabLease {
         self.window.set_keyboard_mode(KeyboardMode::None);
         self.window.close();
         self.state.release(self.request_id);
+    }
+}
+
+impl KeyboardGrabLease {
+    fn focus_state(&self) -> (bool, bool) {
+        let helper_active = self.window.is_active();
+        let bar_active = self
+            .state
+            .bar_window
+            .upgrade()
+            .is_some_and(|window| window.is_active());
+        (helper_active, bar_active)
     }
 }
 
@@ -643,8 +702,6 @@ enum NavCmd {
 // we have descended into the open dropdown. Dropping `lease` releases the
 // keyboard.
 struct NavActive {
-    // Held only for its Drop, which releases the grab; never read directly.
-    #[allow(dead_code)]
     lease: KeyboardGrabLease,
     key: String,
     menu_request_id: u64,
@@ -1168,6 +1225,8 @@ pub fn setup_tray_updates(
         .expect("the status bar window must belong to its GTK application");
     let keyboard_grab = Rc::new(KeyboardGrab {
         application: application.downgrade(),
+        bar_window: window.downgrade(),
+        monitor: window.monitor(),
         active_request: Cell::new(None),
     });
     // Key controllers on the open dropdowns forward NavCmd here; the task owns
@@ -1182,23 +1241,41 @@ pub fn setup_tray_updates(
         popover,
         open: RefCell::new(None),
     });
-    open_menu
-        .popover
-        .connect_map(|_| debug!("Fused tray menu surface mapped"));
     let open_menu_weak = Rc::downgrade(&open_menu);
-    let nav_tx_unmapped = nav_tx.clone();
-    open_menu.popover.connect_unmap(move |_| {
-        debug!("Fused tray menu surface unmapped");
+    open_menu.popover.connect_map(move |_| {
         let Some(open_menu) = open_menu_weak.upgrade() else {
             return;
         };
-        let request_id = open_menu
-            .open
-            .borrow()
+        let open = open_menu.open.borrow();
+        match open.as_ref() {
+            Some(menu) => info!(
+                item = menu.key,
+                request_id = menu.request_id,
+                keyboard_grab = menu.keyboard_grab,
+                "Fused tray menu surface mapped"
+            ),
+            None => warn!("Fused tray menu surface mapped without menu state"),
+        }
+    });
+    let open_menu_weak = Rc::downgrade(&open_menu);
+    let nav_tx_unmapped = nav_tx.clone();
+    open_menu.popover.connect_unmap(move |_| {
+        let Some(open_menu) = open_menu_weak.upgrade() else {
+            return;
+        };
+        let open = open_menu.open.borrow();
+        let state = open
             .as_ref()
-            .filter(|menu| menu.keyboard_grab)
-            .map(|menu| menu.request_id);
-        if let Some(request_id) = request_id {
+            .map(|menu| (menu.key.clone(), menu.request_id, menu.keyboard_grab));
+        drop(open);
+        match &state {
+            Some((item, request_id, keyboard_grab)) => info!(
+                item,
+                request_id, keyboard_grab, "Fused tray menu surface unmapped"
+            ),
+            None => info!("Fused tray menu surface unmapped without menu state"),
+        }
+        if let Some((_, request_id, true)) = state {
             let _ = nav_tx_unmapped.send(NavCmd::UserClosed { request_id });
         }
     });
@@ -1384,7 +1461,27 @@ pub fn setup_tray_updates(
                         }
                         // open is keyboard-menu with no target: resume on the
                         // icon the last session ended on, else the first icon.
+                        // Always tear down first: this command is the recovery
+                        // boundary for a stale menu or lost compositor grab.
                         IpcRequest::Open => {
+                            if let Some(active) = nav.as_ref() {
+                                let (helper_active, bar_active) = active.lease.focus_state();
+                                info!(
+                                    item = active.key,
+                                    request_id = active.menu_request_id,
+                                    helper_active,
+                                    bar_active,
+                                    "Tray open resetting existing navigation session"
+                                );
+                            }
+                            end_nav(
+                                &mut nav,
+                                &mut last_nav_key,
+                                &container,
+                                &entries,
+                                &open_menu,
+                                &menu_requests,
+                            );
                             let index = last_nav_key
                                 .as_ref()
                                 .and_then(|key| {
@@ -1829,13 +1926,29 @@ fn handle_nav(
                 .as_ref()
                 .is_some_and(|menu| menu.key == key && menu.request_id == *request_id);
             let surface_mapped = open_menu.popover.is_mapped();
-            let menu_ready = menu_loaded && surface_mapped;
+            let (helper_active, bar_active) = nav
+                .as_ref()
+                .map(|active| active.lease.focus_state())
+                .unwrap_or((false, false));
+            let keyboard_active = helper_active || bar_active;
+            let menu_ready = menu_loaded && surface_mapped && keyboard_active;
+            info!(
+                item = key,
+                request_id,
+                menu_loaded,
+                surface_mapped,
+                helper_active,
+                bar_active,
+                "Tray menu readiness checked"
+            );
             if !menu_ready {
                 warn!(
                     item = key,
                     request_id,
                     menu_loaded,
                     surface_mapped,
+                    helper_active,
+                    bar_active,
                     "Tray menu was not ready before timeout"
                 );
                 end_nav(

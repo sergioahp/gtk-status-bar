@@ -5,6 +5,7 @@
 // therefore wired before the first producer can send. Producers that crash are
 // restarted with exponential backoff by their run_*_supervised wrappers.
 
+mod appearance;
 mod bus;
 mod clock;
 mod dbus;
@@ -150,7 +151,7 @@ async fn run_tray_ipc_supervised(ui_tx: mpsc::UnboundedSender<IpcUiRequest>) {
 // exposed (e.g. a session without a color-scheme portal) we default to dark
 // rather than leaving GTK on its light default.
 fn configure_color_scheme() {
-    let prefer_dark = detect_prefer_dark().unwrap_or_else(|| {
+    let prefer_dark = appearance::detect_prefer_dark().unwrap_or_else(|| {
         debug!("No desktop color-scheme preference available; defaulting the bar to dark");
         true
     });
@@ -163,36 +164,6 @@ fn configure_color_scheme() {
         prefer_dark,
         "Applied color-scheme preference to GTK settings"
     );
-}
-
-// Read `org.freedesktop.appearance color-scheme` from the settings portal:
-// 1 = prefer dark, 2 = prefer light, 0 = no preference. Returns None when the
-// portal or the setting is unavailable, letting the caller pick a default.
-fn detect_prefer_dark() -> Option<bool> {
-    use zbus::blocking::Connection;
-
-    let connection = Connection::session().ok()?;
-    let reply = connection
-        .call_method(
-            Some("org.freedesktop.portal.Desktop"),
-            "/org/freedesktop/portal/desktop",
-            Some("org.freedesktop.portal.Settings"),
-            "Read",
-            &("org.freedesktop.appearance", "color-scheme"),
-        )
-        .ok()?;
-    // The reply is a `v` whose payload is a `u`; zbus can hand it back
-    // double-wrapped, so peel variant layers until the integer surfaces.
-    let body = reply.body();
-    let mut value: zvariant::Value = body.deserialize().ok()?;
-    while let zvariant::Value::Value(inner) = value {
-        value = *inner;
-    }
-    match u32::try_from(value).ok()? {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
-    }
 }
 
 fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()> {
@@ -223,6 +194,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
     let (bus, receivers) = bus::Bus::new();
     let (tray_backend, tray_ui) = tray::channels();
     let (tray_ipc_tx, tray_ipc_rx) = mpsc::unbounded_channel();
+    let (color_scheme_tx, color_scheme_rx) = mpsc::unbounded_channel();
 
     widgets::update_time_widget(time_widget);
     widgets::setup_tray_updates(tray_ui, tray_ipc_rx, tray_widget, &window);
@@ -232,6 +204,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
     widgets::setup_bluetooth_updates(receivers.bluetooth, bt_widget);
     widgets::setup_network_updates(receivers.network, network_widget);
     widgets::setup_volume_updates(volume_widget)?;
+    widgets::setup_color_scheme_updates(color_scheme_rx);
 
     // Every consumer above is wired before any producer below spawns. The
     // D-Bus monitor serves both battery and bluetooth, while the tray also has
@@ -245,6 +218,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
     ));
     tokio::spawn(tray::run_tray_supervised(tray_backend));
     tokio::spawn(run_tray_ipc_supervised(tray_ipc_tx));
+    tokio::spawn(appearance::run_color_scheme_supervised(color_scheme_tx));
 
     info!("Application activated successfully");
     Ok(())

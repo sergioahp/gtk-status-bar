@@ -36,6 +36,7 @@ Options:\n\
   --network-down-after-seconds N      Default: 15\n\
   --network-recent-window-seconds N   Default: 60\n\
   --network-ping-timeout-seconds N    Default: 2\n\
+  --network-dbus-timeout-seconds N    Default: 5\n\
   -h, --help\n\n\
 CONNECTOR is the GDK output connector name, such as DVI-I-1 or DP-1. Ping\n\
 targets must be IPv4 or IPv6 addresses.";
@@ -91,6 +92,9 @@ fn parse_cli(arguments: &[String]) -> Result<CliAction> {
             }
             "--network-ping-timeout-seconds" => {
                 options.network.ping_timeout = parse_seconds(flag, value)?;
+            }
+            "--network-dbus-timeout-seconds" => {
+                options.network.dbus_timeout = parse_seconds(flag, value)?;
             }
             _ => bail!("unknown argument: {flag}\n\n{USAGE}"),
         }

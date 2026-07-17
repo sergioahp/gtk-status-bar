@@ -28,7 +28,6 @@ const ACTIVE_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.Connection
 const WIRELESS_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const ACCESS_POINT_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 
-const ICON_GLOBE: &str = "\u{f0ac}";
 const ICON_ETHERNET: &str = "\u{f0200}";
 const ICON_NETWORK: &str = "\u{f06f3}";
 const ICON_NETWORK_OFF: &str = "\u{f0c9b}";
@@ -130,10 +129,18 @@ impl NetworkSnapshot {
 }
 
 fn display_text(link: &Link, reachability: Reachability) -> String {
+    // Online connections show no indicator; only degraded states get a glyph.
     let reachability = match reachability {
         Reachability::Unknown => "?",
-        Reachability::Online => ICON_GLOBE,
+        Reachability::Online => "",
         Reachability::Offline => "×",
+    };
+    // Append the indicator with its leading space only when present, so an
+    // online connection never leaves a dangling trailing space.
+    let suffix = if reachability.is_empty() {
+        String::new()
+    } else {
+        format!(" {reachability}")
     };
     match link {
         Link::None => format!("{ICON_NETWORK_OFF} ×"),
@@ -145,10 +152,11 @@ fn display_text(link: &Link, reachability: Reachability) -> String {
                 61..=80 => ICON_WIFI_3,
                 _ => ICON_WIFI_4,
             };
-            format!("{icon} {strength}% {reachability}")
+            // Extra gap after the wifi glyph so it doesn't touch the number.
+            format!("{icon}  {strength}%{suffix}")
         }
-        Link::Wired => format!("{ICON_ETHERNET} {reachability}"),
-        Link::Other => format!("{ICON_NETWORK} {reachability}"),
+        Link::Wired => format!("{ICON_ETHERNET}{suffix}"),
+        Link::Other => format!("{ICON_NETWORK}{suffix}"),
     }
 }
 
@@ -646,15 +654,15 @@ mod tests {
         );
         assert_eq!(
             display_text(&Link::Wired, Reachability::Online),
-            format!("{ICON_ETHERNET} {ICON_GLOBE}")
+            ICON_ETHERNET
         );
         assert_eq!(
             display_text(&Link::Wifi { strength: 73 }, Reachability::Unknown),
-            format!("{ICON_WIFI_3} 73% ?")
+            format!("{ICON_WIFI_3}  73% ?")
         );
         assert_eq!(
             display_text(&Link::Wifi { strength: 28 }, Reachability::Online),
-            format!("{ICON_WIFI_1} 28% {ICON_GLOBE}")
+            format!("{ICON_WIFI_1}  28%")
         );
         assert_eq!(
             display_text(&Link::Other, Reachability::Offline),

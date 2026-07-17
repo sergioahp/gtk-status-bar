@@ -46,6 +46,7 @@ pub struct NetworkConfig {
     pub outage_confirmation: Duration,
     pub recent_instability: Duration,
     pub ping_timeout: Duration,
+    pub dbus_timeout: Duration,
 }
 
 impl Default for NetworkConfig {
@@ -65,6 +66,7 @@ impl Default for NetworkConfig {
             outage_confirmation: Duration::from_secs(15),
             recent_instability: Duration::from_secs(60),
             ping_timeout: Duration::from_secs(2),
+            dbus_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -507,12 +509,16 @@ async fn monitor_network(bus: &Bus, config: &NetworkConfig) -> Result<()> {
     }
     let mut stream = zbus::MessageStream::from(&connection);
 
-    let mut snapshot = match read_snapshot(&connection).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
+    let mut snapshot = match tokio::time::timeout(config.dbus_timeout, read_snapshot(&connection)).await {
+        Err(_) => {
+            warn!(timeout = ?config.dbus_timeout, "Initial NetworkManager snapshot timed out");
+            NetworkSnapshot::disconnected()
+        }
+        Ok(Err(error)) => {
             warn!(error = %format_args!("{error:#}"), "Initial NetworkManager snapshot failed");
             NetworkSnapshot::disconnected()
         }
+        Ok(Ok(snapshot)) => snapshot,
     };
     let mut health = ProbeHealth::new();
     if !snapshot.has_network() {
@@ -559,12 +565,19 @@ async fn monitor_network(bus: &Bus, config: &NetworkConfig) -> Result<()> {
                 }
 
                 let previous = snapshot.clone();
-                match read_snapshot(&connection).await {
-                    Ok(updated) => snapshot = updated,
-                    Err(error) => {
+                match tokio::time::timeout(config.dbus_timeout, read_snapshot(&connection)).await {
+                    Err(_) => {
+                        warn!(timeout = ?config.dbus_timeout, "NetworkManager event resnapshot timed out; treating link as down");
+                        snapshot = NetworkSnapshot::disconnected();
+                        health.reset_for_no_network();
+                        send_status(bus, &snapshot, &health);
+                        continue;
+                    }
+                    Ok(Err(error)) => {
                         warn!(error = %format_args!("{error:#}"), "NetworkManager event resnapshot failed");
                         continue;
                     }
+                    Ok(Ok(updated)) => snapshot = updated,
                 }
                 let now = Instant::now();
                 if !snapshot.has_network() {

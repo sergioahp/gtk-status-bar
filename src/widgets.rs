@@ -552,6 +552,16 @@ fn update_tray_button(button: &gtk4::Button, image: &gtk4::Image, item: &TrayIte
         _ => "active",
     };
     button.add_css_class(status_class);
+    // The tooltip text is now supplied at query time (see create_tray_entry),
+    // which no longer maintains the accessible description the old
+    // set_tooltip_text call provided as a side effect. Keep it updated here so
+    // screen readers still get the item title on every upsert.
+    let description = if item.title.is_empty() {
+        &item.key
+    } else {
+        &item.title
+    };
+    button.update_property(&[gtk4::accessible::Property::Description(description)]);
     update_tray_image(image, item);
 }
 
@@ -745,6 +755,10 @@ enum NavCmd {
     UserClosed { request_id: u64 },
     MenuTimeout { request_id: u64 },
     MouseAction(TrayCommand),
+    // The fused popover surface unmapped. Sent on every unmap (unlike
+    // UserClosed, which is nav-only) so the loop can restore tray tooltips
+    // after click-outside dismissal, which otherwise never reaches it.
+    MenuSurfaceUnmapped,
 }
 
 // The live keyboard-navigation session. Present only while the grab is held.
@@ -1162,8 +1176,13 @@ fn create_tray_entry(
     // (confirmed twice by backtrace on the live desktop, 2026-07-19). Answer
     // the tooltip query dynamically instead of setting static text so the
     // tooltip simply declines to exist whenever a menu could be holding the
-    // grab, and reappears on the next hover once everything is closed.
-    button.set_has_tooltip(true);
+    // grab, and reappears on the next hover once everything is closed. This
+    // query gate is the backstop; the durable switch is has-tooltip itself,
+    // toggled around the grab lifetime by set_tray_tooltips_enabled, because
+    // GTK's reposition path can remap a visible tooltip without re-querying.
+    button.set_has_tooltip(
+        open_menu.open.borrow().is_none() && keyboard_grab.active_request.get().is_none(),
+    );
     let state_for_tooltip = state.clone();
     let open_menu_for_tooltip = Rc::downgrade(open_menu);
     let keyboard_grab_for_tooltip = Rc::downgrade(keyboard_grab);
@@ -1175,7 +1194,10 @@ fn create_tray_entry(
             .upgrade()
             .is_some_and(|grab| grab.active_request.get().is_some());
         if menu_open || grab_active {
-            trace!(menu_open, grab_active, "Declining tray tooltip while a menu is up");
+            trace!(
+                menu_open,
+                grab_active, "Declining tray tooltip while a menu is up"
+            );
             return false;
         }
         let item = state_for_tooltip.borrow();
@@ -1362,6 +1384,7 @@ pub fn setup_tray_updates(
         if let Some((_, request_id, true)) = state {
             let _ = nav_tx_unmapped.send(NavCmd::UserClosed { request_id });
         }
+        let _ = nav_tx_unmapped.send(NavCmd::MenuSurfaceUnmapped);
     });
     let open_menu_weak = Rc::downgrade(&open_menu);
     let nav_tx_closed = nav_tx.clone();
@@ -1399,6 +1422,11 @@ pub fn setup_tray_updates(
                             Some(entry) => {
                                 update_tray_button(&entry.button, &entry.image, &item);
                                 *entry.state.borrow_mut() = item;
+                                if open_menu.open.borrow().is_none()
+                                    && keyboard_grab.active_request.get().is_none()
+                                {
+                                    entry.button.trigger_tooltip_query();
+                                }
                             }
                             None => {
                                 let key = item.key.clone();
@@ -1481,13 +1509,16 @@ pub fn setup_tray_updates(
                         continue;
                     }
                     match entries.get(&menu.key) {
-                        Some(entry) => show_tray_menu(
-                            entry,
-                            &container,
-                            &menu,
-                            &commands,
-                            &nav_tx,
-                        ),
+                        Some(entry) => {
+                            set_tray_tooltips_enabled(&entries, false);
+                            show_tray_menu(
+                                entry,
+                                &container,
+                                &menu,
+                                &commands,
+                                &nav_tx,
+                            );
+                        }
                         None => debug!(item = menu.key, "Ignoring menu for unknown tray item"),
                     }
                 }
@@ -1840,6 +1871,18 @@ fn open_icon_menu(
     Ok(request_id)
 }
 
+// Tooltips must not be mappable while any tray popup grab can exist: GTK can
+// remap an already-visible tooltip without re-querying the application, and an
+// illegal second popup under an active grab deadlocks the main loop (see the
+// query handler in create_tray_entry). The has-tooltip property is the durable
+// switch GTK itself consults on that reposition path, so flip it for every
+// icon around the whole grab lifetime; the query handler stays as a backstop.
+fn set_tray_tooltips_enabled(entries: &HashMap<String, TrayEntry>, enabled: bool) {
+    for entry in entries.values() {
+        entry.button.set_has_tooltip(enabled);
+    }
+}
+
 // Start (or retarget) a keyboard-navigation session at `index`, entering at
 // level 0 with that icon's dropdown auto-opened. The first call acquires the
 // grab; later calls just move the pre-selection.
@@ -1863,6 +1906,9 @@ fn start_nav(
         .get(&key)
         .ok_or_else(|| format!("tray item {key:?} is no longer available"))?;
 
+    // Suppress native tooltips before creating the grab; the menu layout can
+    // arrive later, but no tooltip popup may map anywhere in between.
+    set_tray_tooltips_enabled(entries, false);
     match nav.as_mut() {
         Some(active) => {
             active.key = key.clone();
@@ -1936,6 +1982,12 @@ fn end_nav(
     }
     container.remove_css_class("nav-focus");
     container.remove_css_class("nav-level-zero");
+    // A mapped popover just sent MenuSurfaceUnmapped, which restores tooltips
+    // once this teardown finishes. A grab that never got its menu mapped has
+    // no such signal coming, so restore here.
+    if !open_menu.popover.is_mapped() && open_menu.open.borrow().is_none() {
+        set_tray_tooltips_enabled(entries, true);
+    }
     info!(
         item = active.key,
         request_id = active.menu_request_id,
@@ -1992,6 +2044,16 @@ fn handle_nav(
             );
             if let Err(error) = commands.send(command) {
                 warn!(%error, "Could not send tray click to D-Bus backend");
+            }
+            return;
+        }
+        NavCmd::MenuSurfaceUnmapped => {
+            // Fires on every popover unmap, including click-outside dismissal
+            // of a pointer-opened menu (which has no nav session). Restore
+            // tooltips only once nothing that could hold a popup grab is left;
+            // a superseding menu's own unmap handles the restore otherwise.
+            if nav.is_none() && open_menu.open.borrow().is_none() {
+                set_tray_tooltips_enabled(entries, true);
             }
             return;
         }
@@ -2226,11 +2288,19 @@ fn handle_nav(
     }
 }
 
-// The clamped pointer-enter a grabbing popup receives on map (see the motion
-// controller in show_tray_menu) leaves a phantom :hover on one row. Real
-// hover always comes with motion events, so shortly after presenting, clear
-// PRELIGHT from every entry unless genuine motion arrived in the meantime;
-// the next real motion re-establishes hover exactly where the pointer is.
+// The synthetic pointer-enter a grabbing popup receives on map (see the
+// motion controller in show_tray_menu) leaves a phantom :hover on one row.
+// Real hover normally comes with motion events, so shortly after presenting,
+// clear PRELIGHT from every entry unless genuine motion arrived in the
+// meantime; the next real motion re-establishes hover where the pointer is.
+// Known limits of the heuristic, accepted deliberately: a pointer that was
+// already inside the popup rectangle at map time and holds perfectly still
+// loses its (correct) hover tint until it moves a pixel, and a synthetic
+// enter arriving later than the delay would keep its phantom tint until the
+// pointer really moves. Both self-heal on the first motion event; the
+// alternative — classifying enters by their coordinates — is guesswork
+// against compositor-specific values ((0,0) observed on Hyprland 0.49, but
+// clamped positions have been seen too).
 const PHANTOM_HOVER_CLEAR_DELAY: Duration = Duration::from_millis(200);
 
 fn schedule_phantom_hover_clear(
@@ -2257,13 +2327,19 @@ fn schedule_phantom_hover_clear(
             return;
         }
         if motion_seen.get() {
-            debug!(request_id, "Keeping hover state backed by real pointer motion");
+            debug!(
+                request_id,
+                "Keeping hover state backed by real pointer motion"
+            );
             return;
         }
         for entry in &menu.entries {
             entry.button.unset_state_flags(gtk4::StateFlags::PRELIGHT);
         }
-        info!(request_id, "Cleared phantom hover state after tray menu map");
+        info!(
+            request_id,
+            "Cleared phantom hover state after tray menu map"
+        );
     });
 }
 
@@ -2357,10 +2433,12 @@ fn show_tray_menu(
     });
     // A tooltip that is already visible when the menu maps never re-queries:
     // GTK remaps it directly (gtk_tooltip_window_map), which is the popup
-    // stacking violation that deadlocks the main loop. Force one query now —
-    // it re-evaluates whichever widget is under the pointer display-wide, the
-    // query handler sees the open menu state set above and declines, and GTK
-    // hides the tooltip before the grabbing popup appears.
+    // stacking violation that deadlocks the main loop. The caller has already
+    // flipped has-tooltip off for every icon (the durable guard GTK consults
+    // on that reposition path); this forced query makes GTK re-evaluate and
+    // hide a currently-visible tooltip right now. Note the query only runs
+    // when the pointer is on this widget's native surface — which is exactly
+    // when a tray tooltip can be visible, since all icons share the bar.
     entry.button.trigger_tooltip_query();
     if let Err(error) = point_tray_menu_at(open_menu, &entry.button, container) {
         warn!(item = menu.key, %error, "Could not anchor fused tray menu to its icon");
@@ -2420,7 +2498,10 @@ fn show_tray_menu(
             // layer-shell popover can block inside grab_focus() while Wayland
             // is resolving the two surfaces, wedging the entire GTK loop.
             // Both surfaces already have the same navigation controller.
-            info!(item = item_key, request_id, "Tray dropdown opened at level 0");
+            info!(
+                item = item_key,
+                request_id, "Tray dropdown opened at level 0"
+            );
             schedule_phantom_hover_clear(&open_menu, request_id, &motion_seen);
         });
     } else {

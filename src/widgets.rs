@@ -24,7 +24,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use tray_ipc::{IpcRequest, IpcResponse, IpcTrayItem, IpcUiRequest};
 
 use crate::bus::{TitleUpdate, VolumeUpdate, WorkspaceUpdate};
@@ -552,11 +552,6 @@ fn update_tray_button(button: &gtk4::Button, image: &gtk4::Image, item: &TrayIte
         _ => "active",
     };
     button.add_css_class(status_class);
-    button.set_tooltip_text(Some(if item.title.is_empty() {
-        &item.key
-    } else {
-        &item.title
-    }));
     update_tray_image(image, item);
 }
 
@@ -634,6 +629,10 @@ impl KeyboardGrab {
         focus_target.set_size_request(1, 1);
         focus_target.set_focusable(true);
         window.set_child(Some(&focus_target));
+        // Without this the default titlebar makes the "1x1" helper surface
+        // 200x200 on the overlay layer, parked right where wide tray menus
+        // render their top rows (hyprctl layers, 2026-07-19).
+        window.set_decorated(false);
         window.init_layer_shell();
         window.set_namespace(Some("gtk-status-bar-keyboard-grab"));
         window.set_layer(Layer::Overlay);
@@ -652,12 +651,20 @@ impl KeyboardGrab {
         window.connect_map(move |window| {
             if let Some(surface) = window.surface() {
                 surface.set_input_region(&gtk4::cairo::Region::create());
+                // GTK rewrites the input region on resize/style changes, so a
+                // single clear on map is not durable. Re-clear after every
+                // layout so the helper can never swallow pointer input.
+                surface.connect_layout(|surface, _width, _height| {
+                    surface.set_input_region(&gtk4::cairo::Region::create());
+                });
             }
             info!(
                 request_id,
                 active = window.is_active(),
                 keyboard_mode = ?window.keyboard_mode(),
                 layer = ?window.layer(),
+                width = window.width(),
+                height = window.height(),
                 monitor = %monitor,
                 "Tray keyboard helper mapped"
             );
@@ -1135,6 +1142,7 @@ fn create_tray_entry(
     menu_requests: &Rc<Cell<u64>>,
     nav_tx: &mpsc::UnboundedSender<NavCmd>,
     open_menu: &Rc<TrayMenuHost>,
+    keyboard_grab: &Rc<KeyboardGrab>,
 ) -> TrayEntry {
     let button = gtk4::Button::new();
     button.add_css_class("tray-item");
@@ -1145,6 +1153,39 @@ fn create_tray_entry(
     update_tray_button(&button, &image, &item);
 
     let state = Rc::new(RefCell::new(item));
+
+    // Native tooltips must never map while a tray dropdown (or the nav
+    // keyboard grab) is up: the dropdown is a grabbing xdg_popup, a tooltip
+    // would be a second popup on the same parent, Hyprland never configures
+    // that illegal sibling, and gdk_wayland_surface_present_popup blocks the
+    // whole GTK main loop inside wl_display_dispatch_queue waiting for it
+    // (confirmed twice by backtrace on the live desktop, 2026-07-19). Answer
+    // the tooltip query dynamically instead of setting static text so the
+    // tooltip simply declines to exist whenever a menu could be holding the
+    // grab, and reappears on the next hover once everything is closed.
+    button.set_has_tooltip(true);
+    let state_for_tooltip = state.clone();
+    let open_menu_for_tooltip = Rc::downgrade(open_menu);
+    let keyboard_grab_for_tooltip = Rc::downgrade(keyboard_grab);
+    button.connect_query_tooltip(move |_button, _x, _y, _keyboard_mode, tooltip| {
+        let menu_open = open_menu_for_tooltip
+            .upgrade()
+            .is_some_and(|open_menu| open_menu.open.borrow().is_some());
+        let grab_active = keyboard_grab_for_tooltip
+            .upgrade()
+            .is_some_and(|grab| grab.active_request.get().is_some());
+        if menu_open || grab_active {
+            trace!(menu_open, grab_active, "Declining tray tooltip while a menu is up");
+            return false;
+        }
+        let item = state_for_tooltip.borrow();
+        tooltip.set_text(Some(if item.title.is_empty() {
+            &item.key
+        } else {
+            &item.title
+        }));
+        true
+    });
 
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(0);
@@ -1366,6 +1407,7 @@ pub fn setup_tray_updates(
                                     &menu_requests,
                                     &nav_tx,
                                     &open_menu,
+                                    &keyboard_grab,
                                 );
                                 container.append(&entry.button);
                                 entries.insert(key.clone(), entry);
@@ -2184,6 +2226,47 @@ fn handle_nav(
     }
 }
 
+// The clamped pointer-enter a grabbing popup receives on map (see the motion
+// controller in show_tray_menu) leaves a phantom :hover on one row. Real
+// hover always comes with motion events, so shortly after presenting, clear
+// PRELIGHT from every entry unless genuine motion arrived in the meantime;
+// the next real motion re-establishes hover exactly where the pointer is.
+const PHANTOM_HOVER_CLEAR_DELAY: Duration = Duration::from_millis(200);
+
+fn schedule_phantom_hover_clear(
+    open_menu: &Rc<TrayMenuHost>,
+    request_id: u64,
+    motion_seen: &Rc<Cell<bool>>,
+) {
+    let open_menu = Rc::downgrade(open_menu);
+    let motion_seen = motion_seen.clone();
+    glib::timeout_add_local_once(PHANTOM_HOVER_CLEAR_DELAY, move || {
+        let Some(open_menu) = open_menu.upgrade() else {
+            return;
+        };
+        let open = open_menu.open.borrow();
+        let Some(menu) = open.as_ref() else {
+            return;
+        };
+        if menu.request_id != request_id {
+            debug!(
+                request_id,
+                current = menu.request_id,
+                "Skipping phantom hover clear for a superseded menu"
+            );
+            return;
+        }
+        if motion_seen.get() {
+            debug!(request_id, "Keeping hover state backed by real pointer motion");
+            return;
+        }
+        for entry in &menu.entries {
+            entry.button.unset_state_flags(gtk4::StateFlags::PRELIGHT);
+        }
+        info!(request_id, "Cleared phantom hover state after tray menu map");
+    });
+}
+
 // Render a tray item's dbusmenu inside the shared GTK popover. We build the menu
 // from concrete `Button` widgets (instead of `PopoverMenu::from_model`) because
 // the model-based popover constructs its widgets lazily and cannot measure its
@@ -2223,6 +2306,35 @@ fn show_tray_menu(
         entries: &mut menu_entries,
     };
     build_menu_box(&box_, &menu.items, &mut build, &[]);
+
+    // On a fresh map Hyprland hands the grabbing popup a pointer enter even
+    // when the cursor is far away, with coordinates clamped to the popup
+    // bounds — GTK then paints :hover on whichever row that lands on (almost
+    // always the last). Genuine pointer presence always follows up with
+    // motion events, so track those to tell the phantom apart, and log the
+    // raw coordinates to keep validating what the compositor delivers.
+    let motion_seen = Rc::new(Cell::new(false));
+    let motion_controller = gtk4::EventControllerMotion::new();
+    {
+        let key = menu.key.clone();
+        motion_controller.connect_enter(move |_controller, x, y| {
+            info!(item = key, x, y, "Pointer entered tray menu contents");
+        });
+    }
+    {
+        let key = menu.key.clone();
+        motion_controller.connect_leave(move |_controller| {
+            info!(item = key, "Pointer left tray menu contents");
+        });
+    }
+    {
+        let motion_seen = motion_seen.clone();
+        motion_controller.connect_motion(move |_controller, x, y| {
+            motion_seen.set(true);
+            trace!(x, y, "Pointer motion in tray menu contents");
+        });
+    }
+    box_.add_controller(motion_controller);
     popover.set_child(Some(&box_));
 
     // Each submenu is its own native popover and can receive keyboard focus.
@@ -2243,6 +2355,13 @@ fn show_tray_menu(
         entries: menu_entries,
         selected: None,
     });
+    // A tooltip that is already visible when the menu maps never re-queries:
+    // GTK remaps it directly (gtk_tooltip_window_map), which is the popup
+    // stacking violation that deadlocks the main loop. Force one query now —
+    // it re-evaluates whichever widget is under the pointer display-wide, the
+    // query handler sees the open menu state set above and declines, and GTK
+    // hides the tooltip before the grabbing popup appears.
+    entry.button.trigger_tooltip_query();
     if let Err(error) = point_tray_menu_at(open_menu, &entry.button, container) {
         warn!(item = menu.key, %error, "Could not anchor fused tray menu to its icon");
     }
@@ -2264,6 +2383,7 @@ fn show_tray_menu(
             item = menu.key,
             "Already-mapped tray menu surface presented"
         );
+        schedule_phantom_hover_clear(open_menu, menu.request_id, &motion_seen);
         return;
     }
     if is_nav {
@@ -2274,6 +2394,7 @@ fn show_tray_menu(
         let request_id = menu.request_id;
         let popover_weak = popover.downgrade();
         let open_menu_weak = Rc::downgrade(open_menu);
+        let motion_seen = motion_seen.clone();
         glib::timeout_add_local_once(Duration::from_millis(100), move || {
             let Some(open_menu) = open_menu_weak.upgrade() else {
                 return;
@@ -2300,6 +2421,7 @@ fn show_tray_menu(
             // is resolving the two surfaces, wedging the entire GTK loop.
             // Both surfaces already have the same navigation controller.
             info!(item = item_key, request_id, "Tray dropdown opened at level 0");
+            schedule_phantom_hover_clear(&open_menu, request_id, &motion_seen);
         });
     } else {
         info!(item = menu.key, "Mapping pointer-driven tray menu surface");
@@ -2308,6 +2430,7 @@ fn show_tray_menu(
             item = menu.key,
             "Pointer-driven tray menu popup call completed"
         );
+        schedule_phantom_hover_clear(open_menu, menu.request_id, &motion_seen);
     }
 }
 
@@ -2447,6 +2570,13 @@ fn build_menu_box(
         entry.set_has_frame(false);
         entry.add_css_class("tray-menu-item");
         entry.set_hexpand(true);
+        // GTK focuses the first focusable child when the popover maps. That
+        // focus is invisible (selection uses .selected, and the CSS focus
+        // rule is neutralized), collides with :hover on the first entry, and
+        // GTK-driven focus moves inside layer-shell popovers have wedged the
+        // main loop before. Menu entries are driven by pointer clicks and the
+        // nav session, never by GTK keyboard focus, so opt out entirely.
+        entry.set_focusable(false);
         if !item.enabled {
             entry.set_sensitive(false);
         }

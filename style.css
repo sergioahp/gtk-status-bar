@@ -183,10 +183,13 @@ window.layer-bar {
   background-color: rgba(255, 255, 255, 0.10);
 }
 
-/* GTK may assign focus while a popover is mapping, and a teleported virtual
- * pointer may leave hover state behind. Neither is menu selection. Selection
- * is owned by OpenTrayMenu and deliberately uses a stronger accent treatment. */
-.tray-menu-item:focus:not(.selected) {
+/* GTK may assign focus while a popover is mapping (it lands on the first
+ * entry), and a teleported virtual pointer may leave hover state behind.
+ * Neither is menu selection. Selection is owned by OpenTrayMenu and
+ * deliberately uses a stronger accent treatment. The :not(:hover) guard
+ * matters: without it this rule outranks .tray-menu-item:hover (three
+ * pseudo-classes vs two) and the focused first entry can never show hover. */
+.tray-menu-item:focus:not(.selected):not(:hover) {
   background-color: transparent;
   box-shadow: none;
   outline: none;

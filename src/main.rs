@@ -194,6 +194,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
     ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
     window.show();
+    widgets::setup_ui_watchdog();
 
     let (bus, receivers) = bus::Bus::new();
     let (tray_backend, tray_ui) = tray::channels();

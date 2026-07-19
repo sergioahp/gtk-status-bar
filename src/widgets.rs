@@ -12,6 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -29,6 +31,48 @@ use crate::bus::{TitleUpdate, VolumeUpdate, WorkspaceUpdate};
 use crate::clock::Clock;
 use crate::pw;
 use crate::tray::{TrayAction, TrayCommand, TrayItem, TrayMenu, TrayMenuItem, TrayUi, TrayUpdate};
+
+const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const UI_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+const UI_WATCHDOG_REPEAT_CHECKS: u64 = 12;
+
+pub fn setup_ui_watchdog() {
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let ui_heartbeat = heartbeat.clone();
+    glib::timeout_add_local(UI_HEARTBEAT_INTERVAL, move || {
+        ui_heartbeat.fetch_add(1, Ordering::Relaxed);
+        glib::ControlFlow::Continue
+    });
+
+    tokio::spawn(async move {
+        let mut last_heartbeat = heartbeat.load(Ordering::Relaxed);
+        let mut stalled_checks = 0_u64;
+        loop {
+            tokio::time::sleep(UI_WATCHDOG_INTERVAL).await;
+            let current_heartbeat = heartbeat.load(Ordering::Relaxed);
+            if current_heartbeat != last_heartbeat {
+                if stalled_checks > 0 {
+                    info!(
+                        stalled_for_seconds = stalled_checks * UI_WATCHDOG_INTERVAL.as_secs(),
+                        "GTK main loop heartbeat resumed"
+                    );
+                }
+                last_heartbeat = current_heartbeat;
+                stalled_checks = 0;
+                continue;
+            }
+
+            stalled_checks += 1;
+            if stalled_checks == 1 || stalled_checks % UI_WATCHDOG_REPEAT_CHECKS == 0 {
+                warn!(
+                    stalled_for_seconds = stalled_checks * UI_WATCHDOG_INTERVAL.as_secs(),
+                    heartbeat = current_heartbeat,
+                    "GTK main loop heartbeat stalled; UI input, timers, and tray recovery may be unavailable"
+                );
+            }
+        }
+    });
+}
 
 // Widget constructors are infallible — gtk4::Label::new, add_css_class, and
 // set_halign all return (). The previous Result<…> signatures were speculative,
@@ -804,7 +848,6 @@ fn select_menu_index(menu: &mut OpenTrayMenu, selected: usize) -> i32 {
         popover.popup();
     }
     selected_entry.button.add_css_class("selected");
-    selected_entry.button.grab_focus();
     let id = selected_entry.id;
     menu.selected = Some(selected);
     id
@@ -1112,7 +1155,7 @@ fn create_tray_entry(
     let state_for_press = state.clone();
     gesture.connect_pressed(move |gesture_pressed, _press_count, x, y| {
         let item = state_for_press.borrow();
-        debug!(
+        info!(
             item = item.key,
             button = gesture_pressed.current_button(),
             x,
@@ -1133,7 +1176,7 @@ fn create_tray_entry(
             let item = state_for_release.borrow();
             (item.key.clone(), item.item_is_menu, item.menu_path.clone())
         };
-        debug!(
+        info!(
             item = key,
             button = gesture.current_button(),
             x,
@@ -1661,7 +1704,7 @@ fn nav_key_controller(
             gdk::Key::Escape | gdk::Key::q => NavCmd::Escape,
             _ => return glib::Propagation::Proceed,
         };
-        debug!(item = item_key, ?cmd, "Tray nav key");
+        info!(item = item_key, ?cmd, "Tray nav key received");
         if nav_tx.send(cmd).is_err() {
             debug!(item = item_key, "Tray nav channel closed; dropping key");
         }
@@ -1822,6 +1865,13 @@ fn end_nav(
     let Some(active) = nav.take() else {
         return;
     };
+    info!(
+        item = active.key,
+        request_id = active.menu_request_id,
+        in_menu = active.in_menu,
+        menu_surface_mapped = open_menu.popover.is_mapped(),
+        "Ending tray keyboard navigation"
+    );
     // Remember where the user left off so a later `open` resumes here. The key
     // is kept even when the item just vanished — `open` re-checks existence and
     // falls back to the first icon, so a stale key is harmless.
@@ -1830,6 +1880,11 @@ fn end_nav(
         next_menu_request(menu_requests);
     }
     close_tray_menu(open_menu);
+    info!(
+        item = active.key,
+        request_id = active.menu_request_id,
+        "Tray menu closed while ending keyboard navigation"
+    );
     for entry in entries.values() {
         entry.button.remove_css_class("nav-selected");
         // Unmapping the exclusive helper can leave GTK's hover state on the
@@ -1839,8 +1894,13 @@ fn end_nav(
     }
     container.remove_css_class("nav-focus");
     container.remove_css_class("nav-level-zero");
+    info!(
+        item = active.key,
+        request_id = active.menu_request_id,
+        "Releasing tray keyboard helper"
+    );
     drop(active);
-    debug!("Tray keyboard navigation ended");
+    info!("Tray keyboard navigation teardown completed");
 }
 
 // The navigation state machine, driven by one NavCmd at a time. Level 0 scrolls
@@ -1860,8 +1920,21 @@ fn handle_nav(
     commands: &mpsc::UnboundedSender<TrayCommand>,
     menu_requests: &Rc<Cell<u64>>,
 ) {
+    let active = nav.as_ref();
+    info!(
+        ?cmd,
+        nav_item = active.map(|active| active.key.as_str()),
+        nav_request_id = active.map(|active| active.menu_request_id),
+        in_menu = active.map(|active| active.in_menu),
+        "Handling tray navigation input"
+    );
     let cmd = match cmd {
         NavCmd::MouseAction(command) => {
+            info!(
+                item = command.key,
+                action = ?command.action,
+                "Mouse action is ending tray keyboard navigation"
+            );
             end_nav(
                 nav,
                 last_nav_key,
@@ -1869,6 +1942,11 @@ fn handle_nav(
                 entries,
                 open_menu,
                 menu_requests,
+            );
+            info!(
+                item = command.key,
+                action = ?command.action,
+                "Tray keyboard navigation ended for mouse action"
             );
             if let Err(error) = commands.send(command) {
                 warn!(%error, "Could not send tray click to D-Bus backend");
@@ -2129,7 +2207,6 @@ fn show_tray_menu(
 
     let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     box_.add_css_class("tray-menu");
-    box_.set_focusable(true);
     debug!(
         item = menu.key,
         labels = ?menu.items.iter().map(|i| &i.label).collect::<Vec<_>>(),
@@ -2170,7 +2247,7 @@ fn show_tray_menu(
         warn!(item = menu.key, %error, "Could not anchor fused tray menu to its icon");
     }
 
-    debug!(
+    info!(
         item = menu.key,
         entries = menu.items.len(),
         keyboard_grab = menu.keyboard_grab,
@@ -2178,8 +2255,15 @@ fn show_tray_menu(
         "Presenting tray menu"
     );
     if was_mapped {
+        info!(
+            item = menu.key,
+            "Presenting already-mapped tray menu surface"
+        );
         popover.present();
-        box_.grab_focus();
+        info!(
+            item = menu.key,
+            "Already-mapped tray menu surface presented"
+        );
         return;
     }
     if is_nav {
@@ -2189,7 +2273,6 @@ fn show_tray_menu(
         let item_key = menu.key.clone();
         let request_id = menu.request_id;
         let popover_weak = popover.downgrade();
-        let box_weak = box_.downgrade();
         let open_menu_weak = Rc::downgrade(open_menu);
         glib::timeout_add_local_once(Duration::from_millis(100), move || {
             let Some(open_menu) = open_menu_weak.upgrade() else {
@@ -2203,16 +2286,28 @@ fn show_tray_menu(
             if !still_current {
                 return;
             }
-            let (Some(popover), Some(box_)) = (popover_weak.upgrade(), box_weak.upgrade()) else {
+            let Some(popover) = popover_weak.upgrade() else {
                 return;
             };
+            info!(item = item_key, request_id, "Mapping tray menu surface");
             popover.popup();
-            box_.grab_focus();
-            debug!(item = item_key, "Tray dropdown opened at level 0");
+            info!(
+                item = item_key,
+                request_id, "Tray menu popup call completed"
+            );
+            // Keep GTK focus on the exclusive helper surface. Moving it to a
+            // layer-shell popover can block inside grab_focus() while Wayland
+            // is resolving the two surfaces, wedging the entire GTK loop.
+            // Both surfaces already have the same navigation controller.
+            info!(item = item_key, request_id, "Tray dropdown opened at level 0");
         });
     } else {
+        info!(item = menu.key, "Mapping pointer-driven tray menu surface");
         popover.popup();
-        box_.grab_focus();
+        info!(
+            item = menu.key,
+            "Pointer-driven tray menu popup call completed"
+        );
     }
 }
 

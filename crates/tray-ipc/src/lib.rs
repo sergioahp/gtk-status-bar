@@ -183,8 +183,10 @@ async fn handle_client(stream: UnixStream, ui_tx: mpsc::UnboundedSender<IpcUiReq
                 continue;
             }
         };
+        info!(?request, "Tray IPC request received");
 
         let (response_tx, response_rx) = oneshot::channel();
+        let request_for_result = request.clone();
         if ui_tx
             .send(IpcUiRequest {
                 request,
@@ -200,8 +202,21 @@ async fn handle_client(stream: UnixStream, ui_tx: mpsc::UnboundedSender<IpcUiReq
         }
         let response = match tokio::time::timeout(RESPONSE_TIMEOUT, response_rx).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => IpcResponse::error("tray UI dropped the request"),
-            Err(_) => IpcResponse::error("tray UI did not respond within 5 seconds"),
+            Ok(Err(_)) => {
+                warn!(
+                    request = ?request_for_result,
+                    "Tray UI dropped an IPC request before responding"
+                );
+                IpcResponse::error("tray UI dropped the request")
+            }
+            Err(_) => {
+                warn!(
+                    request = ?request_for_result,
+                    timeout_seconds = RESPONSE_TIMEOUT.as_secs(),
+                    "Tray IPC request timed out waiting for the GTK UI"
+                );
+                IpcResponse::error("tray UI did not respond within 5 seconds")
+            }
         };
         if let Err(error) = write_response(&mut writer, &response).await {
             debug!(%error, "Tray IPC client response write failed");

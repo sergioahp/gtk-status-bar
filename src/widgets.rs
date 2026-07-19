@@ -2288,61 +2288,6 @@ fn handle_nav(
     }
 }
 
-// The synthetic pointer-enter a grabbing popup receives on map (see the
-// motion controller in show_tray_menu) leaves a phantom :hover on one row.
-// Real hover normally comes with motion events, so shortly after presenting,
-// clear PRELIGHT from every entry unless genuine motion arrived in the
-// meantime; the next real motion re-establishes hover where the pointer is.
-// Known limits of the heuristic, accepted deliberately: a pointer that was
-// already inside the popup rectangle at map time and holds perfectly still
-// loses its (correct) hover tint until it moves a pixel, and a synthetic
-// enter arriving later than the delay would keep its phantom tint until the
-// pointer really moves. Both self-heal on the first motion event; the
-// alternative — classifying enters by their coordinates — is guesswork
-// against compositor-specific values ((0,0) observed on Hyprland 0.49, but
-// clamped positions have been seen too).
-const PHANTOM_HOVER_CLEAR_DELAY: Duration = Duration::from_millis(200);
-
-fn schedule_phantom_hover_clear(
-    open_menu: &Rc<TrayMenuHost>,
-    request_id: u64,
-    motion_seen: &Rc<Cell<bool>>,
-) {
-    let open_menu = Rc::downgrade(open_menu);
-    let motion_seen = motion_seen.clone();
-    glib::timeout_add_local_once(PHANTOM_HOVER_CLEAR_DELAY, move || {
-        let Some(open_menu) = open_menu.upgrade() else {
-            return;
-        };
-        let open = open_menu.open.borrow();
-        let Some(menu) = open.as_ref() else {
-            return;
-        };
-        if menu.request_id != request_id {
-            debug!(
-                request_id,
-                current = menu.request_id,
-                "Skipping phantom hover clear for a superseded menu"
-            );
-            return;
-        }
-        if motion_seen.get() {
-            debug!(
-                request_id,
-                "Keeping hover state backed by real pointer motion"
-            );
-            return;
-        }
-        for entry in &menu.entries {
-            entry.button.unset_state_flags(gtk4::StateFlags::PRELIGHT);
-        }
-        info!(
-            request_id,
-            "Cleared phantom hover state after tray menu map"
-        );
-    });
-}
-
 // Render a tray item's dbusmenu inside the shared GTK popover. We build the menu
 // from concrete `Button` widgets (instead of `PopoverMenu::from_model`) because
 // the model-based popover constructs its widgets lazily and cannot measure its
@@ -2383,34 +2328,6 @@ fn show_tray_menu(
     };
     build_menu_box(&box_, &menu.items, &mut build, &[]);
 
-    // On a fresh map Hyprland hands the grabbing popup a pointer enter even
-    // when the cursor is far away, with coordinates clamped to the popup
-    // bounds — GTK then paints :hover on whichever row that lands on (almost
-    // always the last). Genuine pointer presence always follows up with
-    // motion events, so track those to tell the phantom apart, and log the
-    // raw coordinates to keep validating what the compositor delivers.
-    let motion_seen = Rc::new(Cell::new(false));
-    let motion_controller = gtk4::EventControllerMotion::new();
-    {
-        let key = menu.key.clone();
-        motion_controller.connect_enter(move |_controller, x, y| {
-            info!(item = key, x, y, "Pointer entered tray menu contents");
-        });
-    }
-    {
-        let key = menu.key.clone();
-        motion_controller.connect_leave(move |_controller| {
-            info!(item = key, "Pointer left tray menu contents");
-        });
-    }
-    {
-        let motion_seen = motion_seen.clone();
-        motion_controller.connect_motion(move |_controller, x, y| {
-            motion_seen.set(true);
-            trace!(x, y, "Pointer motion in tray menu contents");
-        });
-    }
-    box_.add_controller(motion_controller);
     popover.set_child(Some(&box_));
 
     // Each submenu is its own native popover and can receive keyboard focus.
@@ -2461,7 +2378,6 @@ fn show_tray_menu(
             item = menu.key,
             "Already-mapped tray menu surface presented"
         );
-        schedule_phantom_hover_clear(open_menu, menu.request_id, &motion_seen);
         return;
     }
     if is_nav {
@@ -2472,7 +2388,6 @@ fn show_tray_menu(
         let request_id = menu.request_id;
         let popover_weak = popover.downgrade();
         let open_menu_weak = Rc::downgrade(open_menu);
-        let motion_seen = motion_seen.clone();
         glib::timeout_add_local_once(Duration::from_millis(100), move || {
             let Some(open_menu) = open_menu_weak.upgrade() else {
                 return;
@@ -2502,7 +2417,6 @@ fn show_tray_menu(
                 item = item_key,
                 request_id, "Tray dropdown opened at level 0"
             );
-            schedule_phantom_hover_clear(&open_menu, request_id, &motion_seen);
         });
     } else {
         info!(item = menu.key, "Mapping pointer-driven tray menu surface");
@@ -2511,7 +2425,6 @@ fn show_tray_menu(
             item = menu.key,
             "Pointer-driven tray menu popup call completed"
         );
-        schedule_phantom_hover_clear(open_menu, menu.request_id, &motion_seen);
     }
 }
 

@@ -718,8 +718,8 @@ async fn dbusmenu_event(
 
 fn menu_prop<'a>(props: &'a zvariant::Dict<'a, 'a>, name: &str) -> Option<&'a zvariant::Value<'a>> {
     for (candidate, value) in props.iter() {
-        if let zvariant::Value::Str(text) = candidate {
-            if text.as_str() == name {
+        if let zvariant::Value::Str(text) = candidate
+            && text.as_str() == name {
                 // dbusmenu properties are `a{sv}`; each value is a D-Bus variant,
                 // so zvariant hands it back as `Value::Value(inner)`. Unwrap that
                 // one level so the actual string/bool/int is what we match on.
@@ -728,7 +728,6 @@ fn menu_prop<'a>(props: &'a zvariant::Dict<'a, 'a>, name: &str) -> Option<&'a zv
                     other => Some(other),
                 };
             }
-        }
     }
     None
 }

@@ -63,7 +63,7 @@ pub fn setup_ui_watchdog() {
             }
 
             stalled_checks += 1;
-            if stalled_checks == 1 || stalled_checks % UI_WATCHDOG_REPEAT_CHECKS == 0 {
+            if stalled_checks == 1 || stalled_checks.is_multiple_of(UI_WATCHDOG_REPEAT_CHECKS) {
                 warn!(
                     stalled_for_seconds = stalled_checks * UI_WATCHDOG_INTERVAL.as_secs(),
                     heartbeat = current_heartbeat,
@@ -660,12 +660,12 @@ impl KeyboardGrab {
             .unwrap_or_else(|| "compositor-default".into());
         window.connect_map(move |window| {
             if let Some(surface) = window.surface() {
-                surface.set_input_region(&gtk4::cairo::Region::create());
+                surface.set_input_region(Some(&gtk4::cairo::Region::create()));
                 // GTK rewrites the input region on resize/style changes, so a
                 // single clear on map is not durable. Re-clear after every
                 // layout so the helper can never swallow pointer input.
                 surface.connect_layout(|surface, _width, _height| {
-                    surface.set_input_region(&gtk4::cairo::Region::create());
+                    surface.set_input_region(Some(&gtk4::cairo::Region::create()));
                 });
             }
             info!(
@@ -1829,11 +1829,10 @@ fn clear_menu_selection(open_menu: &TrayMenuHost) {
     let Some(menu) = open_menu.as_mut() else {
         return;
     };
-    if let Some(selected) = menu.selected.take() {
-        if let Some(entry) = menu.entries.get(selected) {
+    if let Some(selected) = menu.selected.take()
+        && let Some(entry) = menu.entries.get(selected) {
             entry.button.remove_css_class("selected");
         }
-    }
     for popover in &menu.popovers {
         popover.popdown();
     }
@@ -2448,14 +2447,13 @@ const MENU_ICON_SIZE: i32 = 16;
 // no icon at all when neither is drawable.
 fn menu_icon_image(reference: &gtk4::Box, item: &TrayMenuItem) -> Option<gtk4::Image> {
     let icon_theme = gtk4::IconTheme::for_display(&reference.display());
-    if let Some(name) = item.icon_name.as_deref().filter(|name| !name.is_empty()) {
-        if icon_theme.has_icon(name)
+    if let Some(name) = item.icon_name.as_deref().filter(|name| !name.is_empty())
+        && icon_theme.has_icon(name)
             && named_icon_render_error(&icon_theme, name, MENU_ICON_SIZE, reference.scale_factor())
                 .is_none()
         {
             return Some(gtk4::Image::from_icon_name(name));
         }
-    }
 
     let texture = decode_menu_icon_data(item.icon_data.as_deref()?)?;
     let image = gtk4::Image::new();
@@ -2677,7 +2675,7 @@ pub fn load_css_styles(window: &gtk4::ApplicationWindow) {
 
     let css_provider = gtk4::CssProvider::new();
     let css_data = include_str!("../style.css");
-    css_provider.load_from_data(css_data);
+    css_provider.load_from_string(css_data);
 
     gtk4::style_context_add_provider_for_display(
         &gtk4::prelude::WidgetExt::display(window),
@@ -2766,7 +2764,7 @@ fn update_title_widget_workspace_color(
     let css_provider = gtk4::CssProvider::new();
     let css = format!(".title-widget {{ background-color: {}; }}", color);
 
-    css_provider.load_from_data(&css);
+    css_provider.load_from_string(&css);
 
     let style_context = title_widget.root.style_context();
     style_context.add_provider(&css_provider, gtk4::STYLE_PROVIDER_PRIORITY_USER + 1);
@@ -2949,7 +2947,7 @@ pub fn setup_workspace_updates(
     });
 }
 
-fn desktop_app_class_match_score(app: &gtk4::gio::DesktopAppInfo, class: &str) -> u8 {
+fn desktop_app_class_match_score(app: &gio_unix::DesktopAppInfo, class: &str) -> u8 {
     if app
         .startup_wm_class()
         .is_some_and(|wm_class| wm_class.eq_ignore_ascii_case(class))
@@ -2977,7 +2975,7 @@ fn desktop_app_class_match_score(app: &gtk4::gio::DesktopAppInfo, class: &str) -
 fn desktop_icon_for_class(class: &str) -> Option<gtk4::gio::Icon> {
     gtk4::gio::AppInfo::all()
         .into_iter()
-        .filter_map(|app| app.downcast::<gtk4::gio::DesktopAppInfo>().ok())
+        .filter_map(|app| app.downcast::<gio_unix::DesktopAppInfo>().ok())
         .filter_map(|app| {
             let score = desktop_app_class_match_score(&app, class);
             (score > 0).then_some((score, app))

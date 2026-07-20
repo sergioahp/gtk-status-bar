@@ -10,10 +10,13 @@ members = ["crates/tray-ipc", "crates/trayctl"]
 resolver = "3"
 
 [dependencies]
-gtk4-layer-shell = "0.6.3"
+gtk4-layer-shell = "0.8.0"
 # GIO (GLib I/O) for Application and signal traits
-gio = "0.21.2"
-gtk4 = "0.10.1"
+gio = "0.22.8"
+# DesktopAppInfo moved out of `gio` into the Unix-specific `gio-unix` crate in the
+# gtk-rs 0.22 generation; used for matching Hyprland window classes to .desktop icons.
+gio-unix = "0.22.8"
+gtk4 = { version = "0.11.4", features = ["v4_22"] }
 chrono = "0.4.42"
 tokio = { version = "1.47.1", features = ["full"] }
 hyprland = { git = "https://github.com/hyprland-community/hyprland-rs" }

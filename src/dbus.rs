@@ -884,11 +884,10 @@ fn handle_properties_changed(
                 }
             };
 
-            if process_battery_device_properties(changed_properties, battery) {
-                if let Err(e) = bus.send_battery_update(battery.display_text()) {
+            if process_battery_device_properties(changed_properties, battery)
+                && let Err(e) = bus.send_battery_update(battery.display_text()) {
                     error!("Failed to send battery update: {:#}", e);
                 }
-            }
         }
         "org.bluez.Battery1" => {
             let Value::Dict(_) = changed_properties_val else {
@@ -1250,11 +1249,9 @@ async fn initial_bluetooth_scan(
                     if let Some(name_value) = device_interface
                         .get("Alias")
                         .or_else(|| device_interface.get("Name"))
-                    {
-                        if let Ok(name) = String::try_from(name_value.clone()) {
+                        && let Ok(name) = String::try_from(name_value.clone()) {
                             device_name = Some(name);
                         }
-                    }
                 }
 
                 // Check for Battery1 interface

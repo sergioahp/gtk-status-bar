@@ -133,6 +133,13 @@ fn parse_volume_from_pod(param: &Pod) -> Option<(Option<u8>, Option<u8>, Option<
 }
 
 // Start PipeWire monitoring on dedicated ThreadLoop thread
+//
+// clippy would fold the nested registry/param callbacks into `if let` chains and
+// rewrite the empty-key/value guards as string patterns. The explicit nesting and
+// guards are kept on purpose here: the callbacks are already several closures deep,
+// and the stepwise unwrapping matches the layer-at-a-time style used across this
+// codebase for tracing each PipeWire property as it is decoded.
+#[allow(clippy::collapsible_if, clippy::redundant_guards)]
 pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Result<()> {
     std::thread::spawn(move || {
         debug!("🔧 Initializing PipeWire on dedicated thread...");
@@ -384,7 +391,7 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                             debug!("🔗 ADDING NODE LISTENER for node.name: {}", node_name);
 
                             // Add device to tracking HashMap with node.name, description, and initial empty volume data
-                            if let Some(mut device_map) = device_map.clone().try_borrow_mut().ok() {
+                            if let Ok(mut device_map) = device_map.clone().try_borrow_mut() {
                                 device_map.insert(id, (node_name.clone(), name.clone(), None, None, None));
                                 debug!("📝 Added device to HashMap: {} -> ({}, {}, no volume yet)", id, node_name, name);
                                 debug!("🗂️ Current device map size: {}", device_map.len());
@@ -434,7 +441,7 @@ pub fn start_pipewire_thread(sender: mpsc::UnboundedSender<VolumeUpdate>) -> Res
                                                 // Check if this is the default sink for GUI updates
                                                 let is_default = if let Some(default_sink) = default_sink_weak.upgrade() {
                                                     let current_default = default_sink.borrow();
-                                                    let result = current_default.as_ref().map_or(false, |default| {
+                                                    let result = current_default.as_ref().is_some_and(|default| {
                                                         node_name_clone == *default
                                                     });
                                                     debug!("🎯 Checking if device {} is default: current_default={:?}, node_name={}, is_default={}",

@@ -84,11 +84,10 @@ async fn run_color_scheme(tx: &mpsc::UnboundedSender<bool>) -> Result<()> {
         .await
         .context("create portal Settings proxy")?;
 
-    if let Some(prefer_dark) = read_prefer_dark(&proxy).await {
-        if tx.send(prefer_dark).is_err() {
+    if let Some(prefer_dark) = read_prefer_dark(&proxy).await
+        && tx.send(prefer_dark).is_err() {
             return Ok(());
         }
-    }
 
     let mut changes = proxy
         .receive_signal("SettingChanged")

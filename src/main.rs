@@ -193,7 +193,7 @@ fn activate(application: &gtk4::Application, options: &CliOptions) -> Result<()>
         title_widget,
     ) = widgets::create_experimental_bar();
     window.set_child(Some(&bar));
-    window.show();
+    window.set_visible(true);
     widgets::setup_ui_watchdog();
 
     let (bus, receivers) = bus::Bus::new();

@@ -509,7 +509,19 @@ async fn monitor_network(bus: &Bus, config: &NetworkConfig) -> Result<()> {
     }
     let mut stream = zbus::MessageStream::from(&connection);
 
-    let mut snapshot = match tokio::time::timeout(config.dbus_timeout, read_snapshot(&connection)).await {
+    // Property reads run on their own connection, never the one feeding
+    // `stream`. While we await a read_snapshot, the select! below stops polling
+    // `stream`; under a burst of PropertiesChanged signals (e.g. a flapping
+    // Wi-Fi device) the stream connection's inbound queue fills, backpressures
+    // its socket reader, and the get_property replies never arrive -- the read
+    // hangs until dbus_timeout and the bar wrongly latches to "down" even while
+    // NetworkManager reports full connectivity. A dedicated connection gives
+    // those reads their own reader, independent of stream backpressure.
+    let snapshot_connection = Connection::system()
+        .await
+        .context("connect network snapshot reader to system D-Bus")?;
+
+    let mut snapshot = match tokio::time::timeout(config.dbus_timeout, read_snapshot(&snapshot_connection)).await {
         Err(_) => {
             warn!(timeout = ?config.dbus_timeout, "Initial NetworkManager snapshot timed out");
             NetworkSnapshot::disconnected()
@@ -565,7 +577,7 @@ async fn monitor_network(bus: &Bus, config: &NetworkConfig) -> Result<()> {
                 }
 
                 let previous = snapshot.clone();
-                match tokio::time::timeout(config.dbus_timeout, read_snapshot(&connection)).await {
+                match tokio::time::timeout(config.dbus_timeout, read_snapshot(&snapshot_connection)).await {
                     Err(_) => {
                         warn!(timeout = ?config.dbus_timeout, "NetworkManager event resnapshot timed out; treating link as down");
                         snapshot = NetworkSnapshot::disconnected();

@@ -2549,18 +2549,43 @@ fn build_menu_box(
     build: &mut MenuBuildContext<'_>,
     ancestors: &[gtk4::Popover],
 ) {
+    // The first visible, non-separator row is the menu's "lead". When an app
+    // ships that lead row disabled it is a non-selectable title/category for the
+    // group below it (e.g. Discord's "Discord"), not an unavailable action, so we
+    // band it as a header. Every other disabled row is a genuinely non-selectable
+    // action (e.g. blueman's "Reconnect to..."). "First row" is the load-bearing
+    // signal here: a disabled action can also sit right after a separator, so
+    // "follows a separator" would misclassify it as a header.
+    let mut lead_row_seen = false;
+    // A header row carries its own bottom hairline that reads as the group
+    // divider, so a real separator right beneath it would draw a doubled line.
+    // Swallow that one separator.
+    let mut prev_was_header = false;
     for item in items {
         if !item.visible {
             continue;
         }
         if item.is_separator {
+            if prev_was_header {
+                prev_was_header = false;
+                continue;
+            }
             box_.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
             continue;
         }
 
+        let is_header = !lead_row_seen && !item.enabled;
+        lead_row_seen = true;
+        prev_was_header = is_header;
+
         let entry = gtk4::Button::new();
         entry.set_has_frame(false);
         entry.add_css_class("tray-menu-item");
+        if is_header {
+            entry.add_css_class("tray-menu-header");
+        } else if !item.enabled {
+            entry.add_css_class("tray-menu-disabled");
+        }
         entry.set_hexpand(true);
         // GTK focuses the first focusable child when the popover maps. That
         // focus is invisible (selection uses .selected, and the CSS focus

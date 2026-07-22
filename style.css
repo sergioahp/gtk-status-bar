@@ -210,22 +210,20 @@ window.layer-bar {
 }
 
 /* A non-selectable title/category row: the first entry an app ships disabled
- * (e.g. Discord's "Discord" heading). It is banded so it reads as the title of
- * the group beneath it rather than a dead action: a faint inset fill, a bottom
- * hairline that doubles as the group's separator (build_menu_box swallows a real
- * separator right below it), and an extra left indent. Full-strength bold text
- * plus an accent-tinted icon give it identity. Deliberately distinct from
- * .selected, which is a stronger accent fill plus a left accent bar. */
+ * (e.g. Discord's "Discord" heading). It reads as the title of the group beneath
+ * it rather than a dead action via a brighter blue bold label, a bottom hairline
+ * that doubles as the group's separator (build_menu_box swallows a real separator
+ * right below it), and an extra left indent; an accent-tinted icon adds identity.
+ * No background fill -- the type carries it. Distinct from .selected, which is an
+ * accent background fill plus a left accent bar. */
 .tray-menu-item.tray-menu-header {
-  background-color: rgba(192, 202, 245, 0.06);
-  border-radius: 0.35em 0.35em 0 0;
   box-shadow: inset 0 -1px rgba(192, 202, 245, 0.25);
   margin-bottom: 0.18em;
   padding-left: 0.9em;
 }
 
 .tray-menu-item.tray-menu-header label {
-  color: #c0caf5;
+  color: #a7c7f1;
   font-weight: bold;
 }
 
@@ -236,8 +234,9 @@ window.layer-bar {
 /* A non-selectable *action*: an item the app disabled because it is currently
  * unavailable (e.g. blueman's "Reconnect to..."). The opposite of a header --
  * no band, no accent, no background change at all. The row simply recedes: its
- * foreground (label and icon) drops to half strength so it reads as present but
- * unavailable. Insensitivity already removes the hover and click feedback. */
+ * foreground (label and icon) drops in strength so it reads as present but
+ * unavailable, while staying legible. Insensitivity already removes the hover
+ * and click feedback. */
 .tray-menu-item.tray-menu-disabled {
-  opacity: 0.5;
+  opacity: 0.68;
 }

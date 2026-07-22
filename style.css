@@ -162,19 +162,19 @@ window.layer-bar {
  * These must override the global `* { background-color: transparent }` reset so
  * the menu is legible against the transparent bar. */
 .tray-menu {
-  background-color: rgba(30, 34, 50, 0.96);
-  color: #c0caf5;
+  background-color: rgba(30, 34, 50, 0.87);
+  color: #a7c7f1;
   border-radius: 0.5em;
   padding: 0.25em;
 }
 
 .tray-menu label {
-  color: #c0caf5;
+  color: #a7c7f1;
 }
 
 .tray-menu-item {
   background-color: transparent;
-  color: #c0caf5;
+  color: #a7c7f1;
   border-radius: 0.35em;
   padding: 0.1em 0.3em;
 }
@@ -198,13 +198,55 @@ window.layer-bar {
 .tray-menu-item.selected,
 .tray-menu-item.selected:hover,
 .tray-menu-item.selected:focus {
-  background-color: rgba(122, 162, 247, 0.30);
+  background-color: rgb(20, 50, 100);
   box-shadow: inset 3px 0 #7aa2f7;
   outline: none;
+}
+
+.tray-menu-item.selected label {
+  color: white;
 }
 
 .tray-menu separator {
   background-color: rgba(192, 202, 245, 0.25);
   min-height: 1px;
   margin: 0.2em 0.4em;
+}
+
+/* A non-selectable title/category row: the first entry an app ships disabled
+ * (e.g. Discord's "Discord" heading). It reads as the title of the group beneath
+ * it rather than a dead action via a brighter blue bold label, a bottom hairline
+ * that doubles as the group's separator (build_menu_box swallows a real separator
+ * right below it), and an extra left indent; an accent-tinted icon adds identity.
+ * No background fill -- the type carries it. Distinct from .selected, which is an
+ * accent background fill plus a left accent bar. */
+.tray-menu-item.tray-menu-header {
+  box-shadow: inset 0 -1px rgba(192, 202, 245, 0.25);
+  margin-bottom: 0.18em;
+  padding-left: 0.9em;
+}
+
+.tray-menu-item.tray-menu-header label {
+  color: #72b2f7;
+  font-weight: bold;
+}
+
+.tray-menu-item.tray-menu-header image {
+  color: #7aa2f7;
+}
+
+/* A non-selectable *action*: an item the app disabled because it is currently
+ * unavailable (e.g. blueman's "Reconnect to..."). The opposite of a header --
+ * no band, no accent, no background change at all. The row simply recedes: its
+ * foreground (label and icon) uses an opaque neutral gray so it reads as present
+ * but unavailable without picking up the menu's blue through transparency.
+ * Insensitivity already removes the hover and click feedback. */
+.tray-menu-item.tray-menu-disabled {
+  opacity: 1;
+}
+
+.tray-menu-item.tray-menu-disabled label,
+.tray-menu-item.tray-menu-disabled image {
+  color: #858b98;
+  opacity: 1;
 }

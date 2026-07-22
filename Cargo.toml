@@ -19,11 +19,10 @@ gio-unix = "0.22.8"
 gtk4 = { version = "0.11.4", features = ["v4_22"] }
 chrono = "0.4.42"
 tokio = { version = "1.47.1", features = ["full"] }
-# Pinned: rev after this adds a non-defaulted `visible: bool` to the Client
-# struct (Hyprland >= 0.50). On Hyprland 0.49 the IPC JSON omits it, so serde
-# fails to deserialize and title/active-window handling breaks at runtime with
-# "missing field `visible`". Bump this rev only together with the compositor.
-hyprland = { git = "https://github.com/hyprland-community/hyprland-rs", rev = "6206f713208005be6277762bb11c6a57581f5b70" }
+# Pinned to the Hyprland 0.55 client/workspace schema. These structs include
+# mapped/hidden/visible/acceptsInput and the other fields emitted by 0.55; older
+# compositors omit them and cannot deserialize through this revision.
+hyprland = { git = "https://github.com/hyprland-community/hyprland-rs", rev = "2b03a0cac46f311518aebae317c1f8751c9fadf0" }
 futures-util = "0.3.31"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
